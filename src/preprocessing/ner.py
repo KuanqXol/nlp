@@ -1,20 +1,26 @@
 """
 Module: ner_extraction.py
-Chức năng: NER tiếng Việt với VnCoreNLP pipeline (tokenize + POS + NER).
+NER tiếng Việt với output có cấu trúc, có span ký tự và sentence index.
 
-Thứ tự ưu tiên backend:
-  1. VnCoreNLP  — model chuẩn, POS đi kèm, nhẹ, chạy CPU tốt
-  2. underthesea — fallback, không có POS chi tiết
-  3. HuggingFace transformer — fallback nếu có model
-  4. Rule-based dict — fallback cuối, không cần thư viện
-
-POS tag được lưu lại để relation extraction dùng lọc verb-between-entities.
+Output entity chuẩn:
+{
+    "text": "Vladimir Putin",
+    "type": "PER",
+    "start": 15,
+    "end": 30,
+    "sentence_id": 0,
+    "pos": "Np",
+    "score": 0.92,
+    "entity_text": "Vladimir Putin",  # alias rõ nghĩa
+    "entity_type": "PER"              # alias rõ nghĩa
+}
 """
 
+from __future__ import annotations
+
+import hashlib
 import re
 from typing import Dict, List, Optional
-
-# ── Try import backends ───────────────────────────────────────────────────────
 
 try:
     from vncorenlp import VnCoreNLP as _VnCoreNLP
@@ -36,9 +42,6 @@ try:
     _TRANSFORMERS_AVAILABLE = True
 except ImportError:
     _TRANSFORMERS_AVAILABLE = False
-
-
-# ── Rule-based fallback ───────────────────────────────────────────────────────
 
 _PERSON_DICT = [
     "Putin",
@@ -127,36 +130,122 @@ _VNCORENLP_TAG_MAP = {
 }
 
 
-def _rule_based_ner(text: str) -> List[Dict]:
-    entities, found_spans = [], set()
+def _split_sentences_with_offsets(text: str) -> List[Dict]:
+    spans: List[Dict] = []
+    for i, m in enumerate(re.finditer(r"[^.!?]+[.!?]?", text, flags=re.UNICODE)):
+        sent = m.group().strip()
+        if not sent:
+            continue
+        start = m.start()
+        while start < len(text) and text[start].isspace():
+            start += 1
+        end = start + len(sent)
+        spans.append({"sentence_id": i, "text": sent, "start": start, "end": end})
+    if not spans and text.strip():
+        spans.append(
+            {
+                "sentence_id": 0,
+                "text": text.strip(),
+                "start": 0,
+                "end": len(text.strip()),
+            }
+        )
+    return spans
 
-    def _scan(word_list, ent_type):
+
+def _make_entity(
+    text: str,
+    ent_type: str,
+    start: int,
+    end: int,
+    sentence_id: int,
+    pos: Optional[str],
+    score: float,
+) -> Dict:
+    return {
+        "text": text,
+        "type": ent_type,
+        "start": start,
+        "end": end,
+        "sentence_id": sentence_id,
+        "pos": pos,
+        "score": score,
+        "entity_text": text,
+        "entity_type": ent_type,
+    }
+
+
+def _attach_spans(raw_entities: List[Dict], text: str) -> List[Dict]:
+    sentence_spans = _split_sentences_with_offsets(text)
+    used_spans = set()
+    out: List[Dict] = []
+
+    for e in raw_entities:
+        ent_text = e.get("text", "").strip()
+        ent_type = e.get("type", "MISC")
+        pos = e.get("pos")
+        score = float(e.get("score", 0.8))
+        if not ent_text:
+            continue
+
+        found = False
+        for sent in sentence_spans:
+            local_start = sent["text"].lower().find(ent_text.lower())
+            if local_start < 0:
+                continue
+            global_start = sent["start"] + local_start
+            global_end = global_start + len(ent_text)
+            key = (global_start, global_end, ent_type)
+            if key in used_spans:
+                continue
+            used_spans.add(key)
+            out.append(
+                _make_entity(
+                    ent_text,
+                    ent_type,
+                    global_start,
+                    global_end,
+                    sent["sentence_id"],
+                    pos,
+                    score,
+                )
+            )
+            found = True
+            break
+
+        if not found:
+            # Fallback: nếu không gắn được span thì vẫn trả về entity với span -1.
+            out.append(_make_entity(ent_text, ent_type, -1, -1, -1, pos, score))
+
+    return out
+
+
+def _rule_based_ner(text: str) -> List[Dict]:
+    raw: List[Dict] = []
+
+    def _scan(word_list: List[str], ent_type: str):
         for word in word_list:
-            for m in re.finditer(re.escape(word), text):
-                span = (m.start(), m.end())
-                if not any(span[0] < fe and span[1] > fs for fs, fe in found_spans):
-                    found_spans.add(span)
-                    entities.append(
-                        {"text": m.group(), "type": ent_type, "pos": None, "score": 0.7}
-                    )
+            for m in re.finditer(re.escape(word), text, flags=re.IGNORECASE):
+                raw.append(
+                    {
+                        "text": m.group(),
+                        "type": ent_type,
+                        "start": m.start(),
+                        "end": m.end(),
+                        "sentence_id": -1,
+                        "pos": None,
+                        "score": 0.7,
+                    }
+                )
 
     _scan(_PERSON_DICT, "PER")
     _scan(_LOCATION_DICT, "LOC")
     _scan(_ORG_DICT, "ORG")
     _scan(_MISC_DICT, "MISC")
-    return entities
-
-
-# ── VnCoreNLP backend ─────────────────────────────────────────────────────────
+    return _attach_spans(raw, text)
 
 
 class _VnCoreNLPBackend:
-    """
-    Wrap VnCoreNLP server.
-    Cài: pip install vncorenlp
-    Tải jar + models: https://github.com/vncorenlp/VnCoreNLP
-    """
-
     def __init__(self, jar_path: str, port: int = 9000):
         self.jar_path = jar_path
         self.port = port
@@ -166,10 +255,7 @@ class _VnCoreNLPBackend:
         if self._client is None:
             print(f"[NER/VnCoreNLP] Khởi động (jar={self.jar_path}, port={self.port})")
             self._client = _VnCoreNLP(
-                self.jar_path,
-                annotators="wseg,pos,ner",
-                port=self.port,
-                quiet=True,
+                self.jar_path, annotators="wseg,pos,ner", port=self.port, quiet=True
             )
             print("[NER/VnCoreNLP] Sẵn sàng.")
 
@@ -181,7 +267,7 @@ class _VnCoreNLPBackend:
             print(f"[NER/VnCoreNLP] Lỗi: {e} — fallback rule-based")
             return _rule_based_ner(text)
 
-        entities = []
+        raw_entities: List[Dict] = []
         for sent in result.get("sentences", []):
             i = 0
             while i < len(sent):
@@ -194,6 +280,7 @@ class _VnCoreNLPBackend:
                 if not ent_type:
                     i += 1
                     continue
+
                 span_toks = [tok]
                 j = i + 1
                 while j < len(sent):
@@ -203,24 +290,23 @@ class _VnCoreNLPBackend:
                         j += 1
                     else:
                         break
-                entities.append(
+
+                raw_entities.append(
                     {
-                        "text": " ".join(t["form"] for t in span_toks),
+                        "text": " ".join(t.get("form", "") for t in span_toks).strip(),
                         "type": ent_type,
                         "pos": span_toks[0].get("posTag"),
                         "score": 0.92,
                     }
                 )
                 i = j
-        return entities
+
+        return _attach_spans(raw_entities, text)
 
     def close(self):
         if self._client:
             self._client.close()
             self._client = None
-
-
-# ── underthesea backend ───────────────────────────────────────────────────────
 
 
 class _UndertheseaBackend:
@@ -240,7 +326,9 @@ class _UndertheseaBackend:
             raw = _underthesea_ner(text)
         except Exception:
             return _rule_based_ner(text)
-        entities, i = [], 0
+
+        entities: List[Dict] = []
+        i = 0
         while i < len(raw):
             word, pos, _, ner = raw[i]
             ent_type = self._MAP.get(ner)
@@ -254,6 +342,7 @@ class _UndertheseaBackend:
                         j += 1
                     else:
                         break
+
                 entities.append(
                     {
                         "text": " ".join(span),
@@ -265,38 +354,27 @@ class _UndertheseaBackend:
                 i = j
             else:
                 i += 1
-        return entities
 
-
-# ── Main NER engine ───────────────────────────────────────────────────────────
+        return _attach_spans(entities, text)
 
 
 class VietnameseNER:
-    """
-    NER tiếng Việt — tự chọn backend tốt nhất có sẵn.
-
-    Khuyến nghị cho production (100k bài):
-        ner = VietnameseNER(vncorenlp_jar="VnCoreNLP-1.1.1.jar")
-
-    Chạy không cần cài gì thêm (fallback tự động):
-        ner = VietnameseNER()
-    """
-
     def __init__(
         self,
         vncorenlp_jar: Optional[str] = None,
         vncorenlp_port: int = 9000,
         use_transformer: bool = False,
         transformer_model: str = "NlpHUST/ner-vietnamese-electra-base",
-        use_model: bool = None,  # backward-compat alias cho use_transformer
+        use_model: bool = None,
     ):
         if use_model is not None:
             use_transformer = use_model
+
         self._backend = None
         self._hf_pipe = None
         self._backend_name = "rule-based"
+        self._extract_cache: Dict[str, List[Dict]] = {}
 
-        # 1. VnCoreNLP
         if vncorenlp_jar and _VNCORENLP_AVAILABLE:
             try:
                 self._backend = _VnCoreNLPBackend(vncorenlp_jar, vncorenlp_port)
@@ -306,20 +384,16 @@ class VietnameseNER:
             except Exception as e:
                 print(f"[NER] VnCoreNLP lỗi: {e}")
 
-        # 2. underthesea
         if _UNDERTHESEA_AVAILABLE:
             self._backend = _UndertheseaBackend()
             self._backend_name = "underthesea"
             print("[NER] Backend: underthesea")
             return
 
-        # 3. HuggingFace transformer
         if use_transformer and _TRANSFORMERS_AVAILABLE:
             try:
                 self._hf_pipe = _hf_pipeline(
-                    "ner",
-                    model=transformer_model,
-                    aggregation_strategy="simple",
+                    "ner", model=transformer_model, aggregation_strategy="simple"
                 )
                 self._backend_name = "transformer"
                 print(f"[NER] Backend: HuggingFace ({transformer_model})")
@@ -327,56 +401,70 @@ class VietnameseNER:
             except Exception as e:
                 print(f"[NER] Transformer lỗi: {e}")
 
-        # 4. Rule-based
         print("[NER] Backend: rule-based (fallback)")
 
+    def _cache_key(self, text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
     def extract(self, text: str) -> List[Dict]:
-        """Trích xuất entity, trả về list {text, type, pos, score}."""
+        """Trích xuất entity có span + sentence_id."""
         if not text or not text.strip():
             return []
+
+        key = self._cache_key(text)
+        if key in self._extract_cache:
+            return [dict(e) for e in self._extract_cache[key]]
+
         if self._backend is not None:
-            return self._backend.annotate(text)
-        if self._hf_pipe:
+            entities = self._backend.annotate(text)
+        elif self._hf_pipe:
             try:
                 raw = self._hf_pipe(text)
-                return [
-                    {
-                        "text": r["word"],
-                        "type": r["entity_group"],
-                        "pos": None,
-                        "score": round(float(r["score"]), 3),
-                    }
-                    for r in raw
-                ]
+                entities = _attach_spans(
+                    [
+                        {
+                            "text": r.get("word", ""),
+                            "type": r.get("entity_group", "MISC"),
+                            "pos": None,
+                            "score": round(float(r.get("score", 0.8)), 3),
+                        }
+                        for r in raw
+                    ],
+                    text,
+                )
             except Exception:
-                pass
-        return _rule_based_ner(text)
+                entities = _rule_based_ner(text)
+        else:
+            entities = _rule_based_ner(text)
+
+        self._extract_cache[key] = [dict(e) for e in entities]
+        return entities
 
     def extract_from_document(self, doc: Dict) -> Dict:
-        """Thêm field 'entities' vào document. Dedup theo (text.lower, type)."""
         text = doc.get("full_text", doc.get("content", ""))
         raw = self.extract(text)
-        seen, unique = set(), []
+
+        seen = set()
+        unique: List[Dict] = []
         for e in raw:
-            key = (e["text"].lower(), e["type"])
-            if key not in seen:
-                seen.add(key)
-                unique.append(
-                    {
-                        "text": e["text"],
-                        "type": e["type"],
-                        "pos": e.get("pos"),
-                        "score": e.get("score", 0.8),
-                    }
-                )
-        out = doc.copy()
+            key = (
+                e.get("start"),
+                e.get("end"),
+                e.get("type"),
+                e.get("text", "").lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(e)
+
+        out = dict(doc)
         out["entities"] = unique
         return out
 
     def batch_extract(self, documents: List[Dict], log_every: int = 500) -> List[Dict]:
-        """Xử lý hàng loạt, log progress."""
         print(f"[NER] Xử lý {len(documents)} bài (backend={self._backend_name})...")
-        result = []
+        result: List[Dict] = []
         for i, doc in enumerate(documents):
             result.append(self.extract_from_document(doc))
             if (i + 1) % log_every == 0 or (i + 1) == len(documents):
@@ -393,24 +481,12 @@ class VietnameseNER:
         return self._backend_name
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-
-
 def get_entities_by_type(entities: List[Dict], entity_type: str) -> List[str]:
-    return [e["text"] for e in entities if e["type"] == entity_type]
+    return [e.get("text", "") for e in entities if e.get("type") == entity_type]
 
-
-# ── Demo ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     ner = VietnameseNER()
-    for text in [
-        "Putin gặp Zelensky tại Ukraine để đàm phán hòa bình",
-        "WHO cảnh báo dịch COVID-19 bùng phát tại Hà Nội và TP.HCM",
-        "Samsung khai trương R&D tại Hà Nội với sự tham dự của Phạm Minh Chính",
-    ]:
-        print(f"\n{text}")
-        for e in ner.extract(text):
-            print(
-                f"  {e['text']:20s} [{e['type']}] pos={e.get('pos')} score={e.get('score')}"
-            )
+    text = "Putin gặp Zelensky tại Ukraine để đàm phán hòa bình. WHO cảnh báo dịch COVID-19 tại Hà Nội."
+    for e in ner.extract(text):
+        print(e)

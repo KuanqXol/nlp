@@ -35,19 +35,22 @@ sys.path.insert(0, str(SRC_DIR))
 
 # ── Import các module ────────────────────────────────────────────────────────
 
-from data_loader import NewsDataLoader
-from ner_extraction import VietnameseNER
-from entity_linking import EntityLinker
-from relation_extraction import RelationExtractor
-from knowledge_graph import KnowledgeGraph
-from embedding import EmbeddingManager
-from similarity_graph import SimilarityGraphBuilder
-from graph_ranking import GraphRanker
-from query_processor import QueryProcessor
-from query_expansion import QueryExpander
-from retriever import Retriever
-from rag_pipeline import RAGPipeline
-from graph_visualization import KnowledgeGraphVisualizer
+from src.data_loader import NewsDataLoader
+from src.preprocessing import VietnameseNER, EntityLinker, RelationExtractor
+from src.graph import (
+    KnowledgeGraph,
+    GraphRanker,
+    SimilarityGraphBuilder,
+    KnowledgeGraphVisualizer,
+)
+from src.retrieval import (
+    EmbeddingManager,
+    Retriever,
+    chunk_documents,
+    QueryProcessor,
+    QueryExpander,
+)
+from src.rag import RAGPipeline
 
 
 # ── Banner ───────────────────────────────────────────────────────────────────
@@ -156,13 +159,31 @@ class NewsSearchSystem:
 
         # ── 6. Embedding + Retrieval Index ────────────────────────────────
         print("\n🔢 Bước 6/6: Tạo Embedding Index...")
-        self.em.build_document_index(docs)
-        self.retriever.build(docs, self.em, self._importance_scores)
+        chunks, doc_to_chunks = chunk_documents(
+            docs,
+            strategy="sentence_window",
+            max_chars=400,
+            overlap=1,
+            prepend_title=True,
+        )
+        self.em.build_document_index(
+            [{"id": c["chunk_id"], "full_text": c["chunk_text"]} for c in chunks]
+        )
+        self.retriever.build(
+            chunks,
+            self.em,
+            doc_to_chunks,
+            docs,
+            graph_ranker=self.ranker,
+            kg=self.kg,
+            importance_scores=self._importance_scores,
+        )
 
         # ── Query Expander ────────────────────────────────────────────────
         self._query_expander = QueryExpander(
             self.kg,
-            self._importance_scores,
+            graph_ranker=self.ranker,
+            importance_scores=self._importance_scores,
             max_hop1=5,
             max_hop2=4,
         )

@@ -97,6 +97,18 @@ ID2LABEL = {i: label for label, i in LABEL2ID.items()}
 
 NO_RELATION_ID = LABEL2ID["no_relation"]
 
+# ── Inference constraints ───────────────────────────────────────────────────
+# (source_type, target_type) -> allowed relation labels
+VALID_RELATIONS: Dict[Tuple[str, str], List[str]] = {
+    ("PER", "ORG"): ["leads", "member_of", "cooperates_with"],
+    ("PER", "LOC"): ["located_in", "leads"],
+    ("ORG", "LOC"): ["located_in", "invests_in", "supports"],
+    ("ORG", "ORG"): ["cooperates_with", "member_of", "acquires"],
+    ("LOC", "LOC"): ["supports", "sanctions", "cooperates_with"],
+}
+
+MAX_ENTITY_TOKEN_DISTANCE = 30
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2. WIKIDATA FETCHER
@@ -638,6 +650,37 @@ class PhoBERTRelationExtractor:
 
         return label, confidence
 
+    @staticmethod
+    def _is_valid_relation_for_types(relation: str, e1_type: str, e2_type: str) -> bool:
+        allowed = VALID_RELATIONS.get((e1_type, e2_type), [])
+        if relation in allowed:
+            return True
+        # Một số quan hệ có thể đối xứng theo thứ tự cặp type.
+        reverse_allowed = VALID_RELATIONS.get((e2_type, e1_type), [])
+        return relation in reverse_allowed
+
+    @staticmethod
+    def _token_distance(sentence: str, entity1: str, entity2: str) -> int:
+        tokens = sentence.split()
+        if not tokens:
+            return 10**9
+
+        def _find_index(entity: str) -> int:
+            etoks = entity.split()
+            if not etoks:
+                return -1
+            n = len(etoks)
+            for i in range(max(0, len(tokens) - n + 1)):
+                if [t.lower() for t in tokens[i : i + n]] == [t.lower() for t in etoks]:
+                    return i
+            return -1
+
+        i1 = _find_index(entity1)
+        i2 = _find_index(entity2)
+        if i1 < 0 or i2 < 0:
+            return 10**9
+        return abs(i1 - i2)
+
     def extract_from_document(
         self,
         doc: Dict,
@@ -670,15 +713,37 @@ class PhoBERTRelationExtractor:
             s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 8
         ]
 
-        triples_seen: Dict[Tuple, float] = {}
+        triples_seen: Dict[Tuple, Dict] = {}
 
         def _try_pair(sent, e1_name, e1_ent, e2_name, e2_ent, decay=1.0):
+            # Constraint C: loại cặp entity quá xa nhau theo token distance.
+            token_dist = self._token_distance(sent, e1_name, e2_name)
+            if token_dist > MAX_ENTITY_TOKEN_DISTANCE:
+                return
+
             relation, conf = self.predict_pair(sent, e1_name, e2_name)
             conf = round(conf * decay, 3)
+
+            # Constraint A: threshold confidence.
             if relation == "no_relation" or conf < threshold:
                 return
+
+            # Constraint B: quan hệ phải hợp lệ với cặp type thực thể.
+            if not self._is_valid_relation_for_types(
+                relation,
+                e1_ent.get("type", "MISC"),
+                e2_ent.get("type", "MISC"),
+            ):
+                return
+
             key = (e1_name, relation, e2_name)
-            triples_seen[key] = max(triples_seen.get(key, 0.0), conf)
+            prev = triples_seen.get(key)
+            if prev is None or conf > prev.get("confidence", 0.0):
+                triples_seen[key] = {
+                    "confidence": conf,
+                    "sentence": sent,
+                    "token_distance": token_dist,
+                }
 
         # Per-sentence
         for sent in sentences:
@@ -716,13 +781,15 @@ class PhoBERTRelationExtractor:
 
         # Build output
         result = []
-        for (subj, rel, obj), conf in triples_seen.items():
+        for (subj, rel, obj), info in triples_seen.items():
             triple = {
                 "subject": subj,
                 "relation": rel,
                 "object": obj,
-                "confidence": conf,
+                "confidence": info["confidence"],
                 "method": "phobert",
+                "sentence": info.get("sentence", ""),
+                "token_distance": info.get("token_distance", -1),
             }
             if doc_date:
                 triple["temporal"] = doc_date
@@ -776,7 +843,7 @@ class HybridRelationExtractor:
 
     def __init__(self, phobert_dir: Optional[str] = None, min_confidence: float = 0.60):
         # Rule-based (luôn có)
-        from relation_extraction import RelationExtractor
+        from src.preprocessing.relation_extraction import RelationExtractor
 
         self._rule = RelationExtractor()
         self._min_conf = min_confidence
