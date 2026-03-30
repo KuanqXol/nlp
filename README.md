@@ -6,6 +6,7 @@ Hệ thống tìm kiếm tin tức tiếng Việt kết hợp:
 - Personalized PageRank
 - Chunk-based retrieval
 - FAISS / NumPy vector search
+- BM25 + Reciprocal Rank Fusion
 - Cross-encoder reranking
 - RAG summary
 
@@ -25,6 +26,7 @@ DataLoader
 VietnameseNER
   - underthesea mặc định
   - HuggingFace nếu --use-model và load được
+  - ner_with_checkpoint() + ner_cache.json
         ↓
 EntityLinker
   - exact alias
@@ -44,7 +46,8 @@ Chunking + EmbeddingManager
 Retriever
   - FAISS mặc định nếu có
   - NumPy fallback
-  - Cross-encoder rerank nếu model load được
+  - BM25 + RRF hybrid retrieval
+  - Cross-encoder rerank top-20 nếu model load được
         ↓
 RAGPipeline
   - Claude nếu có ANTHROPIC_API_KEY
@@ -59,6 +62,7 @@ news_kg_rag/
 │   ├── vnexpress_articles.csv
 │   └── index/
 │       ├── state.pkl
+│       ├── bm25.pkl
 │       └── knowledge_graph.pkl
 ├── scripts/
 │   └── build_index.py
@@ -161,6 +165,15 @@ python scripts/build_index.py --data data/custom_news.json --index-dir data/inde
 ```
 
 Sau bước này, state sẽ được lưu trong `data/index/` mặc định.
+Các artifact thường gặp:
+
+- `state.pkl`: documents, chunks, embedding state
+- `knowledge_graph.pkl`: graph đã build
+- `bm25.pkl`: BM25 backend đã serialize
+- `vector.index`: FAISS index nếu môi trường có FAISS
+- `ner_cache.json`: cache text → entities
+- `ner_checkpoint.json`: tiến độ NER để resume nếu build bị ngắt
+- `ner_results.jsonl`: kết quả NER incremental
 
 ### 2. Search từ index đã build
 
@@ -168,6 +181,7 @@ Sau bước này, state sẽ được lưu trong `data/index/` mặc định.
 python main.py --load-index
 python main.py --load-index --query "kinh tế việt nam" --no-llm
 python main.py --load-index --index-dir data/index_custom --query "WHO COVID-19"
+python main.py --load-index --use-phobert-re --phobert-dir data/phobert_re
 ```
 
 ### 3. Rebuild trực tiếp từ raw data
@@ -176,6 +190,7 @@ python main.py --load-index --index-dir data/index_custom --query "WHO COVID-19"
 python main.py
 python main.py --data data/vnexpress_articles.csv --query "chiến tranh nga ukraine"
 python main.py --data data/custom_news.json --query "Samsung Hà Nội"
+python main.py --data data/vnexpress_articles.csv --use-phobert-re --phobert-dir data/phobert_re
 ```
 
 ## CLI options
@@ -191,6 +206,8 @@ python main.py --data data/custom_news.json --query "Samsung Hà Nội"
 | `--viz` | `False` | Xuất KG visualization |
 | `--load-index` | `False` | Load index từ disk thay vì rebuild |
 | `--index-dir` | `data/index` | Thư mục chứa `state.pkl` và `knowledge_graph.pkl` |
+| `--use-phobert-re` | `False` | Bật Hybrid Relation Extractor với PhoBERT nếu có model |
+| `--phobert-dir` | `data/phobert_re` | Thư mục model PhoBERT RE đã fine-tune |
 
 ## Interactive commands
 
@@ -216,6 +233,8 @@ python main.py --data data/custom_news.json --query "Samsung Hà Nội"
 
 - `underthesea` là backend mặc định hiện tại
 - nếu `--use-model` và model load được, có thể dùng HuggingFace
+- có `ner_with_checkpoint()` để resume batch lớn
+- cache NER được persist ra `ner_cache.json`
 - fallback cuối là rule-based
 
 ### `src/preprocessing/entity_linking.py`
@@ -235,7 +254,7 @@ python main.py --data data/custom_news.json --query "Samsung Hà Nội"
 
 - `chunking.py`: sentence-window chunking
 - `embedding.py`: SBERT hoặc TF-IDF fallback
-- `retriever.py`: FAISS mặc định nếu có, NumPy fallback, cross-encoder rerank
+- `retriever.py`: FAISS mặc định nếu có, BM25 + RRF, cross-encoder rerank top-20
 - `query_expansion.py`: relation-aware expansion + multi-query support
 
 ### `src/rag/pipeline.py`
@@ -255,7 +274,11 @@ python test_system.py
 ## Lưu ý thực tế
 
 - FAISS được bật mặc định trong `main.py`, nhưng nếu import FAISS thất bại hệ thống sẽ tự rơi về NumPy backend.
-- Cross-encoder được bật mặc định trong `Retriever`, nhưng nếu `sentence-transformers` hoặc model không load được thì reranking sẽ tự tắt.
+- Nếu có FAISS, index sẽ được lưu thêm ra `vector.index`; nếu không có thì hệ thống vẫn load lại từ embedding state.
+- BM25 luôn được serialize ra `bm25.pkl` để `--load-index` không phải rebuild lexical backend.
+- Cross-encoder được bật mặc định trong `Retriever`, và sẽ rerank top-20 candidates; nếu `sentence-transformers` hoặc model không load được thì hệ thống tự fallback.
+- `--use-phobert-re` sẽ dùng `HybridRelationExtractor`; nếu thiếu model/GPU thì tự fallback về rule-based extractor.
+- Build dài có thể resume nhờ `ner_checkpoint.json` và `ner_results.jsonl`.
 - `--use-model` là “best effort”: nếu HuggingFace model không tải được, hệ thống vẫn fallback về backend sẵn có.
 
 ## Troubleshooting
@@ -271,6 +294,8 @@ Nếu báo thiếu file, hãy build lại:
 ```bash
 python scripts/build_index.py
 ```
+
+Nếu muốn resume NER batch dài sau khi bị ngắt, giữ nguyên `--index-dir` cũ để hệ thống dùng lại `ner_checkpoint.json` và `ner_cache.json`.
 
 ### Không có FAISS
 

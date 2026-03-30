@@ -21,6 +21,7 @@ Phạm vi:
 
 import atexit
 import csv
+import json
 import shutil
 import sys
 import traceback
@@ -211,7 +212,11 @@ except Exception as e:
 section("2. NER")
 # ════════════════════════════════════════════════════════════════════════════
 try:
-    from src.preprocessing.ner import VietnameseNER, get_entities_by_type
+    from src.preprocessing.ner import (
+        VietnameseNER,
+        get_entities_by_type,
+        ner_with_checkpoint,
+    )
 
     ner = VietnameseNER(use_model=False)
 
@@ -241,6 +246,35 @@ try:
     docs_ner = ner.batch_extract(docs[:3])
     results.append(
         check(all("entities" in d for d in docs_ner), "Batch NER thêm field 'entities'")
+    )
+
+    ner_cache = TEMP_ROOT / "ner_cache.json"
+    ner_checkpoint = TEMP_ROOT / "ner_checkpoint.json"
+    ner_results = TEMP_ROOT / "ner_results.jsonl"
+    docs_checkpoint = ner_with_checkpoint(
+        docs[:2],
+        ner,
+        checkpoint_path=str(ner_checkpoint),
+        cache_path=str(ner_cache),
+        results_path=str(ner_results),
+        log_every=1,
+    )
+    docs_resume = ner_with_checkpoint(
+        docs[:2],
+        ner,
+        checkpoint_path=str(ner_checkpoint),
+        cache_path=str(ner_cache),
+        results_path=str(ner_results),
+        log_every=1,
+    )
+    ner_cached = VietnameseNER(use_model=False, cache_path=str(ner_cache))
+    results.append(check(ner_cache.exists(), "Lưu được ner_cache.json"))
+    results.append(check(ner_checkpoint.exists(), "Lưu được NER checkpoint"))
+    results.append(check(ner_results.exists(), "Lưu được NER results JSONL"))
+    results.append(check(len(docs_checkpoint) == 2, "ner_with_checkpoint() xử lý đủ 2 docs"))
+    results.append(check(len(docs_resume) == 2, "ner_with_checkpoint() resume không lỗi"))
+    results.append(
+        check(len(getattr(ner_cached, "_extract_cache", {})) > 0, "Load lại NER cache từ disk")
     )
 
 except Exception as e:
@@ -532,7 +566,7 @@ except Exception as e:
 section("10. Retriever")
 # ════════════════════════════════════════════════════════════════════════════
 try:
-    from src.retrieval.retriever import Retriever
+    from src.retrieval.retriever import Retriever, _FAISS_AVAILABLE
 
     if em is None:
         raise RuntimeError("EmbeddingManager không khả dụng")
@@ -594,6 +628,8 @@ try:
     results.append(check(len(results_r) > 0, "search() trả về kết quả"))
     results.append(check(len(results_r) <= 3, "search() trả về ≤ top_k"))
     results.append(check("retrieval_score" in results_r[0], "Kết quả có 'retrieval_score'"))
+    results.append(check("bm25_score" in results_r[0], "Kết quả có 'bm25_score'"))
+    results.append(check("rrf_score" in results_r[0], "Kết quả có 'rrf_score'"))
     results.append(check(results_r[0]["id"] == "r1", "Bài Nga-Ukraine được rank cao nhất"))
 
     results_rr = ret.retrieve("dịch bệnh COVID", top_k=3, rerank=True)
@@ -601,6 +637,29 @@ try:
 
     doc = ret.get_document("r1")
     results.append(check(doc is not None and doc["id"] == "r1", "get_document() hoạt động"))
+
+    retriever_dir = TEMP_ROOT / "retriever_artifacts"
+    ret.save_artifacts(str(retriever_dir))
+    results.append(check((retriever_dir / "bm25.pkl").exists(), "Lưu được bm25.pkl"))
+
+    ret_loaded = Retriever(use_faiss=False, use_cross_encoder=False)
+    ret_loaded.attach_state(em2, sample_docs, chunk_mode=False)
+    ret_loaded.load_artifacts(str(retriever_dir))
+    loaded_hits = ret_loaded.search("chiến tranh nga ukraine", top_k=2)
+    results.append(check(len(loaded_hits) > 0, "Load BM25 artifact và search được"))
+
+    if _FAISS_AVAILABLE:
+        ret_faiss = Retriever(use_faiss=True, use_cross_encoder=False)
+        ret_faiss.build_simple(sample_docs, em2)
+        faiss_dir = TEMP_ROOT / "retriever_faiss"
+        ret_faiss.save_artifacts(str(faiss_dir))
+        results.append(check((faiss_dir / "vector.index").exists(), "Lưu được vector.index"))
+
+        ret_faiss_loaded = Retriever(use_faiss=True, use_cross_encoder=False)
+        ret_faiss_loaded.attach_state(em2, sample_docs, chunk_mode=False)
+        ret_faiss_loaded.load_artifacts(str(faiss_dir))
+        faiss_hits = ret_faiss_loaded.search("chiến tranh nga ukraine", top_k=2)
+        results.append(check(len(faiss_hits) > 0, "Load FAISS index và search được"))
 
 except Exception as e:
     record_exception("Retriever", e)
@@ -643,7 +702,7 @@ except Exception as e:
 section("12. NewsSearchSystem + Index")
 # ════════════════════════════════════════════════════════════════════════════
 try:
-    from main import NewsSearchSystem
+    from main import NewsSearchSystem, parse_args
 
     print(f"\n  {INFO} Đang build pipeline trên fixture CSV...")
 
@@ -652,6 +711,9 @@ try:
         use_model=False,
         use_faiss=False,
         use_llm=False,
+        use_phobert_re=True,
+        phobert_dir=str(TEMP_ROOT / "missing_phobert"),
+        index_dir=str(INDEX_DIR),
     )
     system.build()
     system.save_index(str(INDEX_DIR))
@@ -660,12 +722,21 @@ try:
     results.append(
         check((INDEX_DIR / "knowledge_graph.pkl").exists(), "Lưu knowledge_graph.pkl thành công")
     )
+    results.append(check((INDEX_DIR / "bm25.pkl").exists(), "Lưu retriever bm25.pkl thành công"))
+    results.append(check((INDEX_DIR / "ner_cache.json").exists(), "Build tạo ner_cache.json"))
+    results.append(
+        check((INDEX_DIR / "ner_checkpoint.json").exists(), "Build tạo ner_checkpoint.json"))
+    results.append(
+        check((INDEX_DIR / "ner_results.jsonl").exists(), "Build tạo ner_results.jsonl"))
 
     loaded_system = NewsSearchSystem(
         data_path=str(FIXTURE_CSV),
         use_model=False,
         use_faiss=False,
         use_llm=False,
+        use_phobert_re=True,
+        phobert_dir=str(TEMP_ROOT / "missing_phobert"),
+        index_dir=str(INDEX_DIR),
     )
     loaded_system.load_index(str(INDEX_DIR))
     loaded_result = loaded_system.search("kinh tế việt nam", top_k=3, hops=1)
@@ -676,6 +747,21 @@ try:
             any("Kinh tế Việt Nam" in article.get("title", "") for article in loaded_result["articles"]),
             "Query 'kinh tế việt nam' tìm được bài kinh tế phù hợp",
         )
+    )
+
+    cli_args = parse_args(
+        [
+            "--load-index",
+            "--index-dir",
+            str(INDEX_DIR),
+            "--use-phobert-re",
+            "--phobert-dir",
+            str(TEMP_ROOT / "missing_phobert"),
+        ]
+    )
+    results.append(check(cli_args.use_phobert_re, "parse_args nhận --use-phobert-re"))
+    results.append(
+        check(cli_args.phobert_dir == str(TEMP_ROOT / "missing_phobert"), "parse_args nhận --phobert-dir")
     )
 
 except Exception as e:

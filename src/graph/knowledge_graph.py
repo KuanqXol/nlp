@@ -31,7 +31,7 @@ except ImportError:
 # ── Cấu hình ─────────────────────────────────────────────────────────────────
 
 MIN_TRIPLE_CONFIDENCE = 0.60  # Triple confidence thấp hơn → bỏ qua
-MAX_COOCCUR_PER_DOC = 10  # Tối đa N cặp co-occurrence per document
+MAX_COOCCUR_PER_DOC = 5  # Tối đa N cặp co-occurrence per document
 COOCCUR_MIN_ENTITY_SCORE = 0.70  # Chỉ co-occur entity có link_score cao
 
 

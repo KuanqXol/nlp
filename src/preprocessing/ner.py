@@ -19,7 +19,9 @@ Output entity chuẩn:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from pathlib import Path
 from typing import Dict, List, Optional
 
 try:
@@ -366,6 +368,7 @@ class VietnameseNER:
         use_transformer: bool = False,
         transformer_model: str = "NlpHUST/ner-vietnamese-electra-base",
         use_model: bool = None,
+        cache_path: Optional[str] = None,
     ):
         if use_model is not None:
             use_transformer = use_model
@@ -380,6 +383,8 @@ class VietnameseNER:
                 self._backend = _VnCoreNLPBackend(vncorenlp_jar, vncorenlp_port)
                 self._backend_name = "VnCoreNLP"
                 print("[NER] Backend: VnCoreNLP")
+                if cache_path:
+                    self.load_cache(cache_path)
                 return
             except Exception as e:
                 print(f"[NER] VnCoreNLP lỗi: {e}")
@@ -391,6 +396,8 @@ class VietnameseNER:
                 )
                 self._backend_name = "transformer"
                 print(f"[NER] Backend: HuggingFace ({transformer_model})")
+                if cache_path:
+                    self.load_cache(cache_path)
                 return
             except Exception as e:
                 print(f"[NER] Transformer lỗi: {e}")
@@ -399,9 +406,13 @@ class VietnameseNER:
             self._backend = _UndertheseaBackend()
             self._backend_name = "underthesea"
             print("[NER] Backend: underthesea")
+            if cache_path:
+                self.load_cache(cache_path)
             return
 
         print("[NER] Backend: rule-based (fallback)")
+        if cache_path:
+            self.load_cache(cache_path)
 
     def _cache_key(self, text: str) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -472,6 +483,27 @@ class VietnameseNER:
         print("[NER] Hoàn thành.")
         return result
 
+    def load_cache(self, cache_path: str):
+        path = Path(cache_path)
+        if not path.exists():
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._extract_cache = {
+                    str(key): list(value) for key, value in data.items()
+                }
+                print(f"[NER] Đã load cache: {path} ({len(self._extract_cache)} keys)")
+        except Exception as e:
+            print(f"[NER] Không load được cache {path}: {e}")
+
+    def save_cache(self, cache_path: str):
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self._extract_cache, f, ensure_ascii=False)
+
     def close(self):
         if isinstance(self._backend, _VnCoreNLPBackend):
             self._backend.close()
@@ -483,6 +515,89 @@ class VietnameseNER:
 
 def get_entities_by_type(entities: List[Dict], entity_type: str) -> List[str]:
     return [e.get("text", "") for e in entities if e.get("type") == entity_type]
+
+
+def _documents_fingerprint(documents: List[Dict]) -> str:
+    sha = hashlib.sha1()
+    for doc in documents:
+        sha.update(str(doc.get("id", "")).encode("utf-8"))
+        sha.update(b"|")
+        sha.update(str(doc.get("url", "")).encode("utf-8"))
+        sha.update(b"|")
+        sha.update(str(doc.get("date", "")).encode("utf-8"))
+        sha.update(b"\n")
+    return sha.hexdigest()
+
+
+def ner_with_checkpoint(
+    documents: List[Dict],
+    ner: VietnameseNER,
+    checkpoint_path: str,
+    cache_path: Optional[str] = None,
+    results_path: Optional[str] = None,
+    log_every: int = 500,
+) -> List[Dict]:
+    checkpoint_file = Path(checkpoint_path)
+    results_file = Path(results_path or checkpoint_file.with_suffix(".jsonl"))
+    dataset_fingerprint = _documents_fingerprint(documents)
+    start_idx = 0
+    result: List[Dict] = []
+
+    if cache_path:
+        ner.load_cache(cache_path)
+
+    if checkpoint_file.exists() and results_file.exists():
+        try:
+            with open(checkpoint_file, encoding="utf-8") as f:
+                checkpoint = json.load(f)
+            if checkpoint.get("fingerprint") == dataset_fingerprint:
+                start_idx = int(checkpoint.get("next_index", 0))
+                with open(results_file, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            result.append(json.loads(line))
+                if len(result) < start_idx:
+                    start_idx = len(result)
+                else:
+                    result = result[:start_idx]
+                if start_idx:
+                    print(f"[NER] Resume từ checkpoint: {start_idx}/{len(documents)}")
+        except Exception as e:
+            print(f"[NER] Bỏ qua checkpoint lỗi: {e}")
+            start_idx = 0
+            result = []
+
+    file_mode = "a" if start_idx > 0 else "w"
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(results_file, file_mode, encoding="utf-8") as sink:
+        for i in range(start_idx, len(documents)):
+            processed = ner.extract_from_document(documents[i])
+            result.append(processed)
+            sink.write(json.dumps(processed, ensure_ascii=False) + "\n")
+
+            if (i + 1) % log_every == 0 or (i + 1) == len(documents):
+                checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(checkpoint_file, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "fingerprint": dataset_fingerprint,
+                            "next_index": i + 1,
+                            "total": len(documents),
+                            "completed": (i + 1) == len(documents),
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                if cache_path:
+                    ner.save_cache(cache_path)
+                print(f"  [{i+1}/{len(documents)}]")
+
+    if cache_path:
+        ner.save_cache(cache_path)
+    return result
 
 
 if __name__ == "__main__":
