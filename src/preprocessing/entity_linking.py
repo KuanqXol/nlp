@@ -40,6 +40,9 @@ except ImportError:
 
 DEFAULT_MODEL = "keepitreal/vietnamese-sbert"
 DEFAULT_THRESHOLD = 0.85
+LEVENSHTEIN_MIN_LEN = 4
+LEVENSHTEIN_SHORT_MAX_DISTANCE = 1
+LEVENSHTEIN_LONG_MAX_DISTANCE = 2
 
 
 def _normalize_text(text: str) -> str:
@@ -64,6 +67,42 @@ def _normalized_forms(text: str) -> Tuple[str, str]:
 def _make_entity_id(canonical: str) -> str:
     base = _remove_diacritics(_normalize_text(canonical)).replace(" ", "_")
     return re.sub(r"[^a-zA-Z0-9_]", "", base) or "entity"
+
+
+LEVENSHTEIN_BLACKLIST_PAIRS = {
+    tuple(sorted((_remove_diacritics(_normalize_text(left)), _remove_diacritics(_normalize_text(right)))))
+    for left, right in [
+        ("Hà Nội", "Hà Nam"),
+        ("Viettel", "Vietjet"),
+        ("NATO", "nano"),
+        ("VinAI", "Vincom"),
+        ("Google", "Googol"),
+        ("Samsung", "Samson"),
+    ]
+}
+
+
+def _levenshtein_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    if len(left) < len(right):
+        left, right = right, left
+
+    previous = list(range(len(right) + 1))
+    for i, ch_left in enumerate(left, 1):
+        current = [i]
+        for j, ch_right in enumerate(right, 1):
+            insert_cost = current[j - 1] + 1
+            delete_cost = previous[j] + 1
+            replace_cost = previous[j - 1] + (ch_left != ch_right)
+            current.append(min(insert_cost, delete_cost, replace_cost))
+        previous = current
+
+    return previous[-1]
 
 
 class _EmbeddingBackend:
@@ -225,7 +264,10 @@ class EntityLinker:
             return
         if info.get("embedding") is not None:
             return
-        info["embedding"] = self._encode_cached(info["canonical"])
+        try:
+            info["embedding"] = self._encode_cached(info["canonical"])
+        except RuntimeError:
+            return
 
     def _exact_lookup(self, surface_form: str) -> Optional[str]:
         norm, norm_no = _normalized_forms(surface_form)
@@ -235,7 +277,52 @@ class EntityLinker:
             return self._exact_no_diacritics[norm_no]
         return None
 
+    def _levenshtein_lookup(self, surface_form: str) -> Tuple[Optional[str], float]:
+        _, norm_no = _normalized_forms(surface_form)
+        if len(norm_no) < LEVENSHTEIN_MIN_LEN:
+            return None, 0.0
+
+        best_id = None
+        best_dist = None
+        best_score = 0.0
+
+        for candidate_norm_no, entity_id in self._exact_no_diacritics.items():
+            if len(candidate_norm_no) < LEVENSHTEIN_MIN_LEN:
+                continue
+            if norm_no[0] != candidate_norm_no[0]:
+                continue
+            if (
+                tuple(sorted((norm_no, candidate_norm_no)))
+                in LEVENSHTEIN_BLACKLIST_PAIRS
+            ):
+                continue
+
+            max_len = max(len(norm_no), len(candidate_norm_no))
+            max_dist = (
+                LEVENSHTEIN_SHORT_MAX_DISTANCE
+                if max_len < 8
+                else LEVENSHTEIN_LONG_MAX_DISTANCE
+            )
+            if abs(len(norm_no) - len(candidate_norm_no)) > max_dist:
+                continue
+
+            dist = _levenshtein_distance(norm_no, candidate_norm_no)
+            if dist > max_dist:
+                continue
+
+            sim = 1.0 - (dist / max_len)
+            if best_dist is None or dist < best_dist or (
+                dist == best_dist and sim > best_score
+            ):
+                best_id = entity_id
+                best_dist = dist
+                best_score = sim
+
+        return best_id, round(best_score, 4) if best_id else 0.0
+
     def _embedding_lookup(self, surface_form: str) -> Tuple[Optional[str], float]:
+        if not _SBERT_AVAILABLE:
+            return None, 0.0
         if not self._entities:
             return None, 0.0
 
@@ -300,7 +387,25 @@ class EntityLinker:
             self._link_cache[cache_key] = dict(out)
             return out
 
-        # Stage 3: embedding similarity
+        # Stage 3: fuzzy Levenshtein match
+        fuzzy_id, fuzzy_sim = self._levenshtein_lookup(surface_form)
+        if fuzzy_id:
+            info = self._entities[fuzzy_id]
+            info["frequency"] += 1
+            info["aliases"].add(surface_form)
+            self._register_exact(surface_form, fuzzy_id)
+            out = {
+                "entity_id": fuzzy_id,
+                "surface_form": surface_form,
+                "canonical": info["canonical"],
+                "type": info.get("type", entity_type),
+                "similarity": fuzzy_sim,
+                "match_type": "levenshtein",
+            }
+            self._link_cache[cache_key] = dict(out)
+            return out
+
+        # Stage 4: embedding similarity
         candidate_id, sim = self._embedding_lookup(surface_form)
         if candidate_id and sim >= self.similarity_threshold:
             info = self._entities[candidate_id]

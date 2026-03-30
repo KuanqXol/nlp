@@ -24,6 +24,7 @@ Pipeline tổng thể:
 
 import argparse
 import os
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,7 @@ from pathlib import Path
 # Thêm src vào path
 SRC_DIR = Path(__file__).parent / "src"
 DATA_DIR = Path(__file__).parent / "data"
+INDEX_DIR = DATA_DIR / "index"
 sys.path.insert(0, str(SRC_DIR))
 
 # ── Import các module ────────────────────────────────────────────────────────
@@ -93,7 +95,7 @@ class NewsSearchSystem:
         self,
         data_path: str = None,
         use_model: bool = False,
-        use_faiss: bool = False,
+        use_faiss: bool = True,
         use_llm: bool = True,
     ):
         """
@@ -103,7 +105,7 @@ class NewsSearchSystem:
             use_faiss: True → dùng FAISS index (cần cài faiss-cpu)
             use_llm: True → thử dùng Claude API (cần ANTHROPIC_API_KEY)
         """
-        self.data_path = data_path or str(DATA_DIR / "news_dataset.json")
+        self.data_path = data_path or str(DATA_DIR / "vnexpress_articles.csv")
 
         print(BANNER)
         print("🔧 Đang khởi tạo hệ thống...\n")
@@ -122,6 +124,8 @@ class NewsSearchSystem:
 
         # State
         self._documents = []
+        self._chunks = []
+        self._doc_to_chunks = {}
         self._importance_scores = {}
         self._query_expander = None
 
@@ -152,6 +156,8 @@ class NewsSearchSystem:
         # ── 5. Knowledge Graph ────────────────────────────────────────────
         print("\n🗺️  Bước 5/6: Xây dựng Knowledge Graph...")
         self.kg.build_from_documents(docs)
+        print("   Thêm similarity edges...")
+        SimilarityGraphBuilder(threshold=0.80).build(self.kg, self.em)
 
         # PageRank
         print("   Tính PageRank...")
@@ -178,6 +184,8 @@ class NewsSearchSystem:
             kg=self.kg,
             importance_scores=self._importance_scores,
         )
+        self._chunks = chunks
+        self._doc_to_chunks = doc_to_chunks
 
         # ── Query Expander ────────────────────────────────────────────────
         self._query_expander = QueryExpander(
@@ -192,6 +200,75 @@ class NewsSearchSystem:
 
         elapsed = time.time() - t0
         print(f"\n✅ Hệ thống đã sẵn sàng! ({elapsed:.1f}s)")
+        self._print_stats()
+
+    def save_index(self, index_dir: str = None):
+        if not self._documents or not self._chunks:
+            raise RuntimeError("Chưa có state để lưu. Hãy chạy build() trước.")
+
+        target_dir = Path(index_dir or INDEX_DIR)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "metadata": {
+                "data_path": self.data_path,
+                "saved_at": int(time.time()),
+            },
+            "documents": self._documents,
+            "chunks": self._chunks,
+            "doc_to_chunks": self._doc_to_chunks,
+            "importance_scores": self._importance_scores,
+            "embedding_state": self.em.export_state(),
+        }
+
+        with open(target_dir / "state.pkl", "wb") as f:
+            pickle.dump(state, f)
+        self.kg.save(str(target_dir / "knowledge_graph.pkl"))
+        print(f"[Index] Đã lưu index vào: {target_dir}")
+
+    def load_index(self, index_dir: str = None):
+        target_dir = Path(index_dir or INDEX_DIR)
+        state_path = target_dir / "state.pkl"
+        kg_path = target_dir / "knowledge_graph.pkl"
+
+        if not state_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy state index: {state_path}")
+        if not kg_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy knowledge graph index: {kg_path}")
+
+        print(f"[Index] Đang load index từ: {target_dir}")
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
+
+        self.kg.load(str(kg_path))
+        self.data_path = state.get("metadata", {}).get("data_path", self.data_path)
+        self._documents = state.get("documents", [])
+        self._chunks = state.get("chunks", [])
+        self._doc_to_chunks = state.get("doc_to_chunks", {})
+        self._importance_scores = state.get("importance_scores", {})
+        self.em = EmbeddingManager.from_state(state.get("embedding_state", {}))
+
+        self.ranker._global_pagerank = dict(getattr(self.kg, "_pagerank", {}))
+        self.ranker._importance_scores = dict(self._importance_scores)
+
+        self.retriever.build(
+            self._chunks,
+            self.em,
+            self._doc_to_chunks,
+            self._documents,
+            graph_ranker=self.ranker,
+            kg=self.kg,
+            importance_scores=self._importance_scores,
+        )
+        self._query_expander = QueryExpander(
+            self.kg,
+            graph_ranker=self.ranker,
+            importance_scores=self._importance_scores,
+            max_hop1=5,
+            max_hop2=4,
+        )
+
+        print("[Index] Load xong. Hệ thống sẵn sàng.")
         self._print_stats()
 
     def _print_stats(self):
@@ -318,7 +395,18 @@ def parse_args():
         "-d",
         type=str,
         default=None,
-        help="Đường dẫn file JSON dataset (mặc định: data/news_dataset.json)",
+        help="Đường dẫn file JSON/CSV dataset (mặc định: data/vnexpress_articles.csv)",
+    )
+    parser.add_argument(
+        "--load-index",
+        action="store_true",
+        help="Load state từ disk thay vì rebuild toàn bộ pipeline",
+    )
+    parser.add_argument(
+        "--index-dir",
+        type=str,
+        default=str(INDEX_DIR),
+        help="Thư mục index trên disk (mặc định: data/index)",
     )
     parser.add_argument(
         "--top-k", "-k", type=int, default=7, help="Số bài báo trả về (mặc định: 7)"
@@ -354,12 +442,14 @@ def main():
     system = NewsSearchSystem(
         data_path=args.data,
         use_model=args.use_model,
-        use_faiss=False,  # Đổi thành True nếu cài faiss-cpu
+        use_faiss=True,
         use_llm=not args.no_llm,
     )
 
-    # Build toàn bộ pipeline
-    system.build()
+    if args.load_index:
+        system.load_index(args.index_dir)
+    else:
+        system.build()
 
     # Visualization sau khi build (nếu yêu cầu)
     if args.viz:

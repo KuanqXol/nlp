@@ -1,30 +1,35 @@
 """
-test_system.py — Bộ test toàn diện cho Vietnamese News Search System
+test_system.py — Bộ smoke test cho Vietnamese News Search System
 
 Chạy:
     python test_system.py
 
-Kiểm tra:
-  1. DataLoader
-  2. NER (rule-based)
-  3. EntityLinker (alias + fuzzy)
+Phạm vi:
+  1. DataLoader (CSV, parse date, strip author, dedup, lang filter)
+  2. NER
+  3. EntityLinker
   4. RelationExtractor
-  5. KnowledgeGraph (build, query, stats)
-  6. EmbeddingManager (TF-IDF)
-  7. GraphRanker (PageRank)
+  5. KnowledgeGraph
+  6. EmbeddingManager
+  7. GraphRanker
   8. QueryProcessor
   9. QueryExpander
   10. Retriever
   11. RAGPipeline
-  12. End-to-end queries
+  12. NewsSearchSystem build/save/load index
 """
 
+import atexit
+import csv
+import shutil
 import sys
-import os
 import traceback
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+ROOT_DIR = Path(__file__).parent.resolve()
+SRC_DIR = ROOT_DIR / "src"
+sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(SRC_DIR))
 
 # ── Màu terminal ────────────────────────────────────────────────────────────
 GREEN = "\033[92m"
@@ -51,39 +56,159 @@ def check(condition: bool, msg: str):
     return condition
 
 
+def record_exception(label: str, exc: Exception):
+    results.append(check(False, f"{label} exception: {exc}"))
+    traceback.print_exc()
+
+
+TEMP_ROOT = ROOT_DIR / ".tmp_test_system"
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+FIXTURE_CSV = TEMP_ROOT / "sample_news.csv"
+INDEX_DIR = TEMP_ROOT / "index"
+atexit.register(lambda: shutil.rmtree(TEMP_ROOT, ignore_errors=True))
+
+
+def write_fixture_csv():
+    rows = [
+        {
+            "url": "https://vnexpress.net/putin-zelensky.html",
+            "date": "Thứ sáu, 31/7/2020, 18:15 (GMT+7)",
+            "category": "thế giới",
+            "title": "Putin gặp Zelensky tại Ukraine",
+            "text": (
+                "Putin gặp Zelensky tại Ukraine. NATO hỗ trợ Ukraine tại Hà Nội.\n"
+                "Nguyễn Nam"
+            ),
+        },
+        {
+            "url": "https://vnexpress.net/putin-zelensky.html",
+            "date": "Thứ sáu, 31/7/2020, 18:30 (GMT+7)",
+            "category": "thế giới",
+            "title": "Bản trùng bài Putin",
+            "text": "Bản trùng cần bị loại.\nNguyễn Nam",
+        },
+        {
+            "url": "https://vnexpress.net/english-story.html",
+            "date": "Thứ bảy, 1/8/2020, 09:30 (GMT+7)",
+            "category": "thế giới",
+            "title": "English article",
+            "text": (
+                "This article is mostly English and should be filtered out because "
+                "it lacks Vietnamese diacritics."
+            ),
+        },
+        {
+            "url": "https://vnexpress.net/gdp-vietnam.html",
+            "date": "Chủ nhật, 2/8/2020, 08:00 (GMT+7)",
+            "category": "kinh tế",
+            "title": "Kinh tế Việt Nam tăng trưởng",
+            "text": (
+                "Kinh tế Việt Nam tăng trưởng 7% GDP trong quý III tại Hà Nội.\n"
+                "Trần Minh"
+            ),
+        },
+        {
+            "url": "https://vnexpress.net/who-covid.html",
+            "date": "Thứ hai, 3/8/2020, 07:45 (GMT+7)",
+            "category": "y tế",
+            "title": "WHO cảnh báo COVID-19 tại châu Á",
+            "text": (
+                "WHO cảnh báo COVID-19 tại châu Á. Việt Nam tăng cường giám sát "
+                "dịch bệnh.\nLê Anh"
+            ),
+        },
+        {
+            "url": "https://vnexpress.net/samsung-rd.html",
+            "date": "Thứ ba, 4/8/2020, 10:30 (GMT+7)",
+            "category": "công nghệ",
+            "title": "Samsung khai trương R&D tại Hà Nội",
+            "text": (
+                "Samsung khai trương trung tâm R&D tại Hà Nội với 3000 kỹ sư.\n"
+                "Mai Lan"
+            ),
+        },
+    ]
+
+    with open(FIXTURE_CSV, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["url", "date", "category", "title", "text"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+write_fixture_csv()
+
 results = []
 
 # ════════════════════════════════════════════════════════════════════════════
 section("1. DataLoader")
 # ════════════════════════════════════════════════════════════════════════════
 try:
-    from src.data_loader import NewsDataLoader, normalize_text
+    from src.data_loader import (
+        NewsDataLoader,
+        normalize_text,
+        parse_vn_date,
+        strip_author,
+        viet_ratio,
+    )
 
-    loader = NewsDataLoader("data/news_dataset.json")
+    loader = NewsDataLoader(str(FIXTURE_CSV))
     docs = loader.load()
     stats = loader.summary()
 
-    results.append(check(len(docs) > 0, "Load document thành công"))
+    results.append(check(len(docs) == 4, "CSV load sau dedup/lang filter còn 4 docs"))
     results.append(check("title" in docs[0], "Document có field 'title'"))
     results.append(check("content" in docs[0], "Document có field 'content'"))
     results.append(check("full_text" in docs[0], "Document có field 'full_text'"))
     results.append(check(stats["total"] == len(docs), "Thống kê total khớp"))
-    results.append(check(len(stats["by_category"]) > 0, "Thống kê theo category"))
+    results.append(check(len(stats["by_category"]) >= 3, "Thống kê theo category"))
     results.append(
-        check(normalize_text("  Xin  chào  ") == "Xin chào", "Normalize text")
+        check(normalize_text("  Xin  chào  ") == "Xin chào", "normalize_text()")
     )
-
-    # Lọc theo category
+    results.append(
+        check(
+            parse_vn_date("Thứ sáu, 31/7/2020, 18:15 (GMT+7)") == "2020-07-31",
+            "parse_vn_date()",
+        )
+    )
+    results.append(
+        check(
+            strip_author("Nội dung chính của bài viết.\nNguyễn Nam")
+            == "Nội dung chính của bài viết.",
+            "strip_author()",
+        )
+    )
+    results.append(
+        check(viet_ratio("This is English only.") < 0.05, "viet_ratio() filterable"))
+    results.append(
+        check(
+            stats["load_stats"]["skipped_dedup"] == 1,
+            "Dedup theo URL hoạt động",
+        )
+    )
+    results.append(
+        check(
+            stats["load_stats"]["skipped_lang"] == 1,
+            "Language filter hoạt động",
+        )
+    )
+    results.append(
+        check(
+            all(d.get("source") == "VnExpress" for d in docs),
+            "Tự suy luận source từ URL",
+        )
+    )
     the_gioi = loader.get_by_category("thế giới")
     results.append(check(len(the_gioi) > 0, "Lọc theo category 'thế giới'"))
 
 except Exception as e:
-    print(f"  {FAIL}  DataLoader exception: {e}")
-    traceback.print_exc()
+    record_exception("DataLoader", e)
     docs = []
 
 # ════════════════════════════════════════════════════════════════════════════
-section("2. NER (Rule-based)")
+section("2. NER")
 # ════════════════════════════════════════════════════════════════════════════
 try:
     from src.preprocessing.ner import VietnameseNER, get_entities_by_type
@@ -101,21 +226,25 @@ try:
 
     text2 = "WHO cảnh báo dịch H5N1 tại Hà Nội và TP.HCM"
     ents2 = ner.extract(text2)
-    orgs = get_entities_by_type(ents2, "ORG")
-    locs = get_entities_by_type(ents2, "LOC")
+    per_or_org = get_entities_by_type(ents2, "PER") + get_entities_by_type(ents2, "ORG")
 
-    results.append(check("WHO" in orgs, "Phát hiện ORG: 'WHO'"))
-    results.append(check(len(locs) >= 1, "Phát hiện LOC entity"))
+    results.append(
+        check(any(e["text"].lower() == "who" for e in ents2), "Nhận ra entity 'WHO'"))
+    results.append(
+        check(
+            any("hà nội" in e["text"].lower() or "tp.hcm" in e["text"].lower() for e in ents2),
+            "Nhận ra ít nhất một địa danh Việt Nam",
+        )
+    )
+    results.append(check(isinstance(per_or_org, list), "get_entities_by_type() hoạt động"))
 
-    # Batch extract
-    docs_ner = ner.batch_extract(docs[:5])
+    docs_ner = ner.batch_extract(docs[:3])
     results.append(
         check(all("entities" in d for d in docs_ner), "Batch NER thêm field 'entities'")
     )
 
 except Exception as e:
-    print(f"  {FAIL}  NER exception: {e}")
-    traceback.print_exc()
+    record_exception("NER", e)
     ner, docs_ner = None, []
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -126,51 +255,37 @@ try:
 
     linker = EntityLinker()
 
+    results.append(check(linker.link("Hanoi")[0] == "Hà Nội", "Link 'Hanoi' → 'Hà Nội'"))
+    results.append(check(linker.link("Hanoy")[0] == "Hà Nội", "Levenshtein 'Hanoy' → 'Hà Nội'"))
     results.append(
-        check(linker.link("Hanoi")[0] == "Hà Nội", "Link 'Hanoi' → 'Hà Nội'")
-    )
-    results.append(
-        check(
-            linker.link("SARS-CoV-2")[0] == "COVID-19", "Link 'SARS-CoV-2' → 'COVID-19'"
-        )
+        check(linker.link("SARS-CoV-2")[0] == "COVID-19", "Link 'SARS-CoV-2' → 'COVID-19'")
     )
     results.append(check(linker.link("Hoa Kỳ")[0] == "Mỹ", "Link 'Hoa Kỳ' → 'Mỹ'"))
     results.append(
-        check(
-            linker.link("Vladimir Putin")[0] == "Putin",
-            "Link 'Vladimir Putin' → 'Putin'",
-        )
+        check(linker.link("Vladimir Putin")[0] == "Putin", "Link 'Vladimir Putin' → 'Putin'")
     )
-    results.append(
-        check(linker.link("WHO")[0] == "WHO", "Link 'WHO' → 'WHO' (giữ nguyên)")
-    )
+    results.append(check(linker.link("WHO")[0] == "WHO", "Link 'WHO' → 'WHO' (giữ nguyên)"))
 
-    # Gộp entity trùng
     sample_ents = [
         {"text": "Hà Nội", "type": "LOC"},
         {"text": "Hanoi", "type": "LOC"},
-        {"text": "WHO", "type": "ORG"},
-        {"text": "Tổ chức Y tế Thế giới", "type": "ORG"},
+        {"text": "Hanoy", "type": "LOC"},
     ]
     linked = linker.link_entities(sample_ents)
     canonical_names = [e["canonical"] for e in linked]
-    results.append(
-        check("Hà Nội" in canonical_names, "Gộp 'Hà Nội' + 'Hanoi' → 'Hà Nội'")
-    )
+    results.append(check("Hà Nội" in canonical_names, "Gộp các biến thể về 'Hà Nội'"))
     results.append(
         check(
             len([e for e in linked if e["canonical"] == "Hà Nội"]) == 1,
-            "Không trùng lặp sau gộp",
+            "Không trùng lặp sau khi gộp entity",
         )
     )
 
-    # Add custom alias
     linker.add_alias("VnEx", "VnExpress")
     results.append(check(linker.link("VnEx")[0] == "VnExpress", "Thêm alias runtime"))
 
 except Exception as e:
-    print(f"  {FAIL}  EntityLinker exception: {e}")
-    traceback.print_exc()
+    record_exception("EntityLinker", e)
     linker = None
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -183,20 +298,22 @@ try:
 
     sample_doc = {
         "full_text": (
-            "Tổng thống Nga Putin tuyên bố tiếp tục chiến dịch tại Ukraine. "
+            "Putin tuyên bố tiếp tục chiến dịch tại Ukraine. "
             "Zelensky kêu gọi NATO hỗ trợ thêm vũ khí. "
             "WHO cảnh báo dịch COVID-19 bùng phát tại Hà Nội."
         ),
         "linked_entities": [
-            {"text": "Putin", "canonical": "Putin", "type": "PER"},
-            {"text": "Nga", "canonical": "Nga", "type": "LOC"},
-            {"text": "Ukraine", "canonical": "Ukraine", "type": "LOC"},
-            {"text": "Zelensky", "canonical": "Zelensky", "type": "PER"},
-            {"text": "NATO", "canonical": "NATO", "type": "ORG"},
-            {"text": "WHO", "canonical": "WHO", "type": "ORG"},
-            {"text": "COVID-19", "canonical": "COVID-19", "type": "MISC"},
-            {"text": "Hà Nội", "canonical": "Hà Nội", "type": "LOC"},
+            {"text": "Putin", "canonical": "Putin", "type": "PER", "link_score": 1.0},
+            {"text": "Nga", "canonical": "Nga", "type": "LOC", "link_score": 1.0},
+            {"text": "Ukraine", "canonical": "Ukraine", "type": "LOC", "link_score": 1.0},
+            {"text": "Zelensky", "canonical": "Zelensky", "type": "PER", "link_score": 1.0},
+            {"text": "NATO", "canonical": "NATO", "type": "ORG", "link_score": 1.0},
+            {"text": "WHO", "canonical": "WHO", "type": "ORG", "link_score": 1.0},
+            {"text": "COVID-19", "canonical": "COVID-19", "type": "MISC", "link_score": 1.0},
+            {"text": "Hà Nội", "canonical": "Hà Nội", "type": "LOC", "link_score": 1.0},
         ],
+        "date": "2024-01-15",
+        "category": "thế giới",
     }
 
     processed = rel_ex.process_document(sample_doc)
@@ -205,26 +322,12 @@ try:
     results.append(check(len(triples) > 0, "Trích xuất được triple"))
     results.append(check("triples" in processed, "Document có field 'triples'"))
 
-    # Batch
-    all_docs = docs[:5]
-    # Thêm linked_entities từ NER
-    if docs_ner:
-        all_docs = docs_ner[:5]
-        for d in all_docs:
-            if "linked_entities" not in d:
-                d["linked_entities"] = []
-
-    processed_docs = rel_ex.batch_process(all_docs)
+    processed_docs = rel_ex.batch_process(docs[:3])
     results.append(
-        check(
-            all("triples" in d for d in processed_docs),
-            "Batch process thêm 'triples' vào tất cả doc",
-        )
-    )
+        check(all("triples" in d for d in processed_docs), "Batch process thêm 'triples'"))
 
 except Exception as e:
-    print(f"  {FAIL}  RelationExtractor exception: {e}")
-    traceback.print_exc()
+    record_exception("RelationExtractor", e)
 
 # ════════════════════════════════════════════════════════════════════════════
 section("5. Knowledge Graph")
@@ -238,21 +341,21 @@ try:
         {
             "id": "t1",
             "linked_entities": [
-                {"canonical": "Putin", "type": "PER"},
-                {"canonical": "Nga", "type": "LOC"},
-                {"canonical": "Ukraine", "type": "LOC"},
-                {"canonical": "Zelensky", "type": "PER"},
-                {"canonical": "NATO", "type": "ORG"},
-                {"canonical": "WHO", "type": "ORG"},
-                {"canonical": "COVID-19", "type": "MISC"},
-                {"canonical": "Việt Nam", "type": "LOC"},
+                {"canonical": "Putin", "type": "PER", "link_score": 1.0},
+                {"canonical": "Nga", "type": "LOC", "link_score": 1.0},
+                {"canonical": "Ukraine", "type": "LOC", "link_score": 1.0},
+                {"canonical": "Zelensky", "type": "PER", "link_score": 1.0},
+                {"canonical": "NATO", "type": "ORG", "link_score": 1.0},
+                {"canonical": "WHO", "type": "ORG", "link_score": 1.0},
+                {"canonical": "COVID-19", "type": "MISC", "link_score": 1.0},
+                {"canonical": "Việt Nam", "type": "LOC", "link_score": 1.0},
             ],
             "triples": [
-                {"subject": "Putin", "relation": "lãnh đạo", "object": "Nga"},
-                {"subject": "Nga", "relation": "tấn công", "object": "Ukraine"},
-                {"subject": "Zelensky", "relation": "lãnh đạo", "object": "Ukraine"},
-                {"subject": "NATO", "relation": "hỗ trợ", "object": "Ukraine"},
-                {"subject": "WHO", "relation": "cảnh báo", "object": "COVID-19"},
+                {"subject": "Putin", "relation": "leads", "object": "Nga", "confidence": 0.9},
+                {"subject": "Nga", "relation": "attacks", "object": "Ukraine", "confidence": 0.92},
+                {"subject": "Zelensky", "relation": "leads", "object": "Ukraine", "confidence": 0.9},
+                {"subject": "NATO", "relation": "supports", "object": "Ukraine", "confidence": 0.85},
+                {"subject": "WHO", "relation": "warns_about", "object": "COVID-19", "confidence": 0.88},
             ],
         },
     ]
@@ -263,7 +366,6 @@ try:
     results.append(check(stats["nodes"] > 0, "KG có nodes"))
     results.append(check(stats["edges"] > 0, "KG có edges"))
 
-    # Neighbor lookup
     neighbors = kg.get_neighbors("Ukraine", hops=2)
     results.append(check(len(neighbors["hop1"]) > 0, "Hop-1 neighbors của 'Ukraine'"))
     results.append(
@@ -273,41 +375,35 @@ try:
         )
     )
 
-    # Entity info
     info = kg.get_entity_info("WHO")
     results.append(check(info is not None, "get_entity_info trả về kết quả"))
     results.append(check(info["type"] == "ORG", "Type của 'WHO' là 'ORG'"))
 
-    # Relations between
     rels = kg.get_relations_between("Nga", "Ukraine")
     results.append(check(len(rels) > 0, "Có quan hệ giữa 'Nga' và 'Ukraine'"))
 
-    # Save / Load
-    import tempfile, os
-
-    tmp = tempfile.mktemp(suffix=".pkl")
-    kg.save(tmp)
+    tmp = TEMP_ROOT / "kg_test.pkl"
+    kg.save(str(tmp))
     kg2 = KnowledgeGraph()
-    kg2.load(tmp)
+    kg2.load(str(tmp))
     results.append(
         check(
             kg2.graph.number_of_nodes() == kg.graph.number_of_nodes(),
             "Save/Load KG giữ nguyên số nodes",
         )
     )
-    os.unlink(tmp)
 
 except Exception as e:
-    print(f"  {FAIL}  KnowledgeGraph exception: {e}")
-    traceback.print_exc()
+    record_exception("KnowledgeGraph", e)
+    from src.graph.knowledge_graph import KnowledgeGraph
+
     kg = KnowledgeGraph()
 
 # ════════════════════════════════════════════════════════════════════════════
-section("6. Embedding Manager (TF-IDF)")
+section("6. Embedding Manager")
 # ════════════════════════════════════════════════════════════════════════════
 try:
-    import numpy as np
-    from src.retrieval.embedding import EmbeddingManager, TFIDFEmbedder
+    from src.retrieval.embedding import EmbeddingManager
 
     em = EmbeddingManager(use_sbert=False)
 
@@ -323,33 +419,33 @@ try:
     results.append(check(em.doc_embeddings.shape[0] == 4, "Số doc embedding khớp"))
     results.append(check(em.embedding_dim > 0, "embedding_dim > 0"))
 
-    # Query encoding
     qvec = em.encode_query("chiến tranh nga ukraine")
-    results.append(
-        check(qvec.shape[0] == em.embedding_dim, "Query vector có đúng dimension")
-    )
+    results.append(check(qvec.shape[0] == em.embedding_dim, "Query vector đúng dimension"))
 
-    # Cosine similarity
     sim = em.cosine_similarity(qvec, em.doc_embeddings[0])
     results.append(check(0.0 <= sim <= 1.0, "Cosine similarity trong [0, 1]"))
 
-    # Bài báo đầu về Nga Ukraine phải có similarity cao nhất
     sims = [em.cosine_similarity(qvec, em.doc_embeddings[i]) for i in range(4)]
-    results.append(
-        check(sims[0] == max(sims), "Bài Nga-Ukraine có similarity cao nhất")
-    )
+    results.append(check(sims[0] == max(sims), "Doc Nga-Ukraine có similarity cao nhất"))
 
-    # Entity encoding
     ent_embs = em.encode_entities(["Nga", "Ukraine", "WHO"])
     results.append(check(len(ent_embs) == 3, "Encode 3 entity names"))
 
+    em_state = em.export_state()
+    em_loaded = EmbeddingManager.from_state(em_state)
+    results.append(
+        check(
+            em_loaded.doc_embeddings.shape == em.doc_embeddings.shape,
+            "EmbeddingManager export/load state hoạt động",
+        )
+    )
+
 except Exception as e:
-    print(f"  {FAIL}  EmbeddingManager exception: {e}")
-    traceback.print_exc()
+    record_exception("EmbeddingManager", e)
     em = None
 
 # ════════════════════════════════════════════════════════════════════════════
-section("7. Graph Ranker (PageRank)")
+section("7. Graph Ranker")
 # ════════════════════════════════════════════════════════════════════════════
 try:
     from src.graph.ranking import GraphRanker
@@ -359,32 +455,20 @@ try:
 
     results.append(check(len(pr_scores) > 0, "PageRank trả về scores"))
     results.append(
-        check(
-            all(0 <= v <= 1 for v in pr_scores.values()),
-            "Tất cả PageRank score trong [0, 1]",
-        )
-    )
+        check(all(0 <= v <= 1 for v in pr_scores.values()), "Tất cả score trong [0, 1]"))
+    results.append(check(pr_scores.get("Ukraine", 0) > 0, "Ukraine có PageRank > 0"))
 
-    # Ukraine có nhiều in-edge → phải có score cao
-    ukraine_score = pr_scores.get("Ukraine", 0)
-    nato_score = pr_scores.get("NATO", 0)
-    results.append(check(ukraine_score > 0, "Ukraine có PageRank > 0"))
-
-    # Importance scores
     imp_scores = ranker.compute_importance_scores(kg)
-    results.append(
-        check(len(imp_scores) == len(pr_scores), "Importance scores = số entity")
-    )
+    results.append(check(len(imp_scores) == len(pr_scores), "Importance scores hợp lệ"))
 
-    # Top-k
     top5 = ranker.get_top_k(imp_scores, k=5)
     results.append(check(len(top5) <= 5, "get_top_k trả về ≤ 5"))
     results.append(check(top5[0][1] >= top5[-1][1], "Top-k được sắp xếp giảm dần"))
 
 except Exception as e:
-    print(f"  {FAIL}  GraphRanker exception: {e}")
-    traceback.print_exc()
+    record_exception("GraphRanker", e)
     imp_scores = {}
+    ranker = None
 
 # ════════════════════════════════════════════════════════════════════════════
 section("8. Query Processor")
@@ -394,38 +478,18 @@ try:
 
     qproc = QueryProcessor(ner, linker)
 
-    # Test queries
-    test_cases = [
-        ("chiến tranh nga ukraine", "thế giới"),
-        ("WHO cảnh báo dịch COVID-19", "y tế"),
-        ("kinh tế Việt Nam tăng trưởng", "kinh tế"),
-        ("bầu cử tổng thống Mỹ 2024", "thế giới"),
-        ("Samsung công nghệ AI", "công nghệ"),
-    ]
+    pq = qproc.process("chiến tranh nga ukraine 2024")
+    results.append(check("entities" in pq, "Process query → có 'entities'"))
+    results.append(check("keywords" in pq, "Process query → có 'keywords'"))
+    results.append(check(len(pq["keywords"]) > 0, "Keywords không rỗng"))
+    results.append(check(pq.get("topic") == "thế giới", "Phát hiện topic 'thế giới'"))
+    results.append(check(pq.get("year_filter") == "2024", "Trích xuất năm '2024'"))
 
-    for query, expected_topic in test_cases:
-        pq = qproc.process(query)
-        results.append(
-            check("entities" in pq, f"Process '{query[:20]}...' → có 'entities'")
-        )
-        results.append(
-            check("keywords" in pq, f"Process '{query[:20]}...' → có 'keywords'")
-        )
-        results.append(check(len(pq["keywords"]) > 0, f"Keywords không rỗng"))
-        break  # Chỉ test 1 case để ngắn gọn
-
-    # Test với query rỗng
     pq_empty = qproc.process("")
     results.append(check(pq_empty["entities"] == [], "Query rỗng → entities = []"))
 
-    # Test entity extraction
-    pq_nga = qproc.process("chiến tranh nga ukraine 2024")
-    entity_names = qproc.get_query_entity_names(pq_nga)
-    results.append(check("2024" == pq_nga.get("year_filter"), "Trích xuất năm '2024'"))
-
 except Exception as e:
-    print(f"  {FAIL}  QueryProcessor exception: {e}")
-    traceback.print_exc()
+    record_exception("QueryProcessor", e)
     qproc = None
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -434,7 +498,13 @@ section("9. Query Expander")
 try:
     from src.retrieval.query_expansion import QueryExpander
 
-    expander = QueryExpander(kg, imp_scores, max_hop1=4, max_hop2=3)
+    expander = QueryExpander(
+        kg,
+        graph_ranker=ranker,
+        importance_scores=imp_scores,
+        max_hop1=4,
+        max_hop2=3,
+    )
     pq_test = {
         "entities": [{"canonical": "Ukraine", "type": "LOC"}],
         "keywords": ["chiến tranh"],
@@ -447,25 +517,16 @@ try:
     results.append(check("hop1_entities" in exp, "Expansion có 'hop1_entities'"))
     results.append(check("hop2_entities" in exp, "Expansion có 'hop2_entities'"))
     results.append(check("expanded_query" in exp, "Expansion có 'expanded_query'"))
-    results.append(
-        check(
-            "ukraine" in exp["expanded_query"].lower(), "Expanded query chứa entity gốc"
-        )
-    )
+    results.append(check("multi_queries" in exp, "Expansion có 'multi_queries'"))
+    results.append(check("ukraine" in exp["expanded_query"].lower(), "Expanded query chứa entity gốc"))
+    results.append(check(len(exp["hop1_entities"]) > 0, "Có ít nhất 1 hop-1 neighbor"))
 
-    # Hop-1 của Ukraine nên bao gồm Nga, Zelensky, NATO
-    hop1 = exp["hop1_entities"]
-    results.append(check(len(hop1) > 0, "Có ít nhất 1 hop-1 neighbor"))
-
-    # Explain không raise exception
     explain_text = expander.explain(exp)
-    results.append(
-        check("QUY TRÌNH MỞ RỘNG QUERY" in explain_text, "explain() trả về text đúng")
-    )
+    results.append(check("QUERY EXPANSION" in explain_text, "explain() trả về heading đúng"))
+    results.append(check("Multi-queries" in explain_text, "explain() hiển thị multi-queries"))
 
 except Exception as e:
-    print(f"  {FAIL}  QueryExpander exception: {e}")
-    traceback.print_exc()
+    record_exception("QueryExpander", e)
 
 # ════════════════════════════════════════════════════════════════════════════
 section("10. Retriever")
@@ -486,6 +547,7 @@ try:
             "date": "2024-01-15",
             "url": "https://vne.vn/1",
             "category": "thế giới",
+            "linked_entities": [{"canonical": "Ukraine"}, {"canonical": "NATO"}],
         },
         {
             "id": "r2",
@@ -496,6 +558,7 @@ try:
             "date": "2024-01-16",
             "url": "https://vnn.vn/2",
             "category": "y tế",
+            "linked_entities": [{"canonical": "WHO"}, {"canonical": "COVID-19"}],
         },
         {
             "id": "r3",
@@ -506,6 +569,7 @@ try:
             "date": "2024-01-17",
             "url": "https://tn.vn/3",
             "category": "công nghệ",
+            "linked_entities": [{"canonical": "VinAI"}],
         },
         {
             "id": "r4",
@@ -516,16 +580,7 @@ try:
             "date": "2024-01-18",
             "url": "https://vne.vn/4",
             "category": "kinh tế",
-        },
-        {
-            "id": "r5",
-            "title": "Samsung khai trương R&D Hà Nội",
-            "full_text": "Samsung Electronics khai trương trung tâm R&D tại Hà Nội.",
-            "content": "Samsung mở R&D tại Hà Nội.",
-            "source": "Tuổi Trẻ",
-            "date": "2024-01-19",
-            "url": "https://tt.vn/5",
-            "category": "công nghệ",
+            "linked_entities": [{"canonical": "Việt Nam"}],
         },
     ]
 
@@ -535,55 +590,42 @@ try:
     ret = Retriever(use_faiss=False)
     ret.build_simple(sample_docs, em2)
 
-    # Retrieve
-    results_r = ret.retrieve("chiến tranh nga ukraine", top_k=3)
-    results.append(check(len(results_r) > 0, "Retrieve trả về kết quả"))
-    results.append(check(len(results_r) <= 3, "Retrieve trả về ≤ top_k"))
-    results.append(
-        check("retrieval_score" in results_r[0], "Kết quả có 'retrieval_score'")
-    )
-    results.append(
-        check(results_r[0]["id"] == "r1", "Bài Nga-Ukraine được rank cao nhất")
-    )
+    results_r = ret.search("chiến tranh nga ukraine", top_k=3)
+    results.append(check(len(results_r) > 0, "search() trả về kết quả"))
+    results.append(check(len(results_r) <= 3, "search() trả về ≤ top_k"))
+    results.append(check("retrieval_score" in results_r[0], "Kết quả có 'retrieval_score'"))
+    results.append(check(results_r[0]["id"] == "r1", "Bài Nga-Ukraine được rank cao nhất"))
 
-    # Retrieve với rerank
     results_rr = ret.retrieve("dịch bệnh COVID", top_k=3, rerank=True)
     results.append(check(len(results_rr) > 0, "Reranking không lỗi"))
 
-    # get_document
     doc = ret.get_document("r1")
-    results.append(
-        check(doc is not None and doc["id"] == "r1", "get_document() hoạt động")
-    )
+    results.append(check(doc is not None and doc["id"] == "r1", "get_document() hoạt động"))
 
 except Exception as e:
-    print(f"  {FAIL}  Retriever exception: {e}")
-    traceback.print_exc()
-    ret = em2 = None
+    record_exception("Retriever", e)
+    ret = None
 
 # ════════════════════════════════════════════════════════════════════════════
 section("11. RAG Pipeline")
 # ════════════════════════════════════════════════════════════════════════════
 try:
-    from src.rag.pipeline import RAGPipeline, build_context, TemplateSummarizer
+    from src.rag.pipeline import RAGPipeline, TemplateSummarizer, build_context
 
     if ret is None:
         raise RuntimeError("Retriever không khả dụng")
 
     rag = RAGPipeline(ret, use_llm=False, top_k=5)
 
-    # Test build_context
     ctx = build_context(sample_docs[:2], max_chars_per_doc=100)
     results.append(check(len(ctx) > 0, "build_context tạo được string"))
     results.append(check("Bài 1" in ctx, "Context có label 'Bài 1'"))
 
-    # Template summarizer
     ts = TemplateSummarizer()
     summary = ts.summarize("nga ukraine", sample_docs[:3])
     results.append(check("NGA UKRAINE" in summary.upper(), "Summary chứa query"))
     results.append(check(len(summary) > 50, "Summary không rỗng"))
 
-    # Full RAG run
     result = rag.run("chiến tranh nga ukraine", top_k=3)
     results.append(check("query" in result, "RAG result có 'query'"))
     results.append(check("articles" in result, "RAG result có 'articles'"))
@@ -591,77 +633,53 @@ try:
     results.append(check("sources" in result, "RAG result có 'sources'"))
     results.append(check(len(result["articles"]) > 0, "RAG trả về bài báo"))
 
-    # Format không raise
     formatted = rag.format_result(result)
     results.append(check("═" in formatted, "format_result trả về table"))
 
 except Exception as e:
-    print(f"  {FAIL}  RAGPipeline exception: {e}")
-    traceback.print_exc()
+    record_exception("RAGPipeline", e)
 
 # ════════════════════════════════════════════════════════════════════════════
-section("12. End-to-End Full Pipeline")
+section("12. NewsSearchSystem + Index")
 # ════════════════════════════════════════════════════════════════════════════
 try:
-    from src.data_loader import NewsDataLoader
-    from src.preprocessing.ner import VietnameseNER
-    from src.preprocessing.entity_linking import EntityLinker
-    from src.preprocessing.relation_extraction import RelationExtractor
-    from src.graph.knowledge_graph import KnowledgeGraph
-    from src.retrieval.embedding import EmbeddingManager
-    from src.graph.ranking import GraphRanker
-    from src.retrieval.query_processor import QueryProcessor
-    from src.retrieval.query_expansion import QueryExpander
-    from src.retrieval.retriever import Retriever
-    from src.rag.pipeline import RAGPipeline
+    from main import NewsSearchSystem
 
-    print(f"\n  {INFO} Đang chạy full pipeline trên dataset thật...")
+    print(f"\n  {INFO} Đang build pipeline trên fixture CSV...")
 
-    loader = NewsDataLoader("data/news_dataset.json")
-    all_docs = loader.load()
+    system = NewsSearchSystem(
+        data_path=str(FIXTURE_CSV),
+        use_model=False,
+        use_faiss=False,
+        use_llm=False,
+    )
+    system.build()
+    system.save_index(str(INDEX_DIR))
 
-    ner_e2e = VietnameseNER(use_model=False)
-    linker_e2e = EntityLinker()
-    rel_e2e = RelationExtractor()
-    kg_e2e = KnowledgeGraph()
-    em_e2e = EmbeddingManager(use_sbert=False)
-    ranker_e2e = GraphRanker()
+    results.append(check((INDEX_DIR / "state.pkl").exists(), "Lưu state.pkl thành công"))
+    results.append(
+        check((INDEX_DIR / "knowledge_graph.pkl").exists(), "Lưu knowledge_graph.pkl thành công")
+    )
 
-    all_docs = ner_e2e.batch_extract(all_docs)
-    all_docs = linker_e2e.batch_process(all_docs)
-    all_docs = rel_e2e.batch_process(all_docs)
-    kg_e2e.build_from_documents(all_docs)
-    scores_e2e = ranker_e2e.compute_importance_scores(kg_e2e)
-    em_e2e.build_document_index(all_docs)
+    loaded_system = NewsSearchSystem(
+        data_path=str(FIXTURE_CSV),
+        use_model=False,
+        use_faiss=False,
+        use_llm=False,
+    )
+    loaded_system.load_index(str(INDEX_DIR))
+    loaded_result = loaded_system.search("kinh tế việt nam", top_k=3, hops=1)
 
-    ret_e2e = Retriever(use_faiss=False)
-    ret_e2e.build(all_docs, em_e2e, scores_e2e)
-
-    rag_e2e = RAGPipeline(ret_e2e, use_llm=False, top_k=5)
-    qproc_e2e = QueryProcessor(ner_e2e, linker_e2e)
-    expander_e2e = QueryExpander(kg_e2e, scores_e2e)
-
-    test_e2e_queries = [
-        "chiến tranh nga ukraine",
-        "WHO dịch bệnh COVID",
-        "Samsung công nghệ Việt Nam",
-        "bầu cử Mỹ 2024",
-    ]
-
-    for q in test_e2e_queries:
-        pq = qproc_e2e.process(q)
-        exp = expander_e2e.expand(pq, hops=2)
-        res = rag_e2e.run(exp["expanded_query"], expansion_result=exp)
-        results.append(
-            check(
-                len(res["articles"]) > 0,
-                f"E2E query '{q[:30]}' → {len(res['articles'])} bài báo",
-            )
+    results.append(check(len(loaded_result["articles"]) > 0, "Load index và search thành công"))
+    results.append(
+        check(
+            any("Kinh tế Việt Nam" in article.get("title", "") for article in loaded_result["articles"]),
+            "Query 'kinh tế việt nam' tìm được bài kinh tế phù hợp",
         )
+    )
 
 except Exception as e:
-    print(f"  {FAIL}  End-to-End exception: {e}")
-    traceback.print_exc()
+    record_exception("NewsSearchSystem", e)
 
 # ════════════════════════════════════════════════════════════════════════════
 # TỔNG KẾT

@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 # ── Context Builder ──────────────────────────────────────────────────────────
 
 
-def build_context(documents: List[Dict], max_chars_per_doc: int = 400) -> str:
+def build_context(documents: List[Dict], max_chars_per_doc: int = 800) -> str:
     """
     Tạo context string từ danh sách document để đưa vào LLM.
 
@@ -242,7 +242,7 @@ class RAGPipeline:
             articles = self.retriever.retrieve(query, top_k=k)
 
         # ── Bước 2: Build context ─────────────────────────────────────────
-        context = build_context(articles, max_chars_per_doc=350)
+        context = build_context(articles, max_chars_per_doc=800)
 
         # ── Bước 3: Generate summary ──────────────────────────────────────
         summary = None

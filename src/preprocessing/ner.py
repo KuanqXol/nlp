@@ -384,12 +384,6 @@ class VietnameseNER:
             except Exception as e:
                 print(f"[NER] VnCoreNLP lỗi: {e}")
 
-        if _UNDERTHESEA_AVAILABLE:
-            self._backend = _UndertheseaBackend()
-            self._backend_name = "underthesea"
-            print("[NER] Backend: underthesea")
-            return
-
         if use_transformer and _TRANSFORMERS_AVAILABLE:
             try:
                 self._hf_pipe = _hf_pipeline(
@@ -400,6 +394,12 @@ class VietnameseNER:
                 return
             except Exception as e:
                 print(f"[NER] Transformer lỗi: {e}")
+
+        if _UNDERTHESEA_AVAILABLE:
+            self._backend = _UndertheseaBackend()
+            self._backend_name = "underthesea"
+            print("[NER] Backend: underthesea")
+            return
 
         print("[NER] Backend: rule-based (fallback)")
 

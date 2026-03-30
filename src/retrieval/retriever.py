@@ -40,7 +40,7 @@ except ImportError:
 
 # ── Cấu hình ─────────────────────────────────────────────────────────────────
 
-CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-"
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 GRAPH_BOOST_ALPHA = 0.30  # graph_boost weight trong hybrid score
 VECTOR_ALPHA = 0.70  # vector score weight
 MAX_CHUNKS_PER_DOC = 2  # Tối đa N chunk/doc trước khi dedupe
@@ -201,7 +201,7 @@ class Retriever:
     def __init__(
         self,
         use_faiss: bool = True,
-        use_cross_encoder: bool = False,
+        use_cross_encoder: bool = True,
         cross_encoder_model: str = CROSS_ENCODER_MODEL,
     ):
         self._backend = (
@@ -302,7 +302,7 @@ class Retriever:
     # Retrieve
     # ─────────────────────────────────────────────────────────────────────
 
-    def retrieve(
+    def search(
         self,
         query: str,
         top_k: int = 10,
@@ -350,18 +350,46 @@ class Retriever:
         else:
             candidates = self._build_candidates_from_docs(ids, vec_scores, ppr_scores)
 
-        # Cross-encoder rerank
-        if rerank and self._reranker and self._reranker.available:
-            text_field = "chunk_text" if self._chunk_mode else "full_text"
-            candidates = self._reranker.rerank(
-                query,
-                candidates,
-                text_field=text_field,
-                top_k=top_k,
-            )
+        candidates = self._rerank(query, candidates, top_k=top_k, rerank=rerank)
 
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k]
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 10,
+        seed_entities: List[str] = None,
+        rerank: bool = True,
+        fetch_multiplier: int = 3,
+    ) -> List[Dict]:
+        return self.search(
+            query,
+            top_k=top_k,
+            seed_entities=seed_entities,
+            rerank=rerank,
+            fetch_multiplier=fetch_multiplier,
+        )
+
+    def _rerank(
+        self,
+        query: str,
+        candidates: List[Dict],
+        top_k: int,
+        rerank: bool = True,
+    ) -> List[Dict]:
+        if not rerank or not candidates:
+            return candidates[:top_k]
+        if not self._reranker:
+            return candidates[:top_k]
+
+        text_field = "chunk_text" if self._chunk_mode else "full_text"
+        return self._reranker.rerank(
+            query,
+            candidates,
+            text_field=text_field,
+            top_k=top_k,
+        )
 
     def _build_candidates_from_chunks(
         self,
