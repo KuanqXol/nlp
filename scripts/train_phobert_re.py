@@ -21,7 +21,11 @@ from typing import Dict, List, Optional, Tuple
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
-from src.evaluation_re import DEFAULT_GROUND_TRUTH, load_relation_ground_truth
+from src.evaluation_re import (
+    DEFAULT_GROUND_TRUTH,
+    load_relation_ground_truth,
+    run_re_ablation,
+)
 from src.preprocessing.relation_extraction import R
 from src.preprocessing.relation_extraction_phobert import (
     LABEL2ID,
@@ -165,6 +169,40 @@ def summarize_dataset(rows: List[Dict], source_path: str) -> Dict:
     }
 
 
+def write_ground_truth(path: str | Path, samples: List[Dict], source_path: str):
+    payload = {
+        "metadata": {
+            "name": "relation_extraction_ground_truth_split",
+            "source_path": source_path,
+            "total_samples": len(samples),
+        },
+        "samples": samples,
+    }
+    write_json(path, payload)
+
+
+def split_ground_truth_samples(
+    samples: List[Dict],
+    test_split: float,
+    seed: int,
+) -> Tuple[List[Dict], List[Dict]]:
+    if not 0.0 <= test_split < 1.0:
+        raise ValueError("test_split phải nằm trong [0.0, 1.0).")
+    if len(samples) < 3:
+        raise ValueError("Cần ít nhất 3 sample để tách train/test.")
+
+    shuffled = list(samples)
+    random.Random(seed).shuffle(shuffled)
+
+    test_size = max(1, int(round(len(shuffled) * test_split))) if test_split > 0 else 0
+    if test_size >= len(shuffled):
+        test_size = len(shuffled) - 1
+
+    test_samples = shuffled[:test_size]
+    train_samples = shuffled[test_size:]
+    return train_samples, test_samples
+
+
 def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="Prepare supervised dataset và fine-tune PhoBERT RE."
@@ -198,6 +236,12 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--val-split", type=float, default=0.2)
+    parser.add_argument("--test-split", type=float, default=0.22)
+    parser.add_argument(
+        "--test-ground-truth",
+        default="",
+        help="Ground truth riêng để evaluate sau train. Nếu bỏ trống và dùng --ground-truth thì script tự tách holdout.",
+    )
     parser.add_argument("--min-confidence", type=float, default=0.60)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args(argv)
@@ -206,6 +250,9 @@ def parse_args(argv: Optional[List[str]] = None):
 def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
     random.seed(args.seed)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    holdout_ground_truth = None
 
     if args.train_jsonl:
         train_jsonl = Path(args.train_jsonl)
@@ -213,17 +260,46 @@ def main(argv: Optional[List[str]] = None):
             raise FileNotFoundError(f"Không tìm thấy train_jsonl: {train_jsonl}")
         prepared_rows = load_jsonl(train_jsonl)
         source_path = str(train_jsonl)
+        if args.test_ground_truth:
+            holdout_ground_truth = Path(args.test_ground_truth)
     else:
         samples = load_relation_ground_truth(args.ground_truth)
-        prepared_rows = build_supervised_samples(samples)
+        train_gt_samples, test_gt_samples = split_ground_truth_samples(
+            samples,
+            test_split=args.test_split,
+            seed=args.seed,
+        )
+        prepared_rows = build_supervised_samples(train_gt_samples)
         train_jsonl = Path(args.prepared_jsonl)
         write_jsonl(train_jsonl, prepared_rows)
         source_path = str(Path(args.ground_truth))
+        write_ground_truth(
+            output_dir / "benchmark_train.json",
+            train_gt_samples,
+            source_path,
+        )
+        write_ground_truth(
+            output_dir / "benchmark_test.json",
+            test_gt_samples,
+            source_path,
+        )
+        write_json(
+            output_dir / "benchmark_split_manifest.json",
+            {
+                "seed": args.seed,
+                "test_split": args.test_split,
+                "train_samples": len(train_gt_samples),
+                "test_samples": len(test_gt_samples),
+                "train_ids": [sample.get("id", "") for sample in train_gt_samples],
+                "test_ids": [sample.get("id", "") for sample in test_gt_samples],
+            },
+        )
+        holdout_ground_truth = output_dir / "benchmark_test.json"
         print(
             f"[PhoBERTRE] Prepared supervised JSONL: {train_jsonl} ({len(prepared_rows)} rows)"
         )
 
-    summary_path = Path(args.output_dir) / "prepared_dataset_summary.json"
+    summary_path = output_dir / "prepared_dataset_summary.json"
     write_json(summary_path, summarize_dataset(prepared_rows, source_path))
     print(f"[PhoBERTRE] Dataset summary: {summary_path}")
 
@@ -234,13 +310,32 @@ def main(argv: Optional[List[str]] = None):
     extractor = PhoBERTRelationExtractor()
     train_result = extractor.train(
         train_jsonl=str(train_jsonl),
-        output_dir=args.output_dir,
+        output_dir=str(output_dir),
         val_split=args.val_split,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         min_confidence=args.min_confidence,
     )
+
+    if holdout_ground_truth and Path(holdout_ground_truth).exists():
+        print(f"[PhoBERTRE] Evaluate holdout: {holdout_ground_truth}")
+        holdout_report = run_re_ablation(
+            ground_truth=str(holdout_ground_truth),
+            phobert_dir=str(output_dir),
+            verbose=False,
+        )
+        write_json(output_dir / "test_ablation.json", holdout_report)
+        phobert_result = holdout_report.get("phobert", {})
+        if phobert_result.get("status") == "ok":
+            write_json(output_dir / "test_metrics.json", phobert_result["metrics"])
+            train_result["test_metrics"] = phobert_result["metrics"].get("micro_avg", {})
+        else:
+            train_result["test_metrics"] = {
+                "status": phobert_result.get("status", "unknown"),
+                "reason": phobert_result.get("reason", ""),
+            }
+
     print("[PhoBERTRE] Training summary:")
     print(json.dumps(train_result, ensure_ascii=False, indent=2))
 

@@ -873,6 +873,18 @@ try:
     results.append(check(prepared_jsonl.exists(), "prepare-only tạo re_train_supervised.jsonl"))
     dataset_summary = phobert_demo_dir / "prepared_dataset_summary.json"
     results.append(check(dataset_summary.exists(), "prepare-only tạo prepared_dataset_summary.json"))
+    results.append(
+        check((phobert_demo_dir / "benchmark_train.json").exists(), "prepare-only tạo benchmark_train.json")
+    )
+    results.append(
+        check((phobert_demo_dir / "benchmark_test.json").exists(), "prepare-only tạo benchmark_test.json")
+    )
+    results.append(
+        check(
+            (phobert_demo_dir / "benchmark_split_manifest.json").exists(),
+            "prepare-only tạo benchmark_split_manifest.json",
+        )
+    )
     if dataset_summary.exists():
         with open(dataset_summary, encoding="utf-8") as f:
             dl_summary = json.load(f)

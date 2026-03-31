@@ -589,22 +589,33 @@ class PhoBERTRelationExtractor:
         val_ds = REDataset(val_samples, tokenizer)
 
         # Training args
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate,
-            weight_decay=0.01,
-            warmup_ratio=0.1,
-            evaluation_strategy="epoch",
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            logging_steps=50,
-            report_to="none",
-            fp16=torch.cuda.is_available(),
-        )
+        training_kwargs = {
+            "output_dir": output_dir,
+            "num_train_epochs": num_epochs,
+            "per_device_train_batch_size": batch_size,
+            "per_device_eval_batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "weight_decay": 0.01,
+            "warmup_ratio": 0.1,
+            "save_strategy": "epoch",
+            "load_best_model_at_end": True,
+            "metric_for_best_model": "eval_loss",
+            "logging_steps": 50,
+            "report_to": "none",
+            "fp16": torch.cuda.is_available(),
+            "do_train": True,
+            "do_eval": True,
+        }
+        try:
+            training_args = TrainingArguments(
+                evaluation_strategy="epoch",
+                **training_kwargs,
+            )
+        except TypeError:
+            training_args = TrainingArguments(
+                eval_strategy="epoch",
+                **training_kwargs,
+            )
 
         trainer = Trainer(
             model=model,

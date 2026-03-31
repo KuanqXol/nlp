@@ -216,6 +216,13 @@ Fine-tune PhoBERT RE khi có `torch` + `transformers` và GPU:
 python scripts/train_phobert_re.py --output-dir data/phobert_re
 ```
 
+Script sẽ tự:
+
+- tách `relation_ground_truth.json` thành holdout `benchmark_train.json` và `benchmark_test.json`
+- build `re_train_supervised.jsonl` từ phần train
+- fine-tune PhoBERT RE
+- lưu `training_summary.json`, `train_metrics.json`, `test_metrics.json`, `test_ablation.json`
+
 Chạy ablation giữa `rule_based`, `hybrid` và `phobert`:
 
 ```bash
@@ -278,6 +285,7 @@ python -m src.evaluation_nlp --ground-truth data/ner_ground_truth.json
 - `DistantSupervisionBuilder`: tạo dữ liệu train từ corpus + Wikidata
 - `PhoBERTRelationExtractor.train()`: fine-tune classifier head
 - lưu `re_config.json`, `train_metrics.json`, `trainer_log_history.json`, `training_summary.json`
+- script train sẽ lưu thêm `benchmark_split_manifest.json`, `benchmark_test.json`, `test_metrics.json`, `test_ablation.json`
 - `HybridRelationExtractor`: ghép rule-based và PhoBERT
 
 ### `src/evaluation_*.py`
@@ -326,6 +334,7 @@ Smoke test cũng cover:
 - Cross-encoder được bật mặc định trong `Retriever`, và sẽ rerank top-20 candidates; nếu `sentence-transformers` hoặc model không load được thì hệ thống tự fallback.
 - `--use-phobert-re` sẽ dùng `HybridRelationExtractor`; nếu thiếu model/GPU thì tự fallback về rule-based extractor.
 - benchmark DL trong repo là nhỏ và phục vụ mục đích smoke test / demo workflow; muốn chất lượng tốt cần build thêm training data từ distant supervision hoặc annotate nhiều hơn.
+- checkpoint `data/phobert_re` hiện có thể train được ngay trên máy đã cache model, nhưng kết quả holdout còn thấp nếu chỉ dùng benchmark nhỏ.
 - Build dài có thể resume nhờ `ner_checkpoint.json` và `ner_results.jsonl`.
 - `--use-model` là “best effort”: nếu HuggingFace model không tải được, hệ thống vẫn fallback về backend sẵn có.
 
