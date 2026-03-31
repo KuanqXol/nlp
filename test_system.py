@@ -216,6 +216,7 @@ try:
         VietnameseNER,
         get_entities_by_type,
         ner_with_checkpoint,
+        resolve_coreference,
     )
 
     ner = VietnameseNER(use_model=False)
@@ -228,6 +229,15 @@ try:
     results.append(
         check(any(e["text"] == "Ukraine" for e in ents1), "Phát hiện 'Ukraine'")
     )
+
+    ents_name = ner.extract("Nguyễn Văn A làm việc tại Hà Nội.")
+    if ner.backend_name == "underthesea":
+        results.append(
+            check(
+                any(e["text"] == "Nguyễn Văn A" for e in ents_name),
+                "Merge proper noun liên tiếp thành một entity",
+            )
+        )
 
     text2 = "WHO cảnh báo dịch H5N1 tại Hà Nội và TP.HCM"
     ents2 = ner.extract(text2)
@@ -275,6 +285,40 @@ try:
     results.append(check(len(docs_resume) == 2, "ner_with_checkpoint() resume không lỗi"))
     results.append(
         check(len(getattr(ner_cached, "_extract_cache", {})) > 0, "Load lại NER cache từ disk")
+    )
+
+    coref_docs = resolve_coreference(
+        [
+            {
+                "id": "coref-1",
+                "full_text": "Phạm Minh Chính phát biểu. Ông nhấn mạnh cải cách.",
+                "entities": [
+                    {
+                        "text": "Phạm Minh Chính",
+                        "type": "PER",
+                        "start": 0,
+                        "end": 15,
+                        "sentence_id": 0,
+                        "pos": "Np",
+                        "score": 0.9,
+                        "entity_text": "Phạm Minh Chính",
+                        "entity_type": "PER",
+                    }
+                ],
+            }
+        ]
+    )
+    results.append(
+        check(
+            any(entity.get("coref") for entity in coref_docs[0]["entities"]),
+            "resolve_coreference() thêm coref entity",
+        )
+    )
+    results.append(
+        check(
+            any(entity.get("mention_text") == "Ông" for entity in coref_docs[0]["entities"]),
+            "resolve_coreference() giữ mention pronoun",
+        )
     )
 
 except Exception as e:

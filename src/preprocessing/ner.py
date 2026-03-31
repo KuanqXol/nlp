@@ -32,7 +32,11 @@ except ImportError:
     _VNCORENLP_AVAILABLE = False
 
 try:
-    from underthesea import ner as _underthesea_ner
+    from underthesea import (
+        ner as _underthesea_ner,
+        pos_tag as _underthesea_pos_tag,
+        word_tokenize as _underthesea_word_tokenize,
+    )
 
     _UNDERTHESEA_AVAILABLE = True
 except ImportError:
@@ -129,6 +133,22 @@ _VNCORENLP_TAG_MAP = {
     "I-ORG": "ORG",
     "B-MISC": "MISC",
     "I-MISC": "MISC",
+}
+
+_COREFERENCE_PRONOUNS = {
+    "ông": "PER",
+    "ông ấy": "PER",
+    "bà": "PER",
+    "bà ấy": "PER",
+    "anh ấy": "PER",
+    "cô ấy": "PER",
+    "họ": None,
+    "tổ chức này": "ORG",
+    "công ty này": "ORG",
+    "tập đoàn này": "ORG",
+    "thành phố này": "LOC",
+    "quốc gia này": "LOC",
+    "nước này": "LOC",
 }
 
 
@@ -247,6 +267,32 @@ def _rule_based_ner(text: str) -> List[Dict]:
     return _attach_spans(raw, text)
 
 
+def _guess_entity_type(surface: str, entities: List[Dict]) -> str:
+    lowered = surface.lower()
+
+    for ent_type, lexicon in (
+        ("PER", _PERSON_DICT),
+        ("LOC", _LOCATION_DICT),
+        ("ORG", _ORG_DICT),
+        ("MISC", _MISC_DICT),
+    ):
+        if any(lowered == item.lower() for item in lexicon):
+            return ent_type
+
+    votes: Dict[str, int] = {}
+    for entity in entities:
+        entity_text = entity.get("text", "").lower()
+        if entity_text and (entity_text in lowered or lowered in entity_text):
+            ent_type = entity.get("type", "MISC")
+            votes[ent_type] = votes.get(ent_type, 0) + 1
+    if votes:
+        return max(votes.items(), key=lambda item: item[1])[0]
+
+    if surface.isupper() and len(surface) <= 8:
+        return "ORG"
+    return "MISC"
+
+
 class _VnCoreNLPBackend:
     def __init__(self, jar_path: str, port: int = 9000):
         self.jar_path = jar_path
@@ -356,6 +402,61 @@ class _UndertheseaBackend:
                 i = j
             else:
                 i += 1
+
+        try:
+            tokenized = _underthesea_word_tokenize(text)
+            tagged = _underthesea_pos_tag(
+                " ".join(tokenized) if isinstance(tokenized, list) else tokenized
+            )
+        except Exception:
+            tagged = []
+
+        existing = {entity["text"].lower() for entity in entities}
+        buffer: List[str] = []
+
+        def _flush_buffer():
+            if not buffer:
+                return
+            surface = " ".join(buffer).replace("_", " ").strip()
+            buffer.clear()
+            if len(surface.split()) < 2:
+                return
+            if surface.lower() in existing:
+                return
+            entities.append(
+                {
+                    "text": surface,
+                    "type": _guess_entity_type(surface, entities),
+                    "pos": "Np",
+                    "score": 0.78,
+                }
+            )
+            existing.add(surface.lower())
+
+        for token, pos in tagged:
+            if pos == "Np":
+                buffer.append(token)
+            else:
+                _flush_buffer()
+        _flush_buffer()
+
+        for match in re.finditer(
+            r"\b(?:[A-ZĐ][\wÀ-ỹ.-]*\s+){1,}[A-ZĐ][\wÀ-ỹ.-]*\b",
+            text,
+            flags=re.UNICODE,
+        ):
+            surface = match.group().strip()
+            if surface.lower() in existing:
+                continue
+            entities.append(
+                {
+                    "text": surface,
+                    "type": _guess_entity_type(surface, entities),
+                    "pos": "Np",
+                    "score": 0.76,
+                }
+            )
+            existing.add(surface.lower())
 
         return _attach_spans(entities, text)
 
@@ -598,6 +699,85 @@ def ner_with_checkpoint(
     if cache_path:
         ner.save_cache(cache_path)
     return result
+
+
+def resolve_coreference(documents: List[Dict]) -> List[Dict]:
+    resolved_docs: List[Dict] = []
+
+    for doc in documents:
+        entities = sorted(
+            [dict(entity) for entity in doc.get("entities", [])],
+            key=lambda entity: (entity.get("start", -1), entity.get("end", -1)),
+        )
+        text = doc.get("full_text", doc.get("content", ""))
+        if not text or not entities:
+            resolved_docs.append(doc)
+            continue
+
+        history: List[Dict] = []
+        coref_entities: List[Dict] = []
+        sentence_spans = _split_sentences_with_offsets(text)
+
+        for sent in sentence_spans:
+            sent_entities = [
+                entity
+                for entity in entities
+                if sent["start"] <= entity.get("start", -1) < sent["end"]
+            ]
+            sent_lower = sent["text"].lower()
+
+            for pronoun, expected_type in _COREFERENCE_PRONOUNS.items():
+                for match in re.finditer(rf"\b{re.escape(pronoun)}\b", sent_lower):
+                    antecedent = None
+                    for candidate in reversed(history):
+                        if expected_type is None or candidate.get("type") == expected_type:
+                            antecedent = candidate
+                            break
+                    if not antecedent:
+                        continue
+
+                    mention_text = sent["text"][match.start() : match.end()]
+                    coref_entities.append(
+                        {
+                            "text": antecedent.get("text", mention_text),
+                            "resolved_text": antecedent.get("text", mention_text),
+                            "mention_text": mention_text,
+                            "type": antecedent.get("type", "MISC"),
+                            "start": sent["start"] + match.start(),
+                            "end": sent["start"] + match.end(),
+                            "sentence_id": sent["sentence_id"],
+                            "pos": "PRO",
+                            "score": round(
+                                float(antecedent.get("score", 0.8)) * 0.85, 3
+                            ),
+                            "entity_text": antecedent.get("text", mention_text),
+                            "entity_type": antecedent.get("type", "MISC"),
+                            "coref": True,
+                        }
+                    )
+
+            history.extend(sent_entities)
+
+        merged = entities + coref_entities
+        seen = set()
+        deduped = []
+        for entity in merged:
+            key = (
+                entity.get("start"),
+                entity.get("end"),
+                entity.get("type"),
+                entity.get("text", "").lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(entity)
+
+        out = dict(doc)
+        out["entities"] = deduped
+        resolved_docs.append(out)
+
+    return resolved_docs
 
 
 if __name__ == "__main__":

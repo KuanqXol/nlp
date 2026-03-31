@@ -447,7 +447,12 @@ class EntityLinker:
     ) -> List[Dict]:
         merged: Dict[Tuple[str, str], Dict] = {}
         for ent in entities:
-            surface = ent.get("text") or ent.get("entity_text", "")
+            surface = (
+                ent.get("resolved_text")
+                or ent.get("text")
+                or ent.get("entity_text", "")
+            )
+            display_text = ent.get("mention_text") or ent.get("text") or surface
             ent_type = ent.get("type") or ent.get("entity_type", "MISC")
             if not surface:
                 continue
@@ -456,18 +461,18 @@ class EntityLinker:
             key = (link["entity_id"], ent_type)
             if key not in merged:
                 merged[key] = {
-                    "text": surface,
+                    "text": display_text,
                     "canonical": link["canonical"],
                     "entity_id": link["entity_id"],
                     "type": ent_type,
                     "link_score": float(link["similarity"]),
                     "match_type": link["match_type"],
-                    "aliases": [surface],
+                    "aliases": [display_text],
                 }
             else:
                 item = merged[key]
-                if surface not in item["aliases"]:
-                    item["aliases"].append(surface)
+                if display_text not in item["aliases"]:
+                    item["aliases"].append(display_text)
                 item["link_score"] = max(
                     float(item.get("link_score", 0.0)), float(link["similarity"])
                 )

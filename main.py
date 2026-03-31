@@ -44,6 +44,7 @@ from src.preprocessing import (
     RelationExtractor,
     HybridRelationExtractor,
     ner_with_checkpoint,
+    resolve_coreference,
 )
 from src.graph import (
     KnowledgeGraph,
@@ -171,6 +172,8 @@ class NewsSearchSystem:
             cache_path=str(self._index_dir / "ner_cache.json"),
             results_path=str(self._index_dir / "ner_results.jsonl"),
         )
+        print("   Giải đồng tham chiếu nhẹ...")
+        docs = resolve_coreference(docs)
 
         # ── 3. Entity Linking ──────────────────────────────────────────────
         print("\n🔗 Bước 3/6: Chuẩn hóa entity (Entity Linking)...")
