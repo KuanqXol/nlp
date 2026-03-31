@@ -8,6 +8,7 @@ Hệ thống tìm kiếm tin tức tiếng Việt kết hợp:
 - FAISS / NumPy vector search
 - BM25 + Reciprocal Rank Fusion
 - Cross-encoder reranking
+- PhoBERT-based Relation Extraction (optional / offline)
 - RAG summary
 
 Project hiện ưu tiên dữ liệu CSV thật từ VnExpress, nhưng `DataLoader` cũng hỗ trợ JSON array.
@@ -34,6 +35,8 @@ EntityLinker
   - embedding match nếu có sentence-transformers
         ↓
 RelationExtractor
+  - Rule-based mặc định
+  - Hybrid + PhoBERT nếu có checkpoint
         ↓
 KnowledgeGraph + SimilarityGraphBuilder
         ↓
@@ -59,15 +62,21 @@ RAGPipeline
 ```text
 news_kg_rag/
 ├── data/
+│   ├── ner_ground_truth.json
+│   ├── relation_ground_truth.json
 │   ├── vnexpress_articles.csv
 │   └── index/
 │       ├── state.pkl
 │       ├── bm25.pkl
 │       └── knowledge_graph.pkl
 ├── scripts/
-│   └── build_index.py
+│   ├── build_index.py
+│   ├── run_re_ablation.py
+│   └── train_phobert_re.py
 ├── src/
 │   ├── data_loader.py
+│   ├── evaluation_nlp.py
+│   ├── evaluation_re.py
 │   ├── preprocessing/
 │   │   ├── ner.py
 │   │   ├── entity_linking.py
@@ -193,6 +202,27 @@ python main.py --data data/custom_news.json --query "Samsung Hà Nội"
 python main.py --data data/vnexpress_articles.csv --use-phobert-re --phobert-dir data/phobert_re
 ```
 
+### 4. Deep Learning workflow cho PhoBERT RE
+
+Chuẩn bị supervised dataset nhỏ từ benchmark annotate tay:
+
+```bash
+python scripts/train_phobert_re.py --prepare-only
+```
+
+Fine-tune PhoBERT RE khi có `torch` + `transformers` và GPU:
+
+```bash
+python scripts/train_phobert_re.py --output-dir data/phobert_re
+```
+
+Chạy ablation giữa `rule_based`, `hybrid` và `phobert`:
+
+```bash
+python scripts/run_re_ablation.py --ground-truth data/relation_ground_truth.json --phobert-dir data/phobert_re
+python -m src.evaluation_nlp --ground-truth data/ner_ground_truth.json
+```
+
 ## CLI options
 
 | Flag | Default | Ý nghĩa |
@@ -243,6 +273,18 @@ python main.py --data data/vnexpress_articles.csv --use-phobert-re --phobert-dir
 - Levenshtein fuzzy match cho typo ngắn
 - embedding match nếu có `sentence-transformers`
 
+### `src/preprocessing/relation_extraction_phobert.py`
+
+- `DistantSupervisionBuilder`: tạo dữ liệu train từ corpus + Wikidata
+- `PhoBERTRelationExtractor.train()`: fine-tune classifier head
+- lưu `re_config.json`, `train_metrics.json`, `trainer_log_history.json`, `training_summary.json`
+- `HybridRelationExtractor`: ghép rule-based và PhoBERT
+
+### `src/evaluation_*.py`
+
+- `evaluation_nlp.py`: đánh giá NER trên `data/ner_ground_truth.json`
+- `evaluation_re.py`: đánh giá RE và chạy ablation `rule_based vs hybrid vs phobert`
+
 ### `src/graph/*`
 
 - `knowledge_graph.py`: `MultiDiGraph`, temporal edges, confidence filtering
@@ -270,6 +312,11 @@ python test_system.py
 ```
 
 `test_system.py` hiện dùng fixture CSV nhỏ tự tạo trong thư mục tạm, nên không phụ thuộc vào file dữ liệu lớn trong `data/`.
+Smoke test cũng cover:
+
+- benchmark RE annotate tay
+- `scripts/train_phobert_re.py --prepare-only`
+- `scripts/run_re_ablation.py`
 
 ## Lưu ý thực tế
 
@@ -278,6 +325,7 @@ python test_system.py
 - BM25 luôn được serialize ra `bm25.pkl` để `--load-index` không phải rebuild lexical backend.
 - Cross-encoder được bật mặc định trong `Retriever`, và sẽ rerank top-20 candidates; nếu `sentence-transformers` hoặc model không load được thì hệ thống tự fallback.
 - `--use-phobert-re` sẽ dùng `HybridRelationExtractor`; nếu thiếu model/GPU thì tự fallback về rule-based extractor.
+- benchmark DL trong repo là nhỏ và phục vụ mục đích smoke test / demo workflow; muốn chất lượng tốt cần build thêm training data từ distant supervision hoặc annotate nhiều hơn.
 - Build dài có thể resume nhờ `ner_checkpoint.json` và `ner_results.jsonl`.
 - `--use-model` là “best effort”: nếu HuggingFace model không tải được, hệ thống vẫn fallback về backend sẵn có.
 
@@ -306,6 +354,12 @@ Nếu muốn resume NER batch dài sau khi bị ngắt, giữ nguyên `--index-d
 
 - embedding fallback về TF-IDF
 - entity linking embedding match và cross-encoder rerank sẽ tự giảm cấp
+
+### Chưa có checkpoint PhoBERT RE
+
+- `scripts/run_re_ablation.py` sẽ tự skip phần `phobert`
+- `--use-phobert-re` trong `main.py` vẫn chạy được nhờ `HybridRelationExtractor` fallback về rule-based
+- để train model thật, cần `torch`, `transformers`, và tốt nhất là GPU
 
 ### Không có `ANTHROPIC_API_KEY`
 

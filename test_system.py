@@ -23,6 +23,7 @@ import atexit
 import csv
 import json
 import shutil
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -810,6 +811,93 @@ try:
 
 except Exception as e:
     record_exception("NewsSearchSystem", e)
+
+# ════════════════════════════════════════════════════════════════════════════
+section("13. Deep Learning RE")
+# ════════════════════════════════════════════════════════════════════════════
+try:
+    from src.evaluation_re import (
+        evaluate_relation_extractor,
+        load_relation_ground_truth,
+        run_re_ablation,
+    )
+    from src.preprocessing.relation_extraction import RelationExtractor
+
+    re_gt = load_relation_ground_truth(ROOT_DIR / "data" / "relation_ground_truth.json")
+    results.append(check(len(re_gt) == 18, "relation_ground_truth có 18 sample"))
+
+    rule_metrics = evaluate_relation_extractor(
+        RelationExtractor(),
+        ground_truth=ROOT_DIR / "data" / "relation_ground_truth.json",
+        verbose=False,
+    )
+    results.append(check("micro_avg" in rule_metrics, "evaluate_relation_extractor có micro_avg"))
+    results.append(
+        check(rule_metrics["micro_avg"]["f1"] > 0.0, "Rule-based RE benchmark có F1 > 0"))
+
+    ablation = run_re_ablation(
+        ground_truth=ROOT_DIR / "data" / "relation_ground_truth.json",
+        phobert_dir=TEMP_ROOT / "missing_phobert_re",
+        verbose=False,
+    )
+    results.append(check(ablation["rule_based"]["status"] == "ok", "Ablation có rule_based"))
+    results.append(check(ablation["hybrid"]["status"] == "ok", "Ablation có hybrid"))
+    results.append(
+        check(
+            ablation["phobert"]["status"] == "skipped",
+            "Ablation skip PhoBERT khi chưa có model",
+        )
+    )
+
+    prepared_jsonl = TEMP_ROOT / "re_train_supervised.jsonl"
+    phobert_demo_dir = TEMP_ROOT / "phobert_re_demo"
+    train_cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "train_phobert_re.py"),
+        "--prepare-only",
+        "--ground-truth",
+        str(ROOT_DIR / "data" / "relation_ground_truth.json"),
+        "--prepared-jsonl",
+        str(prepared_jsonl),
+        "--output-dir",
+        str(phobert_demo_dir),
+    ]
+    train_proc = subprocess.run(
+        train_cmd,
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    results.append(check(train_proc.returncode == 0, "train_phobert_re.py --prepare-only chạy được"))
+    results.append(check(prepared_jsonl.exists(), "prepare-only tạo re_train_supervised.jsonl"))
+    dataset_summary = phobert_demo_dir / "prepared_dataset_summary.json"
+    results.append(check(dataset_summary.exists(), "prepare-only tạo prepared_dataset_summary.json"))
+    if dataset_summary.exists():
+        with open(dataset_summary, encoding="utf-8") as f:
+            dl_summary = json.load(f)
+        results.append(check(dl_summary["total_rows"] > 18, "Supervised RE dataset có positive + negative"))
+
+    ablation_cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "run_re_ablation.py"),
+        "--ground-truth",
+        str(ROOT_DIR / "data" / "relation_ground_truth.json"),
+        "--phobert-dir",
+        str(TEMP_ROOT / "missing_phobert_re"),
+        "--quiet",
+    ]
+    ablation_proc = subprocess.run(
+        ablation_cmd,
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    results.append(check(ablation_proc.returncode == 0, "run_re_ablation.py chạy được"))
+
+except Exception as e:
+    record_exception("DeepLearningRE", e)
 
 # ════════════════════════════════════════════════════════════════════════════
 # TỔNG KẾT

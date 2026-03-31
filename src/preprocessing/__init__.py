@@ -8,7 +8,10 @@ from src.preprocessing.ner import (
 )
 from src.preprocessing.entity_linking import EntityLinker
 from src.preprocessing.relation_extraction import RelationExtractor
-from src.preprocessing.relation_extraction_phobert import HybridRelationExtractor
+from src.preprocessing.relation_extraction_phobert import (
+    HybridRelationExtractor,
+    PhoBERTRelationExtractor,
+)
 
 __all__ = [
     "VietnameseNER",
@@ -17,5 +20,6 @@ __all__ = [
     "resolve_coreference",
     "EntityLinker",
     "RelationExtractor",
+    "PhoBERTRelationExtractor",
     "HybridRelationExtractor",
 ]
