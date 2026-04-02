@@ -23,6 +23,7 @@ import math
 import pickle
 import re
 from collections import Counter, defaultdict
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -55,6 +56,10 @@ TOP_RERANK_CANDIDATES = 20
 RRF_K = 60
 BM25_K1 = 1.5
 BM25_B = 0.75
+# Date decay: exp(-days_ago / halflife). Bài cũ 365 ngày ≈ 0.37× score
+DATE_DECAY_HALFLIFE = 365.0
+# Set None để tắt date decay hoàn toàn
+DATE_DECAY_ENABLED = True
 
 
 def _tokenize(text: str) -> List[str]:
@@ -543,6 +548,8 @@ class Retriever:
         bm25_score_map = dict(zip(bm25_ids, bm25_scores))
         rrf_score_map = dict(fused)
         bm25_max = max(bm25_score_map.values(), default=0.0)
+        # Normalize RRF: tính max để chuẩn hóa về [0,1]
+        rrf_max = max(rrf_score_map.values(), default=0.0)
 
         # Tính PPR scores một lần nếu có seed entities
         ppr_scores: Dict[str, float] = {}
@@ -561,6 +568,7 @@ class Retriever:
                 rrf_score_map,
                 bm25_max,
                 ppr_scores,
+                rrf_max=rrf_max,
             )
         else:
             candidates = self._build_candidates_from_docs(
@@ -570,9 +578,12 @@ class Retriever:
                 rrf_score_map,
                 bm25_max,
                 ppr_scores,
+                rrf_max=rrf_max,
             )
 
         candidates = self._rerank(query, candidates, top_k=top_k, rerank=rerank)
+        # Date decay: áp dụng sau rerank để cross-encoder score không bị ảnh hưởng
+        candidates = self._apply_date_decay(candidates)
 
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k]
@@ -627,12 +638,13 @@ class Retriever:
         rrf_scores: Dict[str, float],
         bm25_max: float,
         ppr_scores: Dict[str, float],
+        rrf_max: float = 0.0,
     ) -> List[Dict]:
         """
         Chunk-level → dedupe về document level.
         Giữ chunk có score cao nhất per document.
         """
-        # chunk_id → best (vec_score, chunk)
+        # chunk_id → best (hybrid_score, chunk, raw scores)
         best_per_doc: Dict[str, Tuple[float, Dict, float, float, float]] = {}
 
         for cid in chunk_ids:
@@ -643,7 +655,7 @@ class Retriever:
             vscore = vec_scores.get(cid, 0.0)
             bm25_score = bm25_scores.get(cid, 0.0)
             rrf_score = rrf_scores.get(cid, 0.0)
-            hybrid = self._base_rank_score(vscore, bm25_score, rrf_score, bm25_max)
+            hybrid = self._base_rank_score(vscore, bm25_score, rrf_score, bm25_max, rrf_max)
             if doc_id not in best_per_doc or hybrid > best_per_doc[doc_id][0]:
                 best_per_doc[doc_id] = (hybrid, chunk, vscore, bm25_score, rrf_score)
 
@@ -652,7 +664,7 @@ class Retriever:
             doc = self._documents.get(doc_id, {})
             graph_boost = self._compute_graph_boost(doc, ppr_scores)
             final_score = self._base_rank_score(
-                vscore, bm25_score, rrf_score, bm25_max
+                vscore, bm25_score, rrf_score, bm25_max, rrf_max
             ) + GRAPH_BOOST_ALPHA * graph_boost
 
             result = dict(doc)
@@ -679,6 +691,7 @@ class Retriever:
         rrf_scores: Dict[str, float],
         bm25_max: float,
         ppr_scores: Dict[str, float],
+        rrf_max: float = 0.0,
     ) -> List[Dict]:
         candidates = []
         for doc_id in doc_ids:
@@ -690,7 +703,7 @@ class Retriever:
             rrf_score = rrf_scores.get(doc_id, 0.0)
             graph_boost = self._compute_graph_boost(doc, ppr_scores)
             final_score = self._base_rank_score(
-                vscore, bm25_score, rrf_score, bm25_max
+                vscore, bm25_score, rrf_score, bm25_max, rrf_max
             ) + GRAPH_BOOST_ALPHA * graph_boost
 
             result = dict(doc)
@@ -712,13 +725,51 @@ class Retriever:
         bm25_score: float,
         rrf_score: float,
         bm25_max: float,
+        rrf_max: float = 0.0,
     ) -> float:
         bm25_norm = (bm25_score / bm25_max) if bm25_max > 0 else 0.0
+        # Normalize RRF về [0,1] thay vì dùng raw score (~0.01–0.03)
+        rrf_norm = (rrf_score / rrf_max) if rrf_max > 0 else 0.0
         return (
             VECTOR_ALPHA * vector_score
             + BM25_ALPHA * bm25_norm
-            + RRF_ALPHA * rrf_score
+            + RRF_ALPHA * rrf_norm
         )
+
+    def _apply_date_decay(
+        self,
+        candidates: List[Dict],
+        reference_date: date = None,
+    ) -> List[Dict]:
+        """
+        Nhân retrieval_score với date decay weight = exp(-days_ago / halflife).
+
+        Bài mới nhất (days_ago=0)  → weight=1.0  (không đổi)
+        Bài cũ 1 năm (days_ago=365) → weight≈0.37
+        Bài cũ 2 năm (days_ago=730) → weight≈0.14
+
+        Nếu không parse được ngày (thiếu trường date / sai format)
+        → weight=0.5 (tránh penalty không công bằng).
+        """
+        if not DATE_DECAY_ENABLED or not candidates:
+            return candidates
+
+        today = reference_date or date.today()
+        for doc in candidates:
+            raw_date = doc.get("date", "")
+            weight = 0.5  # default khi thiếu/lỗi ngày
+            if raw_date:
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+                    try:
+                        doc_date = datetime.strptime(str(raw_date)[:10], fmt).date()
+                        days_ago = max((today - doc_date).days, 0)
+                        weight = math.exp(-days_ago / DATE_DECAY_HALFLIFE)
+                        break
+                    except ValueError:
+                        continue
+            doc["date_decay_weight"] = round(weight, 4)
+            doc["retrieval_score"] = round(doc["retrieval_score"] * weight, 4)
+        return candidates
 
     def _compute_graph_boost(
         self,

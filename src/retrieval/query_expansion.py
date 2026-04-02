@@ -180,7 +180,7 @@ class QueryExpander:
             original_query, keywords, all_entities
         )
         multi_queries = self._build_multi_queries(
-            original_query, keywords, seeds, hop1_entities, hop2_entities
+            original_query, keywords, seeds, hop1_entities, hop2_entities, entity_scores
         )
 
         return {
@@ -208,30 +208,32 @@ class QueryExpander:
         seeds: List[str],
         hop1: Set[str],
         hop2: Set[str],
+        entity_scores: Dict[str, float] = None,
     ) -> List[str]:
         """
         Tạo danh sách query variants:
         1. Query gốc (không mở rộng)
-        2. Query + hop1 entities (related, high-confidence)
-        3. Query + high-PPR hop2 (nếu có thêm context)
+        2. Query + top-3 hop1 entities (sắp xếp theo PPR score)
+        3. Query + top-3 hop2 entities (sắp xếp theo PPR score)
 
         Mỗi variant được encode độc lập → max similarity khi retrieve.
-        Điều này giữ precision của query gốc trong khi tăng recall qua variants.
+        Sắp xếp theo PPR đảm bảo chọn đúng entity quan trọng nhất với query.
         """
+        scores = entity_scores or {}
         queries = []
 
         # Q1: Original
         if original:
             queries.append(original)
 
-        # Q2: original + top hop1 (tối đa 3)
-        top_h1 = list(hop1)[:3]
+        # Q2: original + top-3 hop1 sắp xếp theo PPR score
+        top_h1 = sorted(hop1, key=lambda e: -scores.get(e, 0.0))[:3]
         if top_h1:
             q2 = f"{original} {' '.join(top_h1)}"
             queries.append(q2.strip())
 
-        # Q3: original + top hop2 (tối đa 3)
-        top_h2 = list(hop2)[:3]
+        # Q3: original + top-3 hop2 sắp xếp theo PPR score
+        top_h2 = sorted(hop2, key=lambda e: -scores.get(e, 0.0))[:3]
         if top_h2:
             q3 = f"{original} {' '.join(top_h2)}"
             queries.append(q3.strip())

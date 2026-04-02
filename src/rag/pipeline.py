@@ -21,6 +21,17 @@ import textwrap
 from datetime import datetime
 from typing import Dict, List, Optional
 
+# Import late để tránh circular (retrieval → rag → retrieval)
+_multi_query_retrieve = None
+
+
+def _get_multi_query_retrieve():
+    global _multi_query_retrieve
+    if _multi_query_retrieve is None:
+        from src.retrieval.query_expansion import multi_query_retrieve as _mqr
+        _multi_query_retrieve = _mqr
+    return _multi_query_retrieve
+
 
 # ── Context Builder ──────────────────────────────────────────────────────────
 
@@ -237,7 +248,21 @@ class RAGPipeline:
 
         # ── Bước 1: Retrieve ─────────────────────────────────────────────
         if expansion_result:
-            articles = self.retriever.retrieve_with_expansion(expansion_result, top_k=k)
+            multi_queries = expansion_result.get("multi_queries", [])
+            seed_entities = expansion_result.get("seed_entities", [])
+            if multi_queries:
+                # Multi-query strategy: search voi tung variant, merge + dedup
+                # Score cuoi = max score khi 1 doc xuat hien o nhieu queries
+                mqr = _get_multi_query_retrieve()
+                articles = mqr(
+                    multi_queries,
+                    self.retriever,
+                    top_k=k,
+                    seed_entities=seed_entities,
+                )
+            else:
+                # Fallback: expanded_query don neu khong co multi_queries
+                articles = self.retriever.retrieve_with_expansion(expansion_result, top_k=k)
         else:
             articles = self.retriever.retrieve(query, top_k=k)
 
