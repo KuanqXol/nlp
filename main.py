@@ -150,6 +150,9 @@ class NewsSearchSystem:
         self._importance_scores = {}
         self._query_expander = None
 
+    def _log_stage_done(self, label: str, start_time: float):
+        print(f"   Hoàn tất {label} trong {time.time() - start_time:.1f}s")
+
     def build(self):
         """
         Chạy toàn bộ pipeline xây dựng hệ thống từ dữ liệu.
@@ -157,14 +160,23 @@ class NewsSearchSystem:
         """
         t0 = time.time()
         self._index_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[Build] data={self.data_path} | index_dir={self._index_dir} | "
+            f"phobert_re={'on' if self._use_phobert_re else 'off'} | "
+            f"phobert_dir={self._phobert_dir}"
+        )
 
         # ── 1. Load data ───────────────────────────────────────────────────
         print("📂 Bước 1/6: Đang load dataset...")
+        stage_t0 = time.time()
         loader = NewsDataLoader(self.data_path)
         docs = loader.load()
+        print(f"   Load xong {len(docs)} bài.")
+        self._log_stage_done("load dataset", stage_t0)
 
         # ── 2. NER ────────────────────────────────────────────────────────
         print("\n🏷️  Bước 2/6: Nhận dạng thực thể (NER)...")
+        stage_t0 = time.time()
         docs = ner_with_checkpoint(
             docs,
             self.ner,
@@ -174,17 +186,23 @@ class NewsSearchSystem:
         )
         print("   Giải đồng tham chiếu nhẹ...")
         docs = resolve_coreference(docs)
+        self._log_stage_done("NER + coreference", stage_t0)
 
         # ── 3. Entity Linking ──────────────────────────────────────────────
         print("\n🔗 Bước 3/6: Chuẩn hóa entity (Entity Linking)...")
+        stage_t0 = time.time()
         docs = self.linker.batch_process(docs)
+        self._log_stage_done("entity linking", stage_t0)
 
         # ── 4. Relation Extraction ────────────────────────────────────────
         print("\n🕸️  Bước 4/6: Trích xuất quan hệ (Relation Extraction)...")
+        stage_t0 = time.time()
         docs = self.rel_extractor.batch_process(docs)
+        self._log_stage_done("relation extraction", stage_t0)
 
         # ── 5. Knowledge Graph ────────────────────────────────────────────
         print("\n🗺️  Bước 5/6: Xây dựng Knowledge Graph...")
+        stage_t0 = time.time()
         self.kg.build_from_documents(docs)
         print("   Thêm similarity edges...")
         SimilarityGraphBuilder(threshold=0.80).build(self.kg, self.em)
@@ -192,9 +210,11 @@ class NewsSearchSystem:
         # PageRank
         print("   Tính PageRank...")
         self._importance_scores = self.ranker.compute_importance_scores(self.kg)
+        self._log_stage_done("knowledge graph + pagerank", stage_t0)
 
         # ── 6. Embedding + Retrieval Index ────────────────────────────────
         print("\n🔢 Bước 6/6: Tạo Embedding Index...")
+        stage_t0 = time.time()
         chunks, doc_to_chunks = chunk_documents(
             docs,
             strategy="sentence_window",
@@ -216,6 +236,8 @@ class NewsSearchSystem:
         )
         self._chunks = chunks
         self._doc_to_chunks = doc_to_chunks
+        print(f"   Chunk count: {len(chunks)}")
+        self._log_stage_done("embedding + retrieval index", stage_t0)
 
         # ── Query Expander ────────────────────────────────────────────────
         self._query_expander = QueryExpander(
@@ -239,6 +261,7 @@ class NewsSearchSystem:
         target_dir = Path(index_dir or self._index_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         self._index_dir = target_dir
+        print(f"[Index] Đang lưu artifacts vào: {target_dir}")
 
         state = {
             "metadata": {
