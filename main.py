@@ -204,13 +204,13 @@ class NewsSearchSystem:
         print("\n🗺️  Bước 5/6: Xây dựng Knowledge Graph...")
         stage_t0 = time.time()
         self.kg.build_from_documents(docs)
-        print("   Thêm similarity edges...")
-        SimilarityGraphBuilder(threshold=0.80).build(self.kg, self.em)
 
-        # PageRank
+        # PageRank (chạy trước similarity để KG đã sạch)
         print("   Tính PageRank...")
         self._importance_scores = self.ranker.compute_importance_scores(self.kg)
         self._log_stage_done("knowledge graph + pagerank", stage_t0)
+
+        # NOTE: SimilarityGraphBuilder chạy ở bước 6 SAU khi có entity vectors.
 
         # ── 6. Embedding + Retrieval Index ────────────────────────────────
         print("\n🔢 Bước 6/6: Tạo Embedding Index...")
@@ -225,6 +225,10 @@ class NewsSearchSystem:
         self.em.build_document_index(
             [{"id": c["chunk_id"], "full_text": c["chunk_text"]} for c in chunks]
         )
+        # SimilarityGraphBuilder dùng entity embeddings — phải chạy SAU
+        # em.build_document_index() mới có vector:
+        print("   Thêm similarity edges vào KG (dùng entity vectors)...")
+        SimilarityGraphBuilder(threshold=0.80).build(self.kg, self.em)
         self.retriever.build(
             chunks,
             self.em,

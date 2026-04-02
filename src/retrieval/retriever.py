@@ -505,6 +505,7 @@ class Retriever:
         seed_entities: List[str] = None,
         rerank: bool = True,
         fetch_multiplier: int = 3,
+        apply_decay: bool = True,
     ) -> List[Dict]:
         """
         Retrieve top-k documents.
@@ -515,10 +516,14 @@ class Retriever:
             seed_entities:   Entity từ query để tính PPR boost
             rerank:          Có dùng cross-encoder rerank không
             fetch_multiplier: Lấy K×multiplier candidates trước khi rerank/dedupe
+            apply_decay:     Có apply date decay không.
+                             Đặt False khi gọi từ multi_query_retrieve để
+                             tránh double-apply (decay chỉ xảy ra 1 lần sau merge).
 
         Returns:
             List document dicts với các fields:
-            retrieval_score, vector_score, graph_boost, cross_encoder_score (nếu có)
+            retrieval_score, vector_score, graph_boost, cross_encoder_score (nếu có),
+            date_decay_weight (nếu apply_decay=True)
         """
         if self._em is None:
             return []
@@ -582,8 +587,10 @@ class Retriever:
             )
 
         candidates = self._rerank(query, candidates, top_k=top_k, rerank=rerank)
-        # Date decay: áp dụng sau rerank để cross-encoder score không bị ảnh hưởng
-        candidates = self._apply_date_decay(candidates)
+        # Date decay: áp dụng sau rerank để cross-encoder score không bị ảnh hưởng.
+        # apply_decay=False khi gọi từ multi_query_retrieve để tránh double-apply.
+        if apply_decay:
+            candidates = self._apply_date_decay(candidates)
 
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k]
@@ -595,6 +602,7 @@ class Retriever:
         seed_entities: List[str] = None,
         rerank: bool = True,
         fetch_multiplier: int = 3,
+        apply_decay: bool = True,
     ) -> List[Dict]:
         return self.search(
             query,
@@ -602,6 +610,7 @@ class Retriever:
             seed_entities=seed_entities,
             rerank=rerank,
             fetch_multiplier=fetch_multiplier,
+            apply_decay=apply_decay,
         )
 
     def _rerank(

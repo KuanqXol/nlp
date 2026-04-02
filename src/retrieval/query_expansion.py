@@ -378,38 +378,66 @@ def multi_query_retrieve(
 ) -> List[Dict]:
     """
     Search với nhiều query variant, merge và dedup kết quả.
-    Score cuối = max score qua các query.
+
+    Luồng:
+      1. Với mỗi query variant: retrieve raw (không rerank, không date decay)
+         để lấy base scores thuần túy từ vector + BM25 + graph.
+      2. Merge: giữ max retrieval_score khi 1 doc xuất hiện ở nhiều queries.
+      3. Rerank merged top-candidates bằng cross-encoder 1 lần duy nhất.
+      4. Apply date decay 1 lần duy nhất trên final list.
 
     Args:
-        queries:  List query strings từ QueryExpander.get_multi_queries()
-        retriever: Retriever instance
-        top_k:    Số kết quả cuối
+        queries:      List query strings từ QueryExpander.get_multi_queries()
+        retriever:    Retriever instance
+        top_k:        Số kết quả cuối
         seed_entities: Cho PPR boost
-        dedup_by: Field để dedup ("id" cho doc-level)
+        dedup_by:     Field để dedup ("id" cho doc-level)
 
     Returns:
-        Merged + sorted results
+        Merged + reranked + date-decayed results, sorted by retrieval_score.
     """
     seen: Dict[str, Dict] = {}
     fetch_k = max(top_k * 2, 20)
 
+    # Dùng query đầu tiên (gốc) làm anchor cho cross-encoder rerank
+    anchor_query = queries[0] if queries else ""
+
     for q in queries:
-        hits = retriever.retrieve(
+        # rerank=False + decay=False: lấy base score thuần, tránh double-apply
+        hits = retriever.search(
             q,
             top_k=fetch_k,
             seed_entities=seed_entities,
-            rerank=False,  # Rerank chỉ chạy một lần sau khi merge
+            rerank=False,
+            apply_decay=False,
         )
         for hit in hits:
             key = hit.get(dedup_by, hit.get("chunk_id", ""))
             if key not in seen:
                 seen[key] = hit
             else:
-                # Giữ score cao nhất
+                # Giữ score cao nhất qua các query variants
                 if hit["retrieval_score"] > seen[key]["retrieval_score"]:
                     seen[key] = hit
 
     merged = sorted(seen.values(), key=lambda x: -x["retrieval_score"])
+
+    # Rerank 1 lần trên merged list (dùng query gốc làm anchor)
+    if anchor_query and hasattr(retriever, "_reranker"):
+        merged = retriever._rerank(
+            anchor_query,
+            merged,
+            top_k=top_k,
+            rerank=True,
+        )
+    else:
+        merged = merged[:top_k]
+
+    # Date decay 1 lần trên final list
+    if hasattr(retriever, "_apply_date_decay"):
+        merged = retriever._apply_date_decay(merged)
+
+    merged.sort(key=lambda x: -x["retrieval_score"])
     return merged[:top_k]
 
 
