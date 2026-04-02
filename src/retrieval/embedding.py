@@ -324,6 +324,59 @@ class EmbeddingManager:
 
         return sorted(results, key=lambda x: -x[1])[:top_k]
 
+    # ── Persistence ───────────────────────────────────────────────────────
+
+    def export_state(self) -> Dict:
+        state = {
+            "use_sbert": self.use_sbert,
+            "model_name": getattr(self._embedder, "model_name", None),
+            "doc_embeddings": self._doc_embeddings,
+            "doc_ids": list(self._doc_ids),
+        }
+
+        if not self.use_sbert and isinstance(self._embedder, TFIDFEmbedder):
+            state["tfidf"] = {
+                "vocab_size": self._embedder.vocab_size,
+                "vocab": list(self._embedder.vocab),
+                "idf": np.asarray(self._embedder.idf, dtype=np.float32),
+            }
+
+        return state
+
+    @classmethod
+    def from_state(cls, state: Dict) -> "EmbeddingManager":
+        requested_use_sbert = bool(state.get("use_sbert", False))
+        em = cls(
+            use_sbert=requested_use_sbert,
+            model_name=state.get("model_name"),
+        )
+
+        if requested_use_sbert and not em.use_sbert:
+            raise RuntimeError(
+                "Index này được build bằng SBERT nhưng môi trường hiện tại "
+                "không có sentence-transformers."
+            )
+
+        if not em.use_sbert and isinstance(em._embedder, TFIDFEmbedder):
+            tfidf_state = state.get("tfidf", {})
+            em._embedder.vocab_size = int(
+                tfidf_state.get("vocab_size", em._embedder.vocab_size)
+            )
+            em._embedder.vocab = list(tfidf_state.get("vocab", []))
+            em._embedder.idf = np.asarray(
+                tfidf_state.get("idf", []), dtype=np.float32
+            )
+            em._embedder._fitted = len(em._embedder.vocab) > 0
+
+        if state.get("doc_embeddings") is not None:
+            em._doc_embeddings = np.asarray(
+                state["doc_embeddings"], dtype=np.float32
+            )
+        em._doc_ids = list(state.get("doc_ids", []))
+        em._entity_embeddings = {}
+        em._query_embedding_cache = {}
+        return em
+
     # ── Properties ─────────────────────────────────────────────────────────
 
     @property

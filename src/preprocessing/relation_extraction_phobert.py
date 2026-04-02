@@ -64,6 +64,50 @@ except ImportError:
     _TORCH_OK = False
 
 
+def _write_json(path: str | Path, payload: Dict):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _write_jsonl(path: str | Path, rows: List[Dict]):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+if _TORCH_OK:
+
+    def _compute_cls_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=-1)
+        accuracy = float((preds == labels).mean()) if len(labels) else 0.0
+
+        macro_f1_scores = []
+        for label_id in sorted(set(labels.tolist()) | set(preds.tolist())):
+            tp = int(((preds == label_id) & (labels == label_id)).sum())
+            fp = int(((preds == label_id) & (labels != label_id)).sum())
+            fn = int(((preds != label_id) & (labels == label_id)).sum())
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if (precision + recall)
+                else 0.0
+            )
+            macro_f1_scores.append(f1)
+
+        macro_f1 = (
+            float(sum(macro_f1_scores) / len(macro_f1_scores))
+            if macro_f1_scores
+            else 0.0
+        )
+        return {"accuracy": accuracy, "macro_f1": macro_f1}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 1. RELATION LABEL MAP
 # ════════════════════════════════════════════════════════════════════════════
@@ -498,6 +542,9 @@ class PhoBERTRelationExtractor:
                 "torch + transformers chưa cài: pip install torch transformers"
             )
 
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
         print(f"[PhoBERTRE] Load training data: {train_jsonl}")
         samples = []
         with open(train_jsonl, encoding="utf-8") as f:
@@ -505,12 +552,16 @@ class PhoBERTRelationExtractor:
                 samples.append(json.loads(line))
 
         print(f"[PhoBERTRE] {len(samples)} samples, {len(RELATION_LABELS)} classes")
+        if len(samples) < 2:
+            raise ValueError("Cần ít nhất 2 sample để train/val split.")
 
         # Train/val split
         random.shuffle(samples)
         n_val = max(1, int(len(samples) * val_split))
         val_samples = samples[:n_val]
         train_samples = samples[n_val:]
+        if not train_samples:
+            raise ValueError("Train split rỗng. Hãy giảm val_split hoặc tăng dữ liệu.")
 
         print(f"[PhoBERTRE] Train: {len(train_samples)}, Val: {len(val_samples)}")
 
@@ -538,53 +589,111 @@ class PhoBERTRelationExtractor:
         val_ds = REDataset(val_samples, tokenizer)
 
         # Training args
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate,
-            weight_decay=0.01,
-            warmup_ratio=0.1,
-            evaluation_strategy="epoch",
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            logging_steps=50,
-            report_to="none",
-            fp16=torch.cuda.is_available(),
-        )
+        training_kwargs = {
+            "output_dir": output_dir,
+            "num_train_epochs": num_epochs,
+            "per_device_train_batch_size": batch_size,
+            "per_device_eval_batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "weight_decay": 0.01,
+            "warmup_ratio": 0.1,
+            "save_strategy": "epoch",
+            "load_best_model_at_end": True,
+            "metric_for_best_model": "eval_loss",
+            "logging_steps": 50,
+            "report_to": "none",
+            "fp16": torch.cuda.is_available(),
+            "do_train": True,
+            "do_eval": True,
+        }
+        try:
+            training_args = TrainingArguments(
+                evaluation_strategy="epoch",
+                **training_kwargs,
+            )
+        except TypeError:
+            training_args = TrainingArguments(
+                eval_strategy="epoch",
+                **training_kwargs,
+            )
 
         trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_ds,
             eval_dataset=val_ds,
+            compute_metrics=_compute_cls_metrics,
         )
 
         print("[PhoBERTRE] Bắt đầu training...")
-        trainer.train()
+        train_result = trainer.train()
+        eval_metrics = trainer.evaluate()
         trainer.save_model(output_dir)
         tokenizer.save_pretrained(output_dir)
 
+        _write_jsonl(output_path / "train_split.jsonl", train_samples)
+        _write_jsonl(output_path / "val_split.jsonl", val_samples)
+
         # Lưu thêm label map và config
-        with open(f"{output_dir}/re_config.json", "w") as f:
-            json.dump(
-                {
-                    "relation_labels": RELATION_LABELS,
-                    "label2id": LABEL2ID,
-                    "id2label": ID2LABEL,
-                    "min_confidence": min_confidence,
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
+        re_config = {
+            "relation_labels": RELATION_LABELS,
+            "label2id": LABEL2ID,
+            "id2label": ID2LABEL,
+            "min_confidence": min_confidence,
+            "base_model": self.model_name,
+            "loss_name": "cross_entropy",
+            "optimizer": "adamw",
+            "training_args": {
+                "num_train_epochs": num_epochs,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "weight_decay": 0.01,
+                "warmup_ratio": 0.1,
+                "val_split": val_split,
+                "fp16": bool(torch.cuda.is_available()),
+            },
+            "dataset": {
+                "train_jsonl": str(train_jsonl),
+                "train_size": len(train_samples),
+                "val_size": len(val_samples),
+                "total_samples": len(samples),
+            },
+        }
+        _write_json(output_path / "re_config.json", re_config)
+
+        _write_json(
+            output_path / "train_metrics.json",
+            {
+                **train_result.metrics,
+                **eval_metrics,
+            },
+        )
+        _write_json(
+            output_path / "trainer_log_history.json",
+            {"log_history": trainer.state.log_history},
+        )
+        _write_json(
+            output_path / "training_summary.json",
+            {
+                "status": "completed",
+                "best_model_checkpoint": trainer.state.best_model_checkpoint,
+                "best_metric": trainer.state.best_metric,
+                "global_step": trainer.state.global_step,
+                "train_metrics": train_result.metrics,
+                "eval_metrics": eval_metrics,
+            },
+        )
 
         print(f"[PhoBERTRE] Training xong → {output_dir}")
         self._tokenizer = tokenizer
         self._model = model
         self._loaded = True
+        self._min_conf = min_confidence
+        return {
+            "train_metrics": train_result.metrics,
+            "eval_metrics": eval_metrics,
+            "best_model_checkpoint": trainer.state.best_model_checkpoint,
+        }
 
     # ── Load ──────────────────────────────────────────────────────────────
 

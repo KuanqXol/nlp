@@ -1,381 +1,376 @@
-# 🇻🇳 Vietnamese KG-Enhanced News Search & RAG System
+# Vietnamese KG-Enhanced News Search & RAG System
 
-Hệ thống tìm kiếm tin tức tiếng Việt kết hợp **Knowledge Graph**, **Embedding Similarity**, **PageRank** và **RAG** (Retrieval Augmented Generation).
+Hệ thống tìm kiếm tin tức tiếng Việt kết hợp:
 
----
+- Knowledge Graph
+- Personalized PageRank
+- Chunk-based retrieval
+- FAISS / NumPy vector search
+- BM25 + Reciprocal Rank Fusion
+- Cross-encoder reranking
+- PhoBERT-based Relation Extraction (optional / offline)
+- RAG summary
 
-## 📐 Kiến trúc hệ thống
+Project hiện ưu tiên dữ liệu CSV thật từ VnExpress, nhưng `DataLoader` cũng hỗ trợ JSON array.
 
-```
-Dataset tin tức (JSON)
+## Kiến trúc hiện tại
+
+```text
+CSV / JSON news data
         ↓
-┌──────────────────┐
-│   Data Loader    │  ← Chuẩn hóa, validate document
-└────────┬─────────┘
-         ↓
-┌──────────────────┐
-│  Vietnamese NER  │  ← NlpHUST/ner-vietnamese-electra-base
-│  (ner_extraction)│    hoặc rule-based fallback
-└────────┬─────────┘
-         ↓
-┌──────────────────┐
-│  Entity Linking  │  ← Alias map + Levenshtein fuzzy match
-│ (entity_linking) │    "Hanoi" → "Hà Nội", "Hoa Kỳ" → "Mỹ"
-└────────┬─────────┘
-         ↓
-┌──────────────────────┐
-│  Relation Extraction │  ← Rule-based pattern matching
-│(relation_extraction) │    (S, R, O) triple
-└────────┬─────────────┘
-         ↓
-┌──────────────────┐
-│ Knowledge Graph  │  ← networkx DiGraph
-│(knowledge_graph) │    Node=entity, Edge=relation
-└────────┬─────────┘
-         ↓
-┌──────────────────┐        ┌──────────────────┐
-│   Graph Ranking  │        │   Embedding Gen  │
-│ (graph_ranking)  │        │   (embedding)    │
-│   PageRank       │        │ vietnamese-sbert │
-└────────┬─────────┘        └────────┬─────────┘
-         └──────────┬────────────────┘
-                    ↓
-         ┌─────────────────────┐
-         │    FAISS / NumPy    │
-         │      Index          │
-         └──────────┬──────────┘
-                    ↓
-         ┌─────────────────────┐
-         │   User Query        │
-         │  (query_processor)  │
-         │  NER + normalize    │
-         └──────────┬──────────┘
-                    ↓
-         ┌─────────────────────┐
-         │   Graph-based       │
-         │  Query Expansion    │
-         │ (query_expansion)   │
-         │ 1-hop + 2-hop KG   │
-         └──────────┬──────────┘
-                    ↓
-         ┌─────────────────────┐
-         │  Vector Retrieval   │
-         │   (retriever)       │
-         │  + KG re-ranking    │
-         └──────────┬──────────┘
-                    ↓
-         ┌─────────────────────┐
-         │   RAG Pipeline      │
-         │  (rag_pipeline)     │
-         │  Claude / Template  │
-         └──────────┬──────────┘
-                    ↓
-         ┌─────────────────────┐
-         │    OUTPUT           │
-         │  • Top articles     │
-         │  • RAG summary      │
-         │  • Entity graph     │
-         └─────────────────────┘
+DataLoader
+  - parse_vn_date()
+  - strip_author()
+  - dedup theo URL
+  - lang filter (viet_ratio)
+        ↓
+VietnameseNER
+  - underthesea mặc định
+  - HuggingFace nếu --use-model và load được
+  - ner_with_checkpoint() + ner_cache.json
+        ↓
+EntityLinker
+  - exact alias
+  - Levenshtein fuzzy match
+  - embedding match nếu có sentence-transformers
+        ↓
+RelationExtractor
+  - Rule-based mặc định
+  - Hybrid + PhoBERT nếu có checkpoint
+        ↓
+KnowledgeGraph + SimilarityGraphBuilder
+        ↓
+GraphRanker
+  - Global PageRank
+  - Query-time Personalized PageRank
+        ↓
+Chunking + EmbeddingManager
+        ↓
+Retriever
+  - FAISS mặc định nếu có
+  - NumPy fallback
+  - BM25 + RRF hybrid retrieval
+  - Cross-encoder rerank top-20 nếu model load được
+        ↓
+RAGPipeline
+  - Claude nếu có ANTHROPIC_API_KEY
+  - Template summary fallback
 ```
 
----
+## Cấu trúc project
 
-## 📁 Cấu trúc project
-
-```
+```text
 news_kg_rag/
 ├── data/
-│   └── news_dataset.json        ← 20 bài báo tiếng Việt mẫu
-│
+│   ├── ner_ground_truth.json
+│   ├── relation_ground_truth.json
+│   ├── vnexpress_articles.csv
+│   └── index/
+│       ├── state.pkl
+│       ├── bm25.pkl
+│       └── knowledge_graph.pkl
+├── scripts/
+│   ├── build_index.py
+│   ├── run_re_ablation.py
+│   └── train_phobert_re.py
 ├── src/
-│   ├── __init__.py
-│   ├── data_loader.py           ← Module 1: Đọc & chuẩn hóa dữ liệu
-│   ├── ner_extraction.py        ← Module 2: NER tiếng Việt
-│   ├── entity_linking.py        ← Module 3: Chuẩn hóa & gộp entity
-│   ├── relation_extraction.py   ← Module 4: Trích xuất (S,R,O) triple
-│   ├── knowledge_graph.py       ← Module 5: Xây dựng KG (networkx)
-│   ├── embedding.py             ← Module 6: Vector embedding
-│   ├── similarity_graph.py      ← Module 7: Edge similarity giữa entity
-│   ├── graph_ranking.py         ← Module 8: PageRank + importance score
-│   ├── query_processor.py       ← Module 9: Xử lý query người dùng
-│   ├── query_expansion.py       ← Module 10: Mở rộng query qua KG
-│   ├── retriever.py             ← Module 11: FAISS / NumPy retrieval
-│   ├── rag_pipeline.py          ← Module 12: RAG answer generation
-│   └── graph_visualization.py   ← Module 13: Visualize KG (pyvis/mpl)
-│
-├── main.py                      ← Entry point (interactive search)
-├── test_system.py               ← 78 unit tests
-├── requirements.txt
+│   ├── data_loader.py
+│   ├── evaluation_nlp.py
+│   ├── evaluation_re.py
+│   ├── preprocessing/
+│   │   ├── ner.py
+│   │   ├── entity_linking.py
+│   │   ├── relation_extraction.py
+│   │   └── relation_extraction_phobert.py
+│   ├── graph/
+│   │   ├── knowledge_graph.py
+│   │   ├── ranking.py
+│   │   ├── similarity.py
+│   │   └── visualization.py
+│   ├── retrieval/
+│   │   ├── chunking.py
+│   │   ├── embedding.py
+│   │   ├── query_processor.py
+│   │   ├── query_expansion.py
+│   │   └── retriever.py
+│   └── rag/
+│       └── pipeline.py
+├── main.py
+├── test_system.py
 └── README.md
 ```
 
----
+## Cài đặt
 
-## 🚀 Hướng dẫn cài đặt
-
-### 1. Cài đặt Python dependencies
+### Core
 
 ```bash
-# Tạo virtual environment
 python -m venv venv
-source venv/bin/activate        # Linux/Mac
-# venv\Scripts\activate         # Windows
+source venv/bin/activate      # Linux / Mac
+# venv\Scripts\activate       # Windows
 
-# Cài đặt core (chạy được ngay, không cần GPU)
-pip install networkx numpy matplotlib
-
-# Cài đặt đầy đủ (cần tải model ~1GB)
 pip install -r requirements.txt
 ```
 
-### 2. Cài đặt tùy chọn
+### Tùy chọn
 
 ```bash
-# FAISS (tăng tốc retrieval)
-pip install faiss-cpu            # CPU
-pip install faiss-gpu            # GPU (cần CUDA)
-
-# Interactive visualization
-pip install pyvis
-
-# Vietnamese NLP models (cần internet)
-pip install underthesea sentence-transformers transformers torch
-```
-
-### 3. Cấu hình API Key (tùy chọn, cho RAG bằng Claude)
-
-```bash
+# Nếu muốn Claude summary
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
----
+## Dữ liệu đầu vào
 
-## ▶️ Cách chạy
+### CSV
 
-### Chế độ Interactive (Khuyến nghị)
+CSV chuẩn hiện tại:
+
+```text
+url,date,category,title,text
+```
+
+Ví dụ:
+
+```csv
+https://vnexpress.net/example.html,"Thứ sáu, 31/7/2020, 18:15 (GMT+7)",thế giới,Tiêu đề bài báo,"Nội dung bài báo..."
+```
+
+Khi load CSV, hệ thống sẽ tự:
+
+- parse ngày kiểu VnExpress sang `YYYY-MM-DD`
+- cắt dòng tác giả ở cuối bài bằng `strip_author()`
+- dedup theo URL
+- bỏ bài có tỷ lệ tiếng Việt quá thấp (`viet_ratio < 0.05`)
+- suy luận `source=VnExpress` từ URL nếu thiếu
+
+### JSON
+
+JSON cần là array các object:
+
+```json
+[
+  {
+    "id": "doc_1",
+    "title": "Tiêu đề bài báo",
+    "content": "Nội dung bài báo",
+    "date": "2024-01-15",
+    "source": "VnExpress",
+    "url": "https://...",
+    "category": "thế giới"
+  }
+]
+```
+
+## Cách chạy
+
+### 1. Build offline index
+
+Khuyến nghị build một lần rồi load lại:
+
+```bash
+python scripts/build_index.py
+python scripts/build_index.py --data data/vnexpress_articles.csv
+python scripts/build_index.py --data data/custom_news.json --index-dir data/index_custom
+```
+
+Sau bước này, state sẽ được lưu trong `data/index/` mặc định.
+Các artifact thường gặp:
+
+- `state.pkl`: documents, chunks, embedding state
+- `knowledge_graph.pkl`: graph đã build
+- `bm25.pkl`: BM25 backend đã serialize
+- `vector.index`: FAISS index nếu môi trường có FAISS
+- `ner_cache.json`: cache text → entities
+- `ner_checkpoint.json`: tiến độ NER để resume nếu build bị ngắt
+- `ner_results.jsonl`: kết quả NER incremental
+
+### 2. Search từ index đã build
+
+```bash
+python main.py --load-index
+python main.py --load-index --query "kinh tế việt nam" --no-llm
+python main.py --load-index --index-dir data/index_custom --query "WHO COVID-19"
+python main.py --load-index --use-phobert-re --phobert-dir data/phobert_re
+```
+
+### 3. Rebuild trực tiếp từ raw data
 
 ```bash
 python main.py
+python main.py --data data/vnexpress_articles.csv --query "chiến tranh nga ukraine"
+python main.py --data data/custom_news.json --query "Samsung Hà Nội"
+python main.py --data data/vnexpress_articles.csv --use-phobert-re --phobert-dir data/phobert_re
 ```
 
-Sau khi build xong, nhập query:
+### 4. Deep Learning workflow cho PhoBERT RE
 
-```
-🔎 Nhập query (hoặc :help): chiến tranh nga ukraine
-```
-
-### Chế độ Single Query
+Chuẩn bị supervised dataset nhỏ từ benchmark annotate tay:
 
 ```bash
-python main.py --query "WHO cảnh báo dịch COVID-19"
-python main.py --query "Samsung đầu tư Việt Nam" --top-k 5
-python main.py --query "bầu cử tổng thống Mỹ" --hops 1
+python scripts/train_phobert_re.py --prepare-only
 ```
 
-### Options
+Fine-tune PhoBERT RE khi có `torch` + `transformers` và GPU:
 
-| Flag             | Default                  | Mô tả                      |
-| ---------------- | ------------------------ | -------------------------- |
-| `--query` / `-q` | None                     | Single query mode          |
-| `--data` / `-d`  | `data/news_dataset.json` | Đường dẫn dataset          |
-| `--top-k` / `-k` | 7                        | Số bài báo trả về          |
-| `--hops`         | 2                        | Số hop query expansion     |
-| `--use-model`    | False                    | Dùng HuggingFace NER model |
-| `--no-llm`       | False                    | Tắt Claude API             |
-| `--viz`          | False                    | Xuất KG visualization      |
+```bash
+python scripts/train_phobert_re.py --output-dir data/phobert_re
+```
 
-### Lệnh trong interactive mode
+Script sẽ tự:
 
-| Lệnh      | Chức năng                     |
-| --------- | ----------------------------- |
-| `<query>` | Tìm kiếm tin tức              |
-| `:kg`     | Thống kê Knowledge Graph      |
-| `:top`    | Top 20 entity quan trọng nhất |
-| `:viz`    | Xuất KG ra file HTML          |
-| `:help`   | Hướng dẫn                     |
-| `:quit`   | Thoát                         |
+- tách `relation_ground_truth.json` thành holdout `benchmark_train.json` và `benchmark_test.json`
+- build `re_train_supervised.jsonl` từ phần train
+- fine-tune PhoBERT RE
+- lưu `training_summary.json`, `train_metrics.json`, `test_metrics.json`, `test_ablation.json`
 
-### Chạy tests
+Chạy ablation giữa `rule_based`, `hybrid` và `phobert`:
+
+```bash
+python scripts/run_re_ablation.py --ground-truth data/relation_ground_truth.json --phobert-dir data/phobert_re
+python -m src.evaluation_nlp --ground-truth data/ner_ground_truth.json
+```
+
+## CLI options
+
+| Flag | Default | Ý nghĩa |
+| --- | --- | --- |
+| `--query`, `-q` | `None` | Chạy một query rồi thoát |
+| `--data`, `-d` | `data/vnexpress_articles.csv` | Đường dẫn raw dataset CSV/JSON |
+| `--top-k`, `-k` | `7` | Số bài báo trả về |
+| `--hops` | `2` | Số hop query expansion |
+| `--use-model` | `False` | Thử dùng HuggingFace NER / SBERT |
+| `--no-llm` | `False` | Tắt Claude summary |
+| `--viz` | `False` | Xuất KG visualization |
+| `--load-index` | `False` | Load index từ disk thay vì rebuild |
+| `--index-dir` | `data/index` | Thư mục chứa `state.pkl` và `knowledge_graph.pkl` |
+| `--use-phobert-re` | `False` | Bật Hybrid Relation Extractor với PhoBERT nếu có model |
+| `--phobert-dir` | `data/phobert_re` | Thư mục model PhoBERT RE đã fine-tune |
+
+## Interactive commands
+
+| Lệnh | Chức năng |
+| --- | --- |
+| `<query>` | Tìm kiếm tin tức |
+| `:kg` | Thống kê Knowledge Graph |
+| `:top` | Top entity quan trọng nhất |
+| `:viz` | Xuất KG ra file HTML/PNG |
+| `:help` | Hướng dẫn |
+| `:quit` | Thoát |
+
+## Mô tả nhanh các module
+
+### `src/data_loader.py`
+
+- `load_json()` và `load_csv()`
+- `parse_vn_date()`
+- `strip_author()`
+- dedup URL + language filter
+
+### `src/preprocessing/ner.py`
+
+- `underthesea` là backend mặc định hiện tại
+- nếu `--use-model` và model load được, có thể dùng HuggingFace
+- có `ner_with_checkpoint()` để resume batch lớn
+- cache NER được persist ra `ner_cache.json`
+- fallback cuối là rule-based
+
+### `src/preprocessing/entity_linking.py`
+
+- alias map
+- Levenshtein fuzzy match cho typo ngắn
+- embedding match nếu có `sentence-transformers`
+
+### `src/preprocessing/relation_extraction_phobert.py`
+
+- `DistantSupervisionBuilder`: tạo dữ liệu train từ corpus + Wikidata
+- `PhoBERTRelationExtractor.train()`: fine-tune classifier head
+- lưu `re_config.json`, `train_metrics.json`, `trainer_log_history.json`, `training_summary.json`
+- script train sẽ lưu thêm `benchmark_split_manifest.json`, `benchmark_test.json`, `test_metrics.json`, `test_ablation.json`
+- `HybridRelationExtractor`: ghép rule-based và PhoBERT
+
+### `src/evaluation_*.py`
+
+- `evaluation_nlp.py`: đánh giá NER trên `data/ner_ground_truth.json`
+- `evaluation_re.py`: đánh giá RE và chạy ablation `rule_based vs hybrid vs phobert`
+
+### `src/graph/*`
+
+- `knowledge_graph.py`: `MultiDiGraph`, temporal edges, confidence filtering
+- `ranking.py`: global PR + PPR
+- `similarity.py`: thêm `similar_to` edges bằng embedding
+- `visualization.py`: Pyvis / Matplotlib
+
+### `src/retrieval/*`
+
+- `chunking.py`: sentence-window chunking
+- `embedding.py`: SBERT hoặc TF-IDF fallback
+- `retriever.py`: FAISS mặc định nếu có, BM25 + RRF, cross-encoder rerank top-20
+- `query_expansion.py`: relation-aware expansion + multi-query support
+
+### `src/rag/pipeline.py`
+
+- build context từ top documents
+- context hiện lấy tối đa `800` ký tự mỗi bài
+- Claude nếu có API key, nếu không dùng template summary
+
+## Test
 
 ```bash
 python test_system.py
 ```
 
----
+`test_system.py` hiện dùng fixture CSV nhỏ tự tạo trong thư mục tạm, nên không phụ thuộc vào file dữ liệu lớn trong `data/`.
+Smoke test cũng cover:
 
-## 💡 Ví dụ Query Demo
+- benchmark RE annotate tay
+- `scripts/train_phobert_re.py --prepare-only`
+- `scripts/run_re_ablation.py`
 
-```
-chiến tranh nga ukraine
-WHO cảnh báo dịch COVID-19 tại châu Á
-Samsung khai trương Hà Nội công nghệ
-bầu cử tổng thống Mỹ 2024
-Phạm Minh Chính kinh tế Việt Nam
-VinAI trí tuệ nhân tạo tiếng Việt
-Ngân hàng Thế giới đầu tư năng lượng
-dịch cúm H5N1 Đông Nam Á
-```
+## Lưu ý thực tế
 
----
+- FAISS được bật mặc định trong `main.py`, nhưng nếu import FAISS thất bại hệ thống sẽ tự rơi về NumPy backend.
+- Nếu có FAISS, index sẽ được lưu thêm ra `vector.index`; nếu không có thì hệ thống vẫn load lại từ embedding state.
+- BM25 luôn được serialize ra `bm25.pkl` để `--load-index` không phải rebuild lexical backend.
+- Cross-encoder được bật mặc định trong `Retriever`, và sẽ rerank top-20 candidates; nếu `sentence-transformers` hoặc model không load được thì hệ thống tự fallback.
+- `--use-phobert-re` sẽ dùng `HybridRelationExtractor`; nếu thiếu model/GPU thì tự fallback về rule-based extractor.
+- benchmark DL trong repo là nhỏ và phục vụ mục đích smoke test / demo workflow; muốn chất lượng tốt cần build thêm training data từ distant supervision hoặc annotate nhiều hơn.
+- checkpoint `data/phobert_re` hiện có thể train được ngay trên máy đã cache model, nhưng kết quả holdout còn thấp nếu chỉ dùng benchmark nhỏ.
+- Build dài có thể resume nhờ `ner_checkpoint.json` và `ner_results.jsonl`.
+- `--use-model` là “best effort”: nếu HuggingFace model không tải được, hệ thống vẫn fallback về backend sẵn có.
 
-## 🧩 Mô tả từng module
+## Troubleshooting
 
-### `data_loader.py`
-
-- Đọc JSON, validate, chuẩn hóa text tiếng Việt
-- Lọc theo `category`, `source`, `date`
-
-### `ner_extraction.py`
-
-- **Primary**: `NlpHUST/ner-vietnamese-electra-base` (HuggingFace)
-- **Fallback**: Rule-based dictionary (PER/LOC/ORG/MISC)
-- Output: `[{'text': 'Putin', 'type': 'PER'}, ...]`
-
-### `entity_linking.py`
-
-- Bảng alias tĩnh (~80 mapping tiếng Việt)
-- Fuzzy match Levenshtein (threshold ≤ 2)
-- Gộp entity trùng: `"Hà Nội"` + `"Hanoi"` → canonical: `"Hà Nội"`
-
-### `relation_extraction.py`
-
-- Pattern regex 13 loại quan hệ tiếng Việt
-- Keyword detection giữa entity pairs
-- Output triple: `("WHO", "cảnh báo", "dịch cúm")`
-
-### `knowledge_graph.py`
-
-- NetworkX DiGraph với node/edge attributes
-- Co-occurrence edge tự động
-- Query: `get_neighbors(entity, hops=2)`
-- Persistence: pickle save/load
-
-### `embedding.py`
-
-- **Primary**: `keepitreal/vietnamese-sbert`
-- **Fallback**: TF-IDF + IDF weighting + L2 normalize
-- Cache entity embeddings
-
-### `graph_ranking.py`
-
-- NetworkX PageRank (damping=0.85)
-- Combined score: `0.6 × PageRank + 0.4 × frequency`
-- Top-k query by entity type
-
-### `query_processor.py`
-
-- NER + Entity Linking trên query
-- Phát hiện topic (6 loại), năm tháng
-- Fallback keyword extraction
-
-### `query_expansion.py`
-
-- 1-hop + 2-hop KG neighbor traversal
-- Ưu tiên neighbor có importance score cao
-- Max expanded entities: 15 (configurable)
-
-### `retriever.py`
-
-- **FAISS** `IndexFlatIP` (cosine) nếu có
-- **NumPy** brute-force fallback
-- Re-ranking: `0.8 × vector_score + 0.2 × entity_importance`
-
-### `rag_pipeline.py`
-
-- Build context từ top-k documents
-- **LLM**: Claude API (nếu có ANTHROPIC_API_KEY)
-- **Template**: Fallback không cần LLM
-- Output: summary + source list
-
-### `graph_visualization.py`
-
-- **Pyvis**: HTML tương tác, drag/zoom
-- **Matplotlib**: PNG tĩnh
-- Màu sắc theo entity type, size theo PageRank
-
----
-
-## 🔧 Mở rộng hệ thống
-
-### Thêm dữ liệu thật
-
-Thêm bài báo vào `data/news_dataset.json` theo format:
-
-```json
-{
-  "id": "unique_id",
-  "title": "Tiêu đề bài báo",
-  "content": "Nội dung...",
-  "date": "2024-01-15",
-  "source": "VnExpress",
-  "url": "https://...",
-  "category": "thế giới"
-}
-```
-
-### Dùng NER model thật
+### Không load được index
 
 ```bash
-# Cài đặt
-pip install transformers torch underthesea
-
-# Chạy với model
-python main.py --use-model
+python main.py --load-index
 ```
 
-### Dùng Vietnamese SBERT
-
-```python
-em = EmbeddingManager(
-    use_sbert=True,
-    model_name="keepitreal/vietnamese-sbert"
-)
-```
-
-### Bật Claude RAG
+Nếu báo thiếu file, hãy build lại:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-python main.py   # Tự động dùng Claude để generate summary
+python scripts/build_index.py
 ```
 
----
+Nếu muốn resume NER batch dài sau khi bị ngắt, giữ nguyên `--index-dir` cũ để hệ thống dùng lại `ner_checkpoint.json` và `ner_cache.json`.
 
-## 📊 Benchmark (Dataset 20 docs)
+### Không có FAISS
 
-| Component           | Thời gian | Ghi chú              |
-| ------------------- | --------- | -------------------- |
-| DataLoader          | ~0.01s    | 20 docs              |
-| NER (rule-based)    | ~0.05s    | 20 docs              |
-| Entity Linking      | ~0.02s    | 20 docs              |
-| Relation Extraction | ~0.1s     | 136 triples          |
-| KG Build            | ~0.05s    | 149 nodes, 293 edges |
-| PageRank            | ~0.01s    |                      |
-| TF-IDF Embedding    | ~0.02s    | dim=532              |
-| Retrieval (NumPy)   | ~0.001s   | per query            |
-| **Total build**     | **~0.3s** |                      |
+- Hệ thống tự dùng NumPy
+- Nếu muốn ép FAISS, cài lại dependency phù hợp môi trường
 
----
+### Không có `sentence-transformers`
 
-## 🛠️ Troubleshooting
+- embedding fallback về TF-IDF
+- entity linking embedding match và cross-encoder rerank sẽ tự giảm cấp
 
-**Lỗi `ModuleNotFoundError`:**
+### Chưa có checkpoint PhoBERT RE
 
-```bash
-pip install networkx numpy matplotlib
-```
+- `scripts/run_re_ablation.py` sẽ tự skip phần `phobert`
+- `--use-phobert-re` trong `main.py` vẫn chạy được nhờ `HybridRelationExtractor` fallback về rule-based
+- để train model thật, cần `torch`, `transformers`, và tốt nhất là GPU
 
-**Lỗi `FAISS not found`:**
+### Không có `ANTHROPIC_API_KEY`
 
-- Hệ thống tự động dùng NumPy fallback
-- Cài: `pip install faiss-cpu`
-
-**Model không tải được:**
-
-- Hệ thống tự động dùng rule-based NER
-- Cần internet: `pip install transformers && python main.py --use-model`
-
-**ANTHROPIC_API_KEY không có:**
-
-- Hệ thống tự động dùng template summary
-- Vẫn hoạt động đầy đủ (chỉ summary kém phong phú hơn)
+- hệ thống vẫn chạy bình thường
+- phần summary sẽ dùng template thay vì LLM

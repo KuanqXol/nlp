@@ -19,7 +19,12 @@ Output entity chuẩn:
 from __future__ import annotations
 
 import hashlib
+import json
+import multiprocessing as mp
+import os
 import re
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 
 try:
@@ -30,7 +35,11 @@ except ImportError:
     _VNCORENLP_AVAILABLE = False
 
 try:
-    from underthesea import ner as _underthesea_ner
+    from underthesea import (
+        ner as _underthesea_ner,
+        pos_tag as _underthesea_pos_tag,
+        word_tokenize as _underthesea_word_tokenize,
+    )
 
     _UNDERTHESEA_AVAILABLE = True
 except ImportError:
@@ -128,6 +137,26 @@ _VNCORENLP_TAG_MAP = {
     "B-MISC": "MISC",
     "I-MISC": "MISC",
 }
+
+_COREFERENCE_PRONOUNS = {
+    "ông": "PER",
+    "ông ấy": "PER",
+    "bà": "PER",
+    "bà ấy": "PER",
+    "anh ấy": "PER",
+    "cô ấy": "PER",
+    "họ": None,
+    "tổ chức này": "ORG",
+    "công ty này": "ORG",
+    "tập đoàn này": "ORG",
+    "thành phố này": "LOC",
+    "quốc gia này": "LOC",
+    "nước này": "LOC",
+}
+
+_NER_MP_SAFE_ENTRYPOINTS = {"main.py", "build_index.py"}
+_NER_MP_CHUNKSIZE = 20
+_NER_MP_MIN_DOCS = 40
 
 
 def _split_sentences_with_offsets(text: str) -> List[Dict]:
@@ -245,6 +274,72 @@ def _rule_based_ner(text: str) -> List[Dict]:
     return _attach_spans(raw, text)
 
 
+def _guess_entity_type(surface: str, entities: List[Dict]) -> str:
+    lowered = surface.lower()
+
+    for ent_type, lexicon in (
+        ("PER", _PERSON_DICT),
+        ("LOC", _LOCATION_DICT),
+        ("ORG", _ORG_DICT),
+        ("MISC", _MISC_DICT),
+    ):
+        if any(lowered == item.lower() for item in lexicon):
+            return ent_type
+
+    votes: Dict[str, int] = {}
+    for entity in entities:
+        entity_text = entity.get("text", "").lower()
+        if entity_text and (entity_text in lowered or lowered in entity_text):
+            ent_type = entity.get("type", "MISC")
+            votes[ent_type] = votes.get(ent_type, 0) + 1
+    if votes:
+        return max(votes.items(), key=lambda item: item[1])[0]
+
+    if surface.isupper() and len(surface) <= 8:
+        return "ORG"
+    return "MISC"
+
+
+def _ner_worker(payload) -> Dict:
+    """Worker chạy trong subprocess riêng."""
+    doc, ner_config = payload
+    try:
+        ner = VietnameseNER(**ner_config)
+        processed = ner.extract_from_document(doc)
+        ner.close()
+        return processed
+    except Exception:
+        out = dict(doc)
+        out.setdefault("entities", [])
+        return out
+
+
+def _is_windows_mp_safe() -> bool:
+    if os.name != "nt":
+        return True
+    if os.environ.get("NLP_FORCE_NER_MP") == "1":
+        return True
+
+    main_module = sys.modules.get("__main__")
+    main_file = Path(getattr(main_module, "__file__", "")).name.lower()
+    return main_file in _NER_MP_SAFE_ENTRYPOINTS
+
+
+def _get_mp_disable_reasons(pending_docs: int, ner_backend: str) -> List[str]:
+    reasons: List[str] = []
+    if pending_docs < _NER_MP_MIN_DOCS:
+        reasons.append(
+            f"pending_docs={pending_docs} < min_docs={_NER_MP_MIN_DOCS}"
+        )
+    if mp.cpu_count() <= 1:
+        reasons.append("cpu_count <= 1")
+    if ner_backend not in {"underthesea", "rule-based"}:
+        reasons.append(f"backend={ner_backend} không hỗ trợ multiprocessing")
+    if not _is_windows_mp_safe():
+        reasons.append("Windows entrypoint hiện tại chưa an toàn cho spawn")
+    return reasons
+
+
 class _VnCoreNLPBackend:
     def __init__(self, jar_path: str, port: int = 9000):
         self.jar_path = jar_path
@@ -355,6 +450,61 @@ class _UndertheseaBackend:
             else:
                 i += 1
 
+        try:
+            tokenized = _underthesea_word_tokenize(text)
+            tagged = _underthesea_pos_tag(
+                " ".join(tokenized) if isinstance(tokenized, list) else tokenized
+            )
+        except Exception:
+            tagged = []
+
+        existing = {entity["text"].lower() for entity in entities}
+        buffer: List[str] = []
+
+        def _flush_buffer():
+            if not buffer:
+                return
+            surface = " ".join(buffer).replace("_", " ").strip()
+            buffer.clear()
+            if len(surface.split()) < 2:
+                return
+            if surface.lower() in existing:
+                return
+            entities.append(
+                {
+                    "text": surface,
+                    "type": _guess_entity_type(surface, entities),
+                    "pos": "Np",
+                    "score": 0.78,
+                }
+            )
+            existing.add(surface.lower())
+
+        for token, pos in tagged:
+            if pos == "Np":
+                buffer.append(token)
+            else:
+                _flush_buffer()
+        _flush_buffer()
+
+        for match in re.finditer(
+            r"\b(?:[A-ZĐ][\wÀ-ỹ.-]*\s+){1,}[A-ZĐ][\wÀ-ỹ.-]*\b",
+            text,
+            flags=re.UNICODE,
+        ):
+            surface = match.group().strip()
+            if surface.lower() in existing:
+                continue
+            entities.append(
+                {
+                    "text": surface,
+                    "type": _guess_entity_type(surface, entities),
+                    "pos": "Np",
+                    "score": 0.76,
+                }
+            )
+            existing.add(surface.lower())
+
         return _attach_spans(entities, text)
 
 
@@ -366,29 +516,38 @@ class VietnameseNER:
         use_transformer: bool = False,
         transformer_model: str = "NlpHUST/ner-vietnamese-electra-base",
         use_model: bool = None,
+        cache_path: Optional[str] = None,
+        log_backend: bool = True,
     ):
         if use_model is not None:
             use_transformer = use_model
 
+        self._spawn_config = {
+            "vncorenlp_jar": vncorenlp_jar,
+            "vncorenlp_port": vncorenlp_port,
+            "use_transformer": use_transformer,
+            "transformer_model": transformer_model,
+            "use_model": use_model,
+            "cache_path": None,
+            "log_backend": False,
+        }
         self._backend = None
         self._hf_pipe = None
         self._backend_name = "rule-based"
         self._extract_cache: Dict[str, List[Dict]] = {}
+        self._log_backend = log_backend
 
         if vncorenlp_jar and _VNCORENLP_AVAILABLE:
             try:
                 self._backend = _VnCoreNLPBackend(vncorenlp_jar, vncorenlp_port)
                 self._backend_name = "VnCoreNLP"
-                print("[NER] Backend: VnCoreNLP")
+                if self._log_backend:
+                    print("[NER] Backend: VnCoreNLP")
+                if cache_path:
+                    self.load_cache(cache_path)
                 return
             except Exception as e:
                 print(f"[NER] VnCoreNLP lỗi: {e}")
-
-        if _UNDERTHESEA_AVAILABLE:
-            self._backend = _UndertheseaBackend()
-            self._backend_name = "underthesea"
-            print("[NER] Backend: underthesea")
-            return
 
         if use_transformer and _TRANSFORMERS_AVAILABLE:
             try:
@@ -396,12 +555,27 @@ class VietnameseNER:
                     "ner", model=transformer_model, aggregation_strategy="simple"
                 )
                 self._backend_name = "transformer"
-                print(f"[NER] Backend: HuggingFace ({transformer_model})")
+                if self._log_backend:
+                    print(f"[NER] Backend: HuggingFace ({transformer_model})")
+                if cache_path:
+                    self.load_cache(cache_path)
                 return
             except Exception as e:
                 print(f"[NER] Transformer lỗi: {e}")
 
-        print("[NER] Backend: rule-based (fallback)")
+        if _UNDERTHESEA_AVAILABLE:
+            self._backend = _UndertheseaBackend()
+            self._backend_name = "underthesea"
+            if self._log_backend:
+                print("[NER] Backend: underthesea")
+            if cache_path:
+                self.load_cache(cache_path)
+            return
+
+        if self._log_backend:
+            print("[NER] Backend: rule-based (fallback)")
+        if cache_path:
+            self.load_cache(cache_path)
 
     def _cache_key(self, text: str) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -472,6 +646,27 @@ class VietnameseNER:
         print("[NER] Hoàn thành.")
         return result
 
+    def load_cache(self, cache_path: str):
+        path = Path(cache_path)
+        if not path.exists():
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._extract_cache = {
+                    str(key): list(value) for key, value in data.items()
+                }
+                print(f"[NER] Đã load cache: {path} ({len(self._extract_cache)} keys)")
+        except Exception as e:
+            print(f"[NER] Không load được cache {path}: {e}")
+
+    def save_cache(self, cache_path: str):
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self._extract_cache, f, ensure_ascii=False)
+
     def close(self):
         if isinstance(self._backend, _VnCoreNLPBackend):
             self._backend.close()
@@ -480,9 +675,256 @@ class VietnameseNER:
     def backend_name(self) -> str:
         return self._backend_name
 
+    def spawn_config(self) -> Dict:
+        return dict(self._spawn_config)
+
 
 def get_entities_by_type(entities: List[Dict], entity_type: str) -> List[str]:
     return [e.get("text", "") for e in entities if e.get("type") == entity_type]
+
+
+def _documents_fingerprint(documents: List[Dict]) -> str:
+    sha = hashlib.sha1()
+    for doc in documents:
+        sha.update(str(doc.get("id", "")).encode("utf-8"))
+        sha.update(b"|")
+        sha.update(str(doc.get("url", "")).encode("utf-8"))
+        sha.update(b"|")
+        sha.update(str(doc.get("date", "")).encode("utf-8"))
+        sha.update(b"\n")
+    return sha.hexdigest()
+
+
+def ner_with_checkpoint(
+    documents: List[Dict],
+    ner: VietnameseNER,
+    checkpoint_path: str,
+    cache_path: Optional[str] = None,
+    results_path: Optional[str] = None,
+    log_every: int = 500,
+) -> List[Dict]:
+    total_start = os.times()
+    checkpoint_file = Path(checkpoint_path)
+    results_file = Path(results_path or checkpoint_file.with_suffix(".jsonl"))
+    dataset_fingerprint = _documents_fingerprint(documents)
+    start_idx = 0
+    result: List[Dict] = []
+
+    if cache_path:
+        ner.load_cache(cache_path)
+
+    print(
+        "[NER] Checkpoint mode: "
+        f"docs={len(documents)}, checkpoint={checkpoint_file}, results={results_file}"
+    )
+    if cache_path:
+        print(f"[NER] Cache path: {cache_path}")
+
+    if checkpoint_file.exists() and results_file.exists():
+        try:
+            with open(checkpoint_file, encoding="utf-8") as f:
+                checkpoint = json.load(f)
+            if checkpoint.get("fingerprint") == dataset_fingerprint:
+                start_idx = int(checkpoint.get("next_index", 0))
+                with open(results_file, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            result.append(json.loads(line))
+                if len(result) < start_idx:
+                    start_idx = len(result)
+                else:
+                    result = result[:start_idx]
+                if start_idx:
+                    print(f"[NER] Resume từ checkpoint: {start_idx}/{len(documents)}")
+        except Exception as e:
+            print(f"[NER] Bỏ qua checkpoint lỗi: {e}")
+            start_idx = 0
+            result = []
+
+    def _update_cache(processed_doc: Dict):
+        if not cache_path:
+            return
+        text = processed_doc.get("full_text", processed_doc.get("content", ""))
+        if not text:
+            return
+        ner._extract_cache[ner._cache_key(text)] = [
+            dict(entity) for entity in processed_doc.get("entities", [])
+        ]
+
+    def _write_checkpoint(next_index: int):
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(checkpoint_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "fingerprint": dataset_fingerprint,
+                    "next_index": next_index,
+                    "total": len(documents),
+                    "completed": next_index == len(documents),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        if cache_path:
+            ner.save_cache(cache_path)
+
+    file_mode = "a" if start_idx > 0 else "w"
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+    pending = documents[start_idx:]
+    disable_reasons = _get_mp_disable_reasons(
+        pending_docs=len(pending),
+        ner_backend=getattr(ner, "backend_name", ""),
+    )
+    can_use_mp = (
+        len(pending) >= _NER_MP_MIN_DOCS
+        and mp.cpu_count() > 1
+        and getattr(ner, "backend_name", "") in {"underthesea", "rule-based"}
+        and _is_windows_mp_safe()
+    )
+
+    with open(results_file, file_mode, encoding="utf-8") as sink:
+        if can_use_mp:
+            n_workers = max(1, mp.cpu_count() - 1)
+            print(
+                f"[NER] Multiprocessing: {n_workers} workers, "
+                f"chunksize={_NER_MP_CHUNKSIZE}"
+            )
+            print(
+                f"[NER] Backend instances: {getattr(ner, 'backend_name', 'unknown')} "
+                f"x{n_workers} workers"
+            )
+            worker_args = (
+                (doc, ner.spawn_config())
+                for doc in pending
+            )
+            ctx = mp.get_context("spawn" if os.name == "nt" else None)
+            with ctx.Pool(processes=n_workers) as pool:
+                for i, processed in enumerate(
+                    pool.imap(_ner_worker, worker_args, chunksize=_NER_MP_CHUNKSIZE),
+                    start=start_idx,
+                ):
+                    _update_cache(processed)
+                    result.append(processed)
+                    sink.write(json.dumps(processed, ensure_ascii=False) + "\n")
+
+                    if (i + 1) % log_every == 0 or (i + 1) == len(documents):
+                        _write_checkpoint(i + 1)
+                        print(
+                            f"  [{i+1}/{len(documents)}] "
+                            f"checkpoint -> {checkpoint_file.name}"
+                        )
+        else:
+            if pending:
+                if disable_reasons:
+                    print(
+                        "[NER] Multiprocessing tắt: "
+                        + "; ".join(disable_reasons)
+                    )
+                print(
+                    f"[NER] Backend instances: {getattr(ner, 'backend_name', 'unknown')} x1"
+                )
+                print("[NER] Dùng chế độ tuần tự.")
+            for i in range(start_idx, len(documents)):
+                processed = ner.extract_from_document(documents[i])
+                _update_cache(processed)
+                result.append(processed)
+                sink.write(json.dumps(processed, ensure_ascii=False) + "\n")
+
+                if (i + 1) % log_every == 0 or (i + 1) == len(documents):
+                    _write_checkpoint(i + 1)
+                    print(
+                        f"  [{i+1}/{len(documents)}] "
+                        f"checkpoint -> {checkpoint_file.name}"
+                    )
+
+    if cache_path:
+        ner.save_cache(cache_path)
+    total_elapsed = os.times().elapsed - total_start.elapsed
+    print(
+        f"[NER] Hoàn tất {len(result)}/{len(documents)} docs trong "
+        f"{total_elapsed:.1f}s"
+    )
+    return result
+
+
+def resolve_coreference(documents: List[Dict]) -> List[Dict]:
+    resolved_docs: List[Dict] = []
+
+    for doc in documents:
+        entities = sorted(
+            [dict(entity) for entity in doc.get("entities", [])],
+            key=lambda entity: (entity.get("start", -1), entity.get("end", -1)),
+        )
+        text = doc.get("full_text", doc.get("content", ""))
+        if not text or not entities:
+            resolved_docs.append(doc)
+            continue
+
+        history: List[Dict] = []
+        coref_entities: List[Dict] = []
+        sentence_spans = _split_sentences_with_offsets(text)
+
+        for sent in sentence_spans:
+            sent_entities = [
+                entity
+                for entity in entities
+                if sent["start"] <= entity.get("start", -1) < sent["end"]
+            ]
+            sent_lower = sent["text"].lower()
+
+            for pronoun, expected_type in _COREFERENCE_PRONOUNS.items():
+                for match in re.finditer(rf"\b{re.escape(pronoun)}\b", sent_lower):
+                    antecedent = None
+                    for candidate in reversed(history):
+                        if expected_type is None or candidate.get("type") == expected_type:
+                            antecedent = candidate
+                            break
+                    if not antecedent:
+                        continue
+
+                    mention_text = sent["text"][match.start() : match.end()]
+                    coref_entities.append(
+                        {
+                            "text": antecedent.get("text", mention_text),
+                            "resolved_text": antecedent.get("text", mention_text),
+                            "mention_text": mention_text,
+                            "type": antecedent.get("type", "MISC"),
+                            "start": sent["start"] + match.start(),
+                            "end": sent["start"] + match.end(),
+                            "sentence_id": sent["sentence_id"],
+                            "pos": "PRO",
+                            "score": round(
+                                float(antecedent.get("score", 0.8)) * 0.85, 3
+                            ),
+                            "entity_text": antecedent.get("text", mention_text),
+                            "entity_type": antecedent.get("type", "MISC"),
+                            "coref": True,
+                        }
+                    )
+
+            history.extend(sent_entities)
+
+        merged = entities + coref_entities
+        seen = set()
+        deduped = []
+        for entity in merged:
+            key = (
+                entity.get("start"),
+                entity.get("end"),
+                entity.get("type"),
+                entity.get("text", "").lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(entity)
+
+        out = dict(doc)
+        out["entities"] = deduped
+        resolved_docs.append(out)
+
+    return resolved_docs
 
 
 if __name__ == "__main__":

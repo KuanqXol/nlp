@@ -19,6 +19,12 @@ Retriever nâng cấp — 3 cải tiến chính:
      Model: cross-encoder/ms-marco-MiniLM-L-6- (multilingual fallback)
 """
 
+import math
+import pickle
+import re
+from collections import Counter, defaultdict
+from datetime import date, datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -40,10 +46,24 @@ except ImportError:
 
 # ── Cấu hình ─────────────────────────────────────────────────────────────────
 
-CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-"
-GRAPH_BOOST_ALPHA = 0.30  # graph_boost weight trong hybrid score
-VECTOR_ALPHA = 0.70  # vector score weight
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
+GRAPH_BOOST_ALPHA = 0.15
+VECTOR_ALPHA = 0.55
+BM25_ALPHA = 0.20
+RRF_ALPHA = 0.10
 MAX_CHUNKS_PER_DOC = 2  # Tối đa N chunk/doc trước khi dedupe
+TOP_RERANK_CANDIDATES = 20
+RRF_K = 60
+BM25_K1 = 1.5
+BM25_B = 0.75
+# Date decay: exp(-days_ago / halflife). Bài cũ 365 ngày ≈ 0.37× score
+DATE_DECAY_HALFLIFE = 365.0
+# Set None để tắt date decay hoàn toàn
+DATE_DECAY_ENABLED = True
+
+
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"\w+", (text or "").lower(), flags=re.UNICODE)
 
 
 # ── Bi-encoder backends (giữ nguyên từ v1) ───────────────────────────────────
@@ -97,6 +117,117 @@ class _FaissBackend:
         ids = [self._ids[i] for i in idxs[0] if i >= 0]
         scores = [float(d) for d in dists[0][: len(ids)]]
         return ids, scores
+
+    def save(self, path: str):
+        if self._index is None or not _FAISS_AVAILABLE:
+            return
+        faiss.write_index(self._index, path)
+
+    def load(self, path: str, ids: List[str]):
+        if not _FAISS_AVAILABLE:
+            raise RuntimeError("FAISS không khả dụng trong môi trường hiện tại.")
+        self._index = faiss.read_index(path)
+        self._ids = list(ids)
+        self._dim = self._index.d
+
+
+class BM25Backend:
+    def __init__(self, k1: float = BM25_K1, b: float = BM25_B):
+        self.k1 = k1
+        self.b = b
+        self._ids: List[str] = []
+        self._doc_len: List[int] = []
+        self._avgdl = 0.0
+        self._idf: Dict[str, float] = {}
+        self._tfs: List[Counter] = []
+
+    def build(self, texts: List[str], ids: List[str]):
+        self._ids = list(ids)
+        self._tfs = []
+        self._doc_len = []
+
+        df_counter: Counter = Counter()
+        for text in texts:
+            tokens = _tokenize(text)
+            tf = Counter(tokens)
+            self._tfs.append(tf)
+            self._doc_len.append(len(tokens))
+            df_counter.update(tf.keys())
+
+        n_docs = max(len(self._ids), 1)
+        self._avgdl = sum(self._doc_len) / max(len(self._doc_len), 1)
+        self._idf = {
+            term: math.log(1 + (n_docs - df + 0.5) / (df + 0.5))
+            for term, df in df_counter.items()
+        }
+
+    def search(self, query: str, k: int) -> Tuple[List[str], List[float]]:
+        if not self._ids:
+            return [], []
+
+        q_terms = _tokenize(query)
+        if not q_terms:
+            return [], []
+
+        qtf = Counter(q_terms)
+        scores: List[Tuple[int, float]] = []
+        avgdl = self._avgdl or 1.0
+
+        for idx, tf in enumerate(self._tfs):
+            score = 0.0
+            dl = self._doc_len[idx] or 1
+            for term, qfreq in qtf.items():
+                f = tf.get(term, 0)
+                if f == 0:
+                    continue
+                idf = self._idf.get(term, 0.0)
+                denom = f + self.k1 * (1 - self.b + self.b * dl / avgdl)
+                score += idf * ((f * (self.k1 + 1)) / max(denom, 1e-8)) * qfreq
+            if score > 0:
+                scores.append((idx, float(score)))
+
+        scores.sort(key=lambda item: -item[1])
+        top = scores[: min(k, len(scores))]
+        return [self._ids[i] for i, _ in top], [score for _, score in top]
+
+    def save(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump(
+                {
+                    "k1": self.k1,
+                    "b": self.b,
+                    "ids": self._ids,
+                    "doc_len": self._doc_len,
+                    "avgdl": self._avgdl,
+                    "idf": self._idf,
+                    "tfs": self._tfs,
+                },
+                f,
+            )
+
+    def load(self, path: str):
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        self.k1 = float(state.get("k1", BM25_K1))
+        self.b = float(state.get("b", BM25_B))
+        self._ids = list(state.get("ids", []))
+        self._doc_len = list(state.get("doc_len", []))
+        self._avgdl = float(state.get("avgdl", 0.0))
+        self._idf = dict(state.get("idf", {}))
+        self._tfs = list(state.get("tfs", []))
+
+
+def rrf_merge(
+    vector_ids: List[str],
+    bm25_ids: List[str],
+    k: int = RRF_K,
+) -> List[Tuple[str, float]]:
+    fused: Dict[str, float] = defaultdict(float)
+    for rank, doc_id in enumerate(vector_ids, start=1):
+        fused[doc_id] += 1.0 / (k + rank)
+    for rank, doc_id in enumerate(bm25_ids, start=1):
+        fused[doc_id] += 1.0 / (k + rank)
+    return sorted(fused.items(), key=lambda item: (-item[1], item[0]))
 
 
 # ── Cross-encoder reranker ────────────────────────────────────────────────────
@@ -201,7 +332,8 @@ class Retriever:
     def __init__(
         self,
         use_faiss: bool = True,
-        use_cross_encoder: bool = False,
+        use_bm25: bool = True,
+        use_cross_encoder: bool = True,
         cross_encoder_model: str = CROSS_ENCODER_MODEL,
     ):
         self._backend = (
@@ -211,6 +343,7 @@ class Retriever:
             f"[Retriever] Backend: {'FAISS' if isinstance(self._backend, _FaissBackend) else 'NumPy'}"
         )
 
+        self._bm25 = BM25Backend() if use_bm25 else None
         self._reranker = (
             CrossEncoderReranker(cross_encoder_model) if use_cross_encoder else None
         )
@@ -224,6 +357,63 @@ class Retriever:
         self._graph_ranker = None
         self._kg = None
         self._global_scores: Dict[str, float] = {}
+
+    def _attach_state(
+        self,
+        embedding_manager,
+        documents: List[Dict],
+        chunks: Optional[List[Dict]] = None,
+        doc_to_chunks: Optional[Dict[str, List[str]]] = None,
+        graph_ranker=None,
+        kg=None,
+        importance_scores: Dict[str, float] = None,
+        chunk_mode: bool = False,
+    ):
+        self._em = embedding_manager
+        self._documents = {d["id"]: d for d in documents}
+        self._chunks = {c["chunk_id"]: c for c in (chunks or [])}
+        self._doc_to_chunks = doc_to_chunks or {}
+        self._graph_ranker = graph_ranker
+        self._kg = kg
+        self._global_scores = importance_scores or {}
+        self._chunk_mode = chunk_mode
+
+    def attach_state(
+        self,
+        embedding_manager,
+        documents: List[Dict],
+        chunks: Optional[List[Dict]] = None,
+        doc_to_chunks: Optional[Dict[str, List[str]]] = None,
+        graph_ranker=None,
+        kg=None,
+        importance_scores: Dict[str, float] = None,
+        chunk_mode: bool = False,
+    ):
+        self._attach_state(
+            embedding_manager=embedding_manager,
+            documents=documents,
+            chunks=chunks,
+            doc_to_chunks=doc_to_chunks,
+            graph_ranker=graph_ranker,
+            kg=kg,
+            importance_scores=importance_scores,
+            chunk_mode=chunk_mode,
+        )
+
+    def _build_bm25(self):
+        if not self._bm25 or self._em is None:
+            return
+        texts: List[str] = []
+        ids = list(self._em.doc_ids)
+        if self._chunk_mode:
+            for chunk_id in ids:
+                chunk = self._chunks.get(chunk_id, {})
+                texts.append(chunk.get("chunk_text", ""))
+        else:
+            for doc_id in ids:
+                doc = self._documents.get(doc_id, {})
+                texts.append(doc.get("full_text", doc.get("content", "")))
+        self._bm25.build(texts, ids)
 
     # ─────────────────────────────────────────────────────────────────────
     # Build (chunk mode — recommended)
@@ -251,14 +441,16 @@ class Retriever:
             kg:                KnowledgeGraph instance (cho PPR)
             importance_scores: Global importance (fallback khi không có PPR)
         """
-        self._em = embedding_manager
-        self._doc_to_chunks = doc_to_chunks
-        self._documents = {d["id"]: d for d in documents}
-        self._chunks = {c["chunk_id"]: c for c in chunks}
-        self._graph_ranker = graph_ranker
-        self._kg = kg
-        self._global_scores = importance_scores or {}
-        self._chunk_mode = True
+        self._attach_state(
+            embedding_manager=embedding_manager,
+            documents=documents,
+            chunks=chunks,
+            doc_to_chunks=doc_to_chunks,
+            graph_ranker=graph_ranker,
+            kg=kg,
+            importance_scores=importance_scores,
+            chunk_mode=True,
+        )
 
         embeddings = embedding_manager.doc_embeddings
         chunk_ids = embedding_manager.doc_ids  # doc_ids thực ra là chunk_ids
@@ -268,6 +460,7 @@ class Retriever:
             return
 
         self._backend.build(embeddings, chunk_ids)
+        self._build_bm25()
         print(
             f"[Retriever] Chunk index: {len(chunk_ids)} chunks, "
             f"{len(self._documents)} docs"
@@ -284,10 +477,12 @@ class Retriever:
         importance_scores: Dict[str, float] = None,
     ):
         """Backward-compat: không chunking, index theo document."""
-        self._em = embedding_manager
-        self._documents = {d["id"]: d for d in documents}
-        self._global_scores = importance_scores or {}
-        self._chunk_mode = False
+        self._attach_state(
+            embedding_manager=embedding_manager,
+            documents=documents,
+            importance_scores=importance_scores,
+            chunk_mode=False,
+        )
 
         embeddings = embedding_manager.doc_embeddings
         doc_ids = embedding_manager.doc_ids
@@ -296,13 +491,14 @@ class Retriever:
             return
 
         self._backend.build(embeddings, doc_ids)
+        self._build_bm25()
         print(f"[Retriever] Document index: {len(doc_ids)} docs")
 
     # ─────────────────────────────────────────────────────────────────────
     # Retrieve
     # ─────────────────────────────────────────────────────────────────────
 
-    def retrieve(
+    def search(
         self,
         query: str,
         top_k: int = 10,
@@ -328,11 +524,32 @@ class Retriever:
             return []
 
         query_vec = self._em.encode_query(query)
-        fetch_k = min(top_k * fetch_multiplier, max(len(self._documents), 1))
-        ids, vec_scores = self._backend.search(query_vec, k=fetch_k)
+        corpus_size = max(len(self._em.doc_ids), 1)
+        fetch_k = min(
+            max(top_k * fetch_multiplier, TOP_RERANK_CANDIDATES),
+            corpus_size,
+        )
+        vec_ids, vec_scores = self._backend.search(query_vec, k=fetch_k)
+        bm25_ids, bm25_scores = (
+            self._bm25.search(query, k=fetch_k) if self._bm25 else ([], [])
+        )
 
+        fused = rrf_merge(vec_ids, bm25_ids)
+        ids = [doc_id for doc_id, _ in fused[:fetch_k]]
+
+        if not ids and vec_ids:
+            ids = vec_ids
+        if not ids and bm25_ids:
+            ids = bm25_ids
         if not ids:
             return []
+
+        vec_score_map = dict(zip(vec_ids, vec_scores))
+        bm25_score_map = dict(zip(bm25_ids, bm25_scores))
+        rrf_score_map = dict(fused)
+        bm25_max = max(bm25_score_map.values(), default=0.0)
+        # Normalize RRF: tính max để chuẩn hóa về [0,1]
+        rrf_max = max(rrf_score_map.values(), default=0.0)
 
         # Tính PPR scores một lần nếu có seed entities
         ppr_scores: Dict[str, float] = {}
@@ -345,57 +562,118 @@ class Retriever:
         candidates = []
         if self._chunk_mode:
             candidates = self._build_candidates_from_chunks(
-                ids, vec_scores, ppr_scores, top_k
+                ids,
+                vec_score_map,
+                bm25_score_map,
+                rrf_score_map,
+                bm25_max,
+                ppr_scores,
+                rrf_max=rrf_max,
             )
         else:
-            candidates = self._build_candidates_from_docs(ids, vec_scores, ppr_scores)
-
-        # Cross-encoder rerank
-        if rerank and self._reranker and self._reranker.available:
-            text_field = "chunk_text" if self._chunk_mode else "full_text"
-            candidates = self._reranker.rerank(
-                query,
-                candidates,
-                text_field=text_field,
-                top_k=top_k,
+            candidates = self._build_candidates_from_docs(
+                ids,
+                vec_score_map,
+                bm25_score_map,
+                rrf_score_map,
+                bm25_max,
+                ppr_scores,
+                rrf_max=rrf_max,
             )
+
+        candidates = self._rerank(query, candidates, top_k=top_k, rerank=rerank)
+        # Date decay: áp dụng sau rerank để cross-encoder score không bị ảnh hưởng
+        candidates = self._apply_date_decay(candidates)
 
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k]
 
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 10,
+        seed_entities: List[str] = None,
+        rerank: bool = True,
+        fetch_multiplier: int = 3,
+    ) -> List[Dict]:
+        return self.search(
+            query,
+            top_k=top_k,
+            seed_entities=seed_entities,
+            rerank=rerank,
+            fetch_multiplier=fetch_multiplier,
+        )
+
+    def _rerank(
+        self,
+        query: str,
+        candidates: List[Dict],
+        top_k: int,
+        rerank: bool = True,
+    ) -> List[Dict]:
+        if not candidates:
+            return candidates[:top_k]
+        if not rerank:
+            return candidates[:top_k]
+
+        text_field = "chunk_text" if self._chunk_mode else "full_text"
+        head = list(candidates[:TOP_RERANK_CANDIDATES])
+        tail = list(candidates[TOP_RERANK_CANDIDATES:])
+        if self._reranker:
+            head = self._reranker.rerank(
+                query,
+                head,
+                text_field=text_field,
+                top_k=None,
+            )
+        combined = head + tail
+        combined.sort(key=lambda x: -x["retrieval_score"])
+        return combined[:top_k]
+
     def _build_candidates_from_chunks(
         self,
         chunk_ids: List[str],
-        vec_scores: List[float],
+        vec_scores: Dict[str, float],
+        bm25_scores: Dict[str, float],
+        rrf_scores: Dict[str, float],
+        bm25_max: float,
         ppr_scores: Dict[str, float],
-        top_k: int,
+        rrf_max: float = 0.0,
     ) -> List[Dict]:
         """
         Chunk-level → dedupe về document level.
         Giữ chunk có score cao nhất per document.
         """
-        # chunk_id → best (vec_score, chunk)
-        best_per_doc: Dict[str, Tuple[float, Dict]] = {}
+        # chunk_id → best (hybrid_score, chunk, raw scores)
+        best_per_doc: Dict[str, Tuple[float, Dict, float, float, float]] = {}
 
-        for cid, vscore in zip(chunk_ids, vec_scores):
+        for cid in chunk_ids:
             chunk = self._chunks.get(cid)
             if not chunk:
                 continue
             doc_id = chunk.get("doc_id", "")
-            if doc_id not in best_per_doc or vscore > best_per_doc[doc_id][0]:
-                best_per_doc[doc_id] = (vscore, chunk)
+            vscore = vec_scores.get(cid, 0.0)
+            bm25_score = bm25_scores.get(cid, 0.0)
+            rrf_score = rrf_scores.get(cid, 0.0)
+            hybrid = self._base_rank_score(vscore, bm25_score, rrf_score, bm25_max, rrf_max)
+            if doc_id not in best_per_doc or hybrid > best_per_doc[doc_id][0]:
+                best_per_doc[doc_id] = (hybrid, chunk, vscore, bm25_score, rrf_score)
 
         candidates = []
-        for doc_id, (vscore, chunk) in best_per_doc.items():
+        for doc_id, (_, chunk, vscore, bm25_score, rrf_score) in best_per_doc.items():
             doc = self._documents.get(doc_id, {})
             graph_boost = self._compute_graph_boost(doc, ppr_scores)
-            final_score = VECTOR_ALPHA * vscore + GRAPH_BOOST_ALPHA * graph_boost
+            final_score = self._base_rank_score(
+                vscore, bm25_score, rrf_score, bm25_max, rrf_max
+            ) + GRAPH_BOOST_ALPHA * graph_boost
 
             result = dict(doc)
             result.update(
                 {
                     "retrieval_score": round(final_score, 4),
                     "vector_score": round(vscore, 4),
+                    "bm25_score": round(bm25_score, 4),
+                    "rrf_score": round(rrf_score, 4),
                     "graph_boost": round(graph_boost, 4),
                     "chunk_text": chunk.get("chunk_text", ""),
                     "chunk_id": chunk.get("chunk_id", ""),
@@ -408,26 +686,89 @@ class Retriever:
     def _build_candidates_from_docs(
         self,
         doc_ids: List[str],
-        vec_scores: List[float],
+        vec_scores: Dict[str, float],
+        bm25_scores: Dict[str, float],
+        rrf_scores: Dict[str, float],
+        bm25_max: float,
         ppr_scores: Dict[str, float],
+        rrf_max: float = 0.0,
     ) -> List[Dict]:
         candidates = []
-        for doc_id, vscore in zip(doc_ids, vec_scores):
+        for doc_id in doc_ids:
             doc = self._documents.get(doc_id)
             if not doc:
                 continue
+            vscore = vec_scores.get(doc_id, 0.0)
+            bm25_score = bm25_scores.get(doc_id, 0.0)
+            rrf_score = rrf_scores.get(doc_id, 0.0)
             graph_boost = self._compute_graph_boost(doc, ppr_scores)
-            final_score = VECTOR_ALPHA * vscore + GRAPH_BOOST_ALPHA * graph_boost
+            final_score = self._base_rank_score(
+                vscore, bm25_score, rrf_score, bm25_max, rrf_max
+            ) + GRAPH_BOOST_ALPHA * graph_boost
 
             result = dict(doc)
             result.update(
                 {
                     "retrieval_score": round(final_score, 4),
                     "vector_score": round(vscore, 4),
+                    "bm25_score": round(bm25_score, 4),
+                    "rrf_score": round(rrf_score, 4),
                     "graph_boost": round(graph_boost, 4),
                 }
             )
             candidates.append(result)
+        return candidates
+
+    def _base_rank_score(
+        self,
+        vector_score: float,
+        bm25_score: float,
+        rrf_score: float,
+        bm25_max: float,
+        rrf_max: float = 0.0,
+    ) -> float:
+        bm25_norm = (bm25_score / bm25_max) if bm25_max > 0 else 0.0
+        # Normalize RRF về [0,1] thay vì dùng raw score (~0.01–0.03)
+        rrf_norm = (rrf_score / rrf_max) if rrf_max > 0 else 0.0
+        return (
+            VECTOR_ALPHA * vector_score
+            + BM25_ALPHA * bm25_norm
+            + RRF_ALPHA * rrf_norm
+        )
+
+    def _apply_date_decay(
+        self,
+        candidates: List[Dict],
+        reference_date: date = None,
+    ) -> List[Dict]:
+        """
+        Nhân retrieval_score với date decay weight = exp(-days_ago / halflife).
+
+        Bài mới nhất (days_ago=0)  → weight=1.0  (không đổi)
+        Bài cũ 1 năm (days_ago=365) → weight≈0.37
+        Bài cũ 2 năm (days_ago=730) → weight≈0.14
+
+        Nếu không parse được ngày (thiếu trường date / sai format)
+        → weight=0.5 (tránh penalty không công bằng).
+        """
+        if not DATE_DECAY_ENABLED or not candidates:
+            return candidates
+
+        today = reference_date or date.today()
+        for doc in candidates:
+            raw_date = doc.get("date", "")
+            weight = 0.5  # default khi thiếu/lỗi ngày
+            if raw_date:
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+                    try:
+                        doc_date = datetime.strptime(str(raw_date)[:10], fmt).date()
+                        days_ago = max((today - doc_date).days, 0)
+                        weight = math.exp(-days_ago / DATE_DECAY_HALFLIFE)
+                        break
+                    except ValueError:
+                        continue
+            doc["date_decay_weight"] = round(weight, 4)
+            doc["retrieval_score"] = round(doc["retrieval_score"] * weight, 4)
         return candidates
 
     def _compute_graph_boost(
@@ -481,6 +822,37 @@ class Retriever:
 
     def get_document(self, doc_id: str) -> Optional[Dict]:
         return self._documents.get(doc_id)
+
+    def save_artifacts(self, index_dir: str):
+        target_dir = Path(index_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(self._backend, _FaissBackend) and self._em is not None:
+            self._backend.save(str(target_dir / "vector.index"))
+        if self._bm25:
+            self._bm25.save(str(target_dir / "bm25.pkl"))
+
+    def load_artifacts(self, index_dir: str) -> bool:
+        target_dir = Path(index_dir)
+        loaded_any = False
+
+        if self._em is not None:
+            vector_path = target_dir / "vector.index"
+            if vector_path.exists() and isinstance(self._backend, _FaissBackend):
+                self._backend.load(str(vector_path), self._em.doc_ids)
+                loaded_any = True
+            elif self._em.doc_embeddings is not None and self._em.doc_ids:
+                self._backend.build(self._em.doc_embeddings, self._em.doc_ids)
+
+        bm25_path = target_dir / "bm25.pkl"
+        if self._bm25:
+            if bm25_path.exists():
+                self._bm25.load(str(bm25_path))
+                loaded_any = True
+            else:
+                self._build_bm25()
+
+        return loaded_any
 
 
 # ── Backward compat ───────────────────────────────────────────────────────────

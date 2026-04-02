@@ -24,6 +24,7 @@ Pipeline tổng thể:
 
 import argparse
 import os
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -31,12 +32,20 @@ from pathlib import Path
 # Thêm src vào path
 SRC_DIR = Path(__file__).parent / "src"
 DATA_DIR = Path(__file__).parent / "data"
+INDEX_DIR = DATA_DIR / "index"
 sys.path.insert(0, str(SRC_DIR))
 
 # ── Import các module ────────────────────────────────────────────────────────
 
 from src.data_loader import NewsDataLoader
-from src.preprocessing import VietnameseNER, EntityLinker, RelationExtractor
+from src.preprocessing import (
+    VietnameseNER,
+    EntityLinker,
+    RelationExtractor,
+    HybridRelationExtractor,
+    ner_with_checkpoint,
+    resolve_coreference,
+)
 from src.graph import (
     KnowledgeGraph,
     GraphRanker,
@@ -93,8 +102,11 @@ class NewsSearchSystem:
         self,
         data_path: str = None,
         use_model: bool = False,
-        use_faiss: bool = False,
+        use_faiss: bool = True,
         use_llm: bool = True,
+        use_phobert_re: bool = False,
+        phobert_dir: str = None,
+        index_dir: str = None,
     ):
         """
         Args:
@@ -103,15 +115,26 @@ class NewsSearchSystem:
             use_faiss: True → dùng FAISS index (cần cài faiss-cpu)
             use_llm: True → thử dùng Claude API (cần ANTHROPIC_API_KEY)
         """
-        self.data_path = data_path or str(DATA_DIR / "news_dataset.json")
+        self.data_path = data_path or str(DATA_DIR / "vnexpress_articles.csv")
+        self._index_dir = Path(index_dir or INDEX_DIR)
+        self._phobert_dir = Path(phobert_dir) if phobert_dir else (DATA_DIR / "phobert_re")
+        self._use_phobert_re = use_phobert_re
 
         print(BANNER)
         print("🔧 Đang khởi tạo hệ thống...\n")
 
         # ── Khởi tạo các component ──────────────────────────────────────────
-        self.ner = VietnameseNER(use_model=use_model)
+        self.ner = VietnameseNER(
+            use_model=use_model,
+            cache_path=str(self._index_dir / "ner_cache.json"),
+        )
         self.linker = EntityLinker()
-        self.rel_extractor = RelationExtractor()
+        if use_phobert_re:
+            self.rel_extractor = HybridRelationExtractor(
+                phobert_dir=str(self._phobert_dir)
+            )
+        else:
+            self.rel_extractor = RelationExtractor()
         self.kg = KnowledgeGraph()
         self.em = EmbeddingManager(use_sbert=use_model)
         self.ranker = GraphRanker()
@@ -122,8 +145,13 @@ class NewsSearchSystem:
 
         # State
         self._documents = []
+        self._chunks = []
+        self._doc_to_chunks = {}
         self._importance_scores = {}
         self._query_expander = None
+
+    def _log_stage_done(self, label: str, start_time: float):
+        print(f"   Hoàn tất {label} trong {time.time() - start_time:.1f}s")
 
     def build(self):
         """
@@ -131,34 +159,62 @@ class NewsSearchSystem:
         Gọi một lần khi khởi động.
         """
         t0 = time.time()
+        self._index_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[Build] data={self.data_path} | index_dir={self._index_dir} | "
+            f"phobert_re={'on' if self._use_phobert_re else 'off'} | "
+            f"phobert_dir={self._phobert_dir}"
+        )
 
         # ── 1. Load data ───────────────────────────────────────────────────
         print("📂 Bước 1/6: Đang load dataset...")
+        stage_t0 = time.time()
         loader = NewsDataLoader(self.data_path)
         docs = loader.load()
+        print(f"   Load xong {len(docs)} bài.")
+        self._log_stage_done("load dataset", stage_t0)
 
         # ── 2. NER ────────────────────────────────────────────────────────
         print("\n🏷️  Bước 2/6: Nhận dạng thực thể (NER)...")
-        docs = self.ner.batch_extract(docs)
+        stage_t0 = time.time()
+        docs = ner_with_checkpoint(
+            docs,
+            self.ner,
+            checkpoint_path=str(self._index_dir / "ner_checkpoint.json"),
+            cache_path=str(self._index_dir / "ner_cache.json"),
+            results_path=str(self._index_dir / "ner_results.jsonl"),
+        )
+        print("   Giải đồng tham chiếu nhẹ...")
+        docs = resolve_coreference(docs)
+        self._log_stage_done("NER + coreference", stage_t0)
 
         # ── 3. Entity Linking ──────────────────────────────────────────────
         print("\n🔗 Bước 3/6: Chuẩn hóa entity (Entity Linking)...")
+        stage_t0 = time.time()
         docs = self.linker.batch_process(docs)
+        self._log_stage_done("entity linking", stage_t0)
 
         # ── 4. Relation Extraction ────────────────────────────────────────
         print("\n🕸️  Bước 4/6: Trích xuất quan hệ (Relation Extraction)...")
+        stage_t0 = time.time()
         docs = self.rel_extractor.batch_process(docs)
+        self._log_stage_done("relation extraction", stage_t0)
 
         # ── 5. Knowledge Graph ────────────────────────────────────────────
         print("\n🗺️  Bước 5/6: Xây dựng Knowledge Graph...")
+        stage_t0 = time.time()
         self.kg.build_from_documents(docs)
+        print("   Thêm similarity edges...")
+        SimilarityGraphBuilder(threshold=0.80).build(self.kg, self.em)
 
         # PageRank
         print("   Tính PageRank...")
         self._importance_scores = self.ranker.compute_importance_scores(self.kg)
+        self._log_stage_done("knowledge graph + pagerank", stage_t0)
 
         # ── 6. Embedding + Retrieval Index ────────────────────────────────
         print("\n🔢 Bước 6/6: Tạo Embedding Index...")
+        stage_t0 = time.time()
         chunks, doc_to_chunks = chunk_documents(
             docs,
             strategy="sentence_window",
@@ -178,6 +234,10 @@ class NewsSearchSystem:
             kg=self.kg,
             importance_scores=self._importance_scores,
         )
+        self._chunks = chunks
+        self._doc_to_chunks = doc_to_chunks
+        print(f"   Chunk count: {len(chunks)}")
+        self._log_stage_done("embedding + retrieval index", stage_t0)
 
         # ── Query Expander ────────────────────────────────────────────────
         self._query_expander = QueryExpander(
@@ -192,6 +252,89 @@ class NewsSearchSystem:
 
         elapsed = time.time() - t0
         print(f"\n✅ Hệ thống đã sẵn sàng! ({elapsed:.1f}s)")
+        self._print_stats()
+
+    def save_index(self, index_dir: str = None):
+        if not self._documents or not self._chunks:
+            raise RuntimeError("Chưa có state để lưu. Hãy chạy build() trước.")
+
+        target_dir = Path(index_dir or self._index_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._index_dir = target_dir
+        print(f"[Index] Đang lưu artifacts vào: {target_dir}")
+
+        state = {
+            "metadata": {
+                "data_path": self.data_path,
+                "saved_at": int(time.time()),
+                "use_phobert_re": self._use_phobert_re,
+                "phobert_dir": str(self._phobert_dir),
+            },
+            "documents": self._documents,
+            "chunks": self._chunks,
+            "doc_to_chunks": self._doc_to_chunks,
+            "importance_scores": self._importance_scores,
+            "embedding_state": self.em.export_state(),
+        }
+
+        with open(target_dir / "state.pkl", "wb") as f:
+            pickle.dump(state, f)
+        self.kg.save(str(target_dir / "knowledge_graph.pkl"))
+        self.retriever.save_artifacts(str(target_dir))
+        print(f"[Index] Đã lưu index vào: {target_dir}")
+
+    def load_index(self, index_dir: str = None):
+        target_dir = Path(index_dir or self._index_dir)
+        state_path = target_dir / "state.pkl"
+        kg_path = target_dir / "knowledge_graph.pkl"
+
+        if not state_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy state index: {state_path}")
+        if not kg_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy knowledge graph index: {kg_path}")
+
+        print(f"[Index] Đang load index từ: {target_dir}")
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
+
+        self.kg.load(str(kg_path))
+        self._index_dir = target_dir
+        self.data_path = state.get("metadata", {}).get("data_path", self.data_path)
+        self._use_phobert_re = bool(
+            state.get("metadata", {}).get("use_phobert_re", self._use_phobert_re)
+        )
+        self._phobert_dir = Path(
+            state.get("metadata", {}).get("phobert_dir", str(self._phobert_dir))
+        )
+        self._documents = state.get("documents", [])
+        self._chunks = state.get("chunks", [])
+        self._doc_to_chunks = state.get("doc_to_chunks", {})
+        self._importance_scores = state.get("importance_scores", {})
+        self.em = EmbeddingManager.from_state(state.get("embedding_state", {}))
+
+        self.ranker._global_pagerank = dict(getattr(self.kg, "_pagerank", {}))
+        self.ranker._importance_scores = dict(self._importance_scores)
+
+        self.retriever.attach_state(
+            self.em,
+            self._documents,
+            self._chunks,
+            self._doc_to_chunks,
+            graph_ranker=self.ranker,
+            kg=self.kg,
+            importance_scores=self._importance_scores,
+            chunk_mode=True,
+        )
+        self.retriever.load_artifacts(str(target_dir))
+        self._query_expander = QueryExpander(
+            self.kg,
+            graph_ranker=self.ranker,
+            importance_scores=self._importance_scores,
+            max_hop1=5,
+            max_hop2=4,
+        )
+
+        print("[Index] Load xong. Hệ thống sẵn sàng.")
         self._print_stats()
 
     def _print_stats(self):
@@ -302,7 +445,7 @@ class NewsSearchSystem:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Vietnamese KG-Enhanced News Search & RAG System"
     )
@@ -318,7 +461,18 @@ def parse_args():
         "-d",
         type=str,
         default=None,
-        help="Đường dẫn file JSON dataset (mặc định: data/news_dataset.json)",
+        help="Đường dẫn file JSON/CSV dataset (mặc định: data/vnexpress_articles.csv)",
+    )
+    parser.add_argument(
+        "--load-index",
+        action="store_true",
+        help="Load state từ disk thay vì rebuild toàn bộ pipeline",
+    )
+    parser.add_argument(
+        "--index-dir",
+        type=str,
+        default=str(INDEX_DIR),
+        help="Thư mục index trên disk (mặc định: data/index)",
     )
     parser.add_argument(
         "--top-k", "-k", type=int, default=7, help="Số bài báo trả về (mặc định: 7)"
@@ -342,7 +496,18 @@ def parse_args():
         action="store_true",
         help="Xuất visualization Knowledge Graph sau khi build",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--use-phobert-re",
+        action="store_true",
+        help="Bật Hybrid Relation Extractor với PhoBERT nếu có model/GPU",
+    )
+    parser.add_argument(
+        "--phobert-dir",
+        type=str,
+        default=str(DATA_DIR / "phobert_re"),
+        help="Thư mục model PhoBERT RE đã fine-tune",
+    )
+    return parser.parse_args(argv)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -354,12 +519,17 @@ def main():
     system = NewsSearchSystem(
         data_path=args.data,
         use_model=args.use_model,
-        use_faiss=False,  # Đổi thành True nếu cài faiss-cpu
+        use_faiss=True,
         use_llm=not args.no_llm,
+        use_phobert_re=args.use_phobert_re,
+        phobert_dir=args.phobert_dir,
+        index_dir=args.index_dir,
     )
 
-    # Build toàn bộ pipeline
-    system.build()
+    if args.load_index:
+        system.load_index(args.index_dir)
+    else:
+        system.build()
 
     # Visualization sau khi build (nếu yêu cầu)
     if args.viz:
