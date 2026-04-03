@@ -24,26 +24,51 @@ from typing import Dict, List, Optional, Set, Tuple
 
 # ── Cấu hình ─────────────────────────────────────────────────────────────────
 
-# Relation types được ưu tiên trong expansion (thứ tự giảm dần)
-HIGH_VALUE_RELATIONS = {
-    "leads",
-    "attacks",
-    "supports",
-    "sanctions",
-    "signs_deal_with",
-    "invests_in",
-    "acquires",
-    "warns_about",
-    "found_in",
-    "member_of",
+# Per-relation expansion weights (replaces binary HIGH_VALUE/EXCLUDE sets)
+RELATION_EXPANSION_WEIGHT = {
+    "leads":           1.0,
+    "attacks":         1.0,
+    "supports":        0.9,
+    "invests_in":      0.9,
+    "signs_deal_with": 0.8,
+    "appointed":       0.8,
+    "cooperates_with": 0.7,
+    "warns_about":     0.7,
+    "found_in":        0.6,
+    "located_in":      0.5,
+    "sanctions":       0.8,
+    "acquires":        0.8,
+    "member_of":       0.6,
+    "co_occurrence":   0.15,   # keep but heavily penalized
+    "similar_to":      0.1,
 }
-# Relation types bị loại khỏi expansion path
-EXCLUDE_RELATIONS = {"co_occurrence", "similar_to"}
+
+# Backward compat: sets derived from weights
+HIGH_VALUE_RELATIONS = {r for r, w in RELATION_EXPANSION_WEIGHT.items() if w >= 0.6}
+EXCLUDE_RELATIONS = {r for r, w in RELATION_EXPANSION_WEIGHT.items() if w < 0.2}
 
 MAX_SEED_ENTITIES = 5
 MAX_HOP1_PER_SEED = 4
 MAX_HOP2_PER_SEED = 3
 MAX_TOTAL_ENTITIES = 12
+
+
+def should_expand(processed_query: Dict) -> bool:
+    """Gate: only expand when query is entity-focused.
+
+    Skip expansion when:
+      - No entities detected
+      - Too many keywords (broad/unfocused query)
+      - Temporal intent (user wants recent news, not related entities)
+    """
+    entities = processed_query.get("entities", [])
+    keywords = processed_query.get("keywords", [])
+    intent = processed_query.get("intent", "")
+    return (
+        len(entities) >= 1
+        and len(keywords) <= 5
+        and intent != "temporal_query"
+    )
 
 
 class QueryExpander:
@@ -117,6 +142,20 @@ class QueryExpander:
 
         if not seeds:
             seeds = processed_query.get("keywords", [])[:3]
+
+        # Expansion gate: skip if query is not entity-focused
+        if not should_expand(processed_query) and seeds == processed_query.get("keywords", [])[:3]:
+            return {
+                "seed_entities": seeds,
+                "hop1_entities": [],
+                "hop2_entities": [],
+                "all_entities": seeds,
+                "entity_scores": {},
+                "relation_paths": {},
+                "expanded_query": processed_query.get("normalized", ""),
+                "multi_queries": [processed_query.get("normalized", "")],
+                "expansion_trace": {},
+            }
 
         original_query = processed_query.get("normalized", "")
         keywords = processed_query.get("keywords", [])
@@ -301,21 +340,28 @@ class QueryExpander:
         return [nb for _, nb in scored[:n]]
 
     def _relation_multiplier(self, e1: str, e2: str) -> float:
-        """Hệ số nhân dựa trên loại relation giữa 2 entity."""
+        """Hệ số nhân dựa trên loại relation giữa 2 entity (per-relation weights)."""
         rels = self.kg.get_relations_between(e1, e2)
         if not rels:
             return 0.5
+
+        best_weight = 0.0
         for rel_info in rels:
             rel = (
                 rel_info.get("relation", "")
                 if isinstance(rel_info, dict)
                 else str(rel_info)
             )
-            if rel in HIGH_VALUE_RELATIONS:
-                return 1.0
-            if rel in EXCLUDE_RELATIONS:
-                return 0.3
-        return 0.7
+            confidence = float(
+                rel_info.get("confidence", 1.0)
+                if isinstance(rel_info, dict)
+                else 1.0
+            )
+            rel_weight = RELATION_EXPANSION_WEIGHT.get(rel, 0.3)
+            weighted = rel_weight * confidence
+            best_weight = max(best_weight, weighted)
+
+        return best_weight if best_weight > 0 else 0.3
 
     def _get_best_relation(self, e1: str, e2: str) -> Optional[str]:
         """Lấy relation có nghĩa nhất giữa 2 entity."""

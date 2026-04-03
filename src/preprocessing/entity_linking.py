@@ -39,7 +39,7 @@ except ImportError:
     _SBERT_AVAILABLE = False
 
 DEFAULT_MODEL = "keepitreal/vietnamese-sbert"
-DEFAULT_THRESHOLD = 0.85
+DEFAULT_THRESHOLD = 0.80  # lowered from 0.85 to catch more embedding matches before Levenshtein
 LEVENSHTEIN_MIN_LEN = 4
 LEVENSHTEIN_SHORT_MAX_DISTANCE = 1
 LEVENSHTEIN_LONG_MAX_DISTANCE = 2
@@ -387,25 +387,7 @@ class EntityLinker:
             self._link_cache[cache_key] = dict(out)
             return out
 
-        # Stage 3: fuzzy Levenshtein match
-        fuzzy_id, fuzzy_sim = self._levenshtein_lookup(surface_form)
-        if fuzzy_id:
-            info = self._entities[fuzzy_id]
-            info["frequency"] += 1
-            info["aliases"].add(surface_form)
-            self._register_exact(surface_form, fuzzy_id)
-            out = {
-                "entity_id": fuzzy_id,
-                "surface_form": surface_form,
-                "canonical": info["canonical"],
-                "type": info.get("type", entity_type),
-                "similarity": fuzzy_sim,
-                "match_type": "levenshtein",
-            }
-            self._link_cache[cache_key] = dict(out)
-            return out
-
-        # Stage 4: embedding similarity
+        # Stage 3: embedding similarity (bi-encoder, BEFORE Levenshtein)
         candidate_id, sim = self._embedding_lookup(surface_form)
         if candidate_id and sim >= self.similarity_threshold:
             info = self._entities[candidate_id]
@@ -419,6 +401,24 @@ class EntityLinker:
                 "type": info.get("type", entity_type),
                 "similarity": round(sim, 4),
                 "match_type": "embedding",
+            }
+            self._link_cache[cache_key] = dict(out)
+            return out
+
+        # Stage 4: fuzzy Levenshtein match (fallback when embedding fails)
+        fuzzy_id, fuzzy_sim = self._levenshtein_lookup(surface_form)
+        if fuzzy_id:
+            info = self._entities[fuzzy_id]
+            info["frequency"] += 1
+            info["aliases"].add(surface_form)
+            self._register_exact(surface_form, fuzzy_id)
+            out = {
+                "entity_id": fuzzy_id,
+                "surface_form": surface_form,
+                "canonical": info["canonical"],
+                "type": info.get("type", entity_type),
+                "similarity": fuzzy_sim,
+                "match_type": "levenshtein",
             }
             self._link_cache[cache_key] = dict(out)
             return out
