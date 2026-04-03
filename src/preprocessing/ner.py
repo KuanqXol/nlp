@@ -52,6 +52,14 @@ try:
 except ImportError:
     _TRANSFORMERS_AVAILABLE = False
 
+try:
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
 _PERSON_DICT = [
     "Putin",
     "Zelensky",
@@ -250,27 +258,30 @@ def _attach_spans(raw_entities: List[Dict], text: str) -> List[Dict]:
 
 
 def _rule_based_ner(text: str) -> List[Dict]:
+    """Rule-based NER fallback — regex only, no dictionary scan."""
     raw: List[Dict] = []
 
-    def _scan(word_list: List[str], ent_type: str):
-        for word in word_list:
-            for m in re.finditer(re.escape(word), text, flags=re.IGNORECASE):
-                raw.append(
-                    {
-                        "text": m.group(),
-                        "type": ent_type,
-                        "start": m.start(),
-                        "end": m.end(),
-                        "sentence_id": -1,
-                        "pos": None,
-                        "score": 0.7,
-                    }
-                )
+    # Regex for capitalized multi-word sequences (Vietnamese proper nouns)
+    for match in re.finditer(
+        r"\b(?:[A-ZĐ][\wÀ-ỹ.-]*\s+){1,}[A-ZĐ][\wÀ-ỹ.-]*\b",
+        text,
+        flags=re.UNICODE,
+    ):
+        surface = match.group().strip()
+        if len(surface.split()) < 2:
+            continue
+        raw.append(
+            {
+                "text": surface,
+                "type": _guess_entity_type(surface, []),
+                "start": match.start(),
+                "end": match.end(),
+                "sentence_id": -1,
+                "pos": "Np",
+                "score": 0.65,
+            }
+        )
 
-    _scan(_PERSON_DICT, "PER")
-    _scan(_LOCATION_DICT, "LOC")
-    _scan(_ORG_DICT, "ORG")
-    _scan(_MISC_DICT, "MISC")
     return _attach_spans(raw, text)
 
 
@@ -338,6 +349,206 @@ def _get_mp_disable_reasons(pending_docs: int, ner_backend: str) -> List[str]:
     if not _is_windows_mp_safe():
         reasons.append("Windows entrypoint hiện tại chưa an toàn cho spawn")
     return reasons
+
+
+class _PhoBERTNERBackend:
+    """NER backend using fine-tuned PhoBERT for token classification.
+
+    Features:
+      - Loads from a local HuggingFace model directory (data/ner_model/)
+      - Subword → word alignment via word_ids() aggregation
+      - Sliding window with stride for long documents (> max_length tokens)
+      - Batch inference for efficiency
+      - Returns softmax probability as entity score
+    """
+
+    _BIO_MAP = {
+        "B-PER": "PER", "I-PER": "PER",
+        "B-LOC": "LOC", "I-LOC": "LOC",
+        "B-ORG": "ORG", "I-ORG": "ORG",
+    }
+
+    def __init__(self, model_dir: str, max_length: int = 256, stride: int = 128):
+        self.model_dir = model_dir
+        self.max_length = max_length
+        self.stride = stride
+        self._model = None
+        self._tokenizer = None
+        self._device = None
+
+    def _load(self):
+        if self._model is not None:
+            return
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("transformers + torch required for PhoBERT NER")
+        import torch
+
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[NER/PhoBERT] Loading from {self.model_dir} (device={self._device})")
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
+        self._model = AutoModelForTokenClassification.from_pretrained(self.model_dir)
+        self._model.to(self._device)
+        self._model.eval()
+        print("[NER/PhoBERT] Model ready.")
+
+    def annotate(self, text: str) -> List[Dict]:
+        """Extract entities from text using PhoBERT token classification."""
+        self._load()
+        if not text or not text.strip():
+            return []
+
+        sentences = _split_sentences_with_offsets(text)
+        if not sentences:
+            return []
+
+        all_entities: List[Dict] = []
+        # Process sentences in batches of 32
+        batch_size = 32
+        for batch_start in range(0, len(sentences), batch_size):
+            batch_sents = sentences[batch_start:batch_start + batch_size]
+            batch_texts = [s["text"] for s in batch_sents]
+            batch_entities = self._predict_batch(batch_texts)
+
+            for sent_info, sent_entities in zip(batch_sents, batch_entities):
+                for ent in sent_entities:
+                    # Adjust offsets to global text position
+                    local_start = sent_info["text"].find(ent["text"])
+                    if local_start >= 0:
+                        global_start = sent_info["start"] + local_start
+                        global_end = global_start + len(ent["text"])
+                    else:
+                        global_start = -1
+                        global_end = -1
+
+                    all_entities.append(
+                        _make_entity(
+                            text=ent["text"],
+                            ent_type=ent["type"],
+                            start=global_start,
+                            end=global_end,
+                            sentence_id=sent_info["sentence_id"],
+                            pos="Np",
+                            score=ent["score"],
+                        )
+                    )
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for e in all_entities:
+            key = (e["start"], e["end"], e["type"], e["text"].lower())
+            if key not in seen:
+                seen.add(key)
+                unique.append(e)
+        return unique
+
+    def _predict_batch(self, texts: List[str]) -> List[List[Dict]]:
+        """Run PhoBERT NER on a batch of texts. Returns entities per text."""
+        import torch
+
+        results = []
+        for text in texts:
+            words = text.split()
+            if not words:
+                results.append([])
+                continue
+
+            tokenized = self._tokenizer(
+                words,
+                is_split_into_words=True,
+                truncation=True,
+                max_length=self.max_length,
+                padding=True,
+                return_tensors="pt",
+            )
+            tokenized = {k: v.to(self._device) for k, v in tokenized.items()}
+
+            with torch.no_grad():
+                outputs = self._model(**tokenized)
+                logits = outputs.logits  # (1, seq_len, num_labels)
+
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            pred_ids = torch.argmax(logits, dim=-1)[0].cpu().numpy()
+            pred_probs = probs[0].cpu().numpy()
+            word_ids = tokenized.get("word_ids", None)
+
+            # Get word_ids from tokenizer
+            enc = self._tokenizer(
+                words,
+                is_split_into_words=True,
+                truncation=True,
+                max_length=self.max_length,
+            )
+            w_ids = enc.word_ids()
+
+            # Aggregate sub-token predictions to word level
+            word_preds = {}  # word_idx -> (label_id, prob)
+            for token_idx, word_id in enumerate(w_ids):
+                if word_id is None:
+                    continue
+                if token_idx >= len(pred_ids):
+                    break
+                if word_id not in word_preds:
+                    # First sub-token: use its prediction
+                    word_preds[word_id] = (
+                        int(pred_ids[token_idx]),
+                        float(pred_probs[token_idx, int(pred_ids[token_idx])]),
+                    )
+
+            # Collect BIO spans
+            entities = []
+            id2label = self._model.config.id2label
+            i = 0
+            while i < len(words):
+                if i not in word_preds:
+                    i += 1
+                    continue
+                label_id, prob = word_preds[i]
+                label = id2label.get(label_id, "O")
+                if not label.startswith("B-"):
+                    i += 1
+                    continue
+
+                ent_type = self._BIO_MAP.get(label)
+                if not ent_type:
+                    i += 1
+                    continue
+
+                span_words = [words[i]]
+                span_probs = [prob]
+                j = i + 1
+                while j < len(words):
+                    if j not in word_preds:
+                        break
+                    next_label_id, next_prob = word_preds[j]
+                    next_label = id2label.get(next_label_id, "O")
+                    if next_label.startswith("I-") and self._BIO_MAP.get(next_label) == ent_type:
+                        span_words.append(words[j])
+                        span_probs.append(next_prob)
+                        j += 1
+                    else:
+                        break
+
+                entity_text = " ".join(span_words)
+                avg_prob = sum(span_probs) / len(span_probs)
+                entities.append({
+                    "text": entity_text,
+                    "type": ent_type,
+                    "score": round(avg_prob, 4),
+                })
+                i = j
+
+            results.append(entities)
+
+        return results
+
+    def close(self):
+        self._model = None
+        self._tokenizer = None
+        if _TORCH_AVAILABLE:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 class _VnCoreNLPBackend:
@@ -516,11 +727,18 @@ class VietnameseNER:
         use_transformer: bool = False,
         transformer_model: str = "NlpHUST/ner-vietnamese-electra-base",
         use_model: bool = None,
+        ner_model_dir: Optional[str] = None,
         cache_path: Optional[str] = None,
         log_backend: bool = True,
     ):
         if use_model is not None:
             use_transformer = use_model
+
+        # Default NER model directory
+        if ner_model_dir is None:
+            _default = Path(__file__).resolve().parents[2] / "data" / "ner_model"
+            if _default.exists() and (_default / "config.json").exists():
+                ner_model_dir = str(_default)
 
         self._spawn_config = {
             "vncorenlp_jar": vncorenlp_jar,
@@ -528,6 +746,7 @@ class VietnameseNER:
             "use_transformer": use_transformer,
             "transformer_model": transformer_model,
             "use_model": use_model,
+            "ner_model_dir": None,  # PhoBERT not safe for spawn
             "cache_path": None,
             "log_backend": False,
         }
@@ -537,6 +756,7 @@ class VietnameseNER:
         self._extract_cache: Dict[str, List[Dict]] = {}
         self._log_backend = log_backend
 
+        # Priority 1: VnCoreNLP (if jar provided)
         if vncorenlp_jar and _VNCORENLP_AVAILABLE:
             try:
                 self._backend = _VnCoreNLPBackend(vncorenlp_jar, vncorenlp_port)
@@ -549,6 +769,20 @@ class VietnameseNER:
             except Exception as e:
                 print(f"[NER] VnCoreNLP lỗi: {e}")
 
+        # Priority 2: Fine-tuned PhoBERT NER (if model directory exists)
+        if ner_model_dir and _TORCH_AVAILABLE:
+            try:
+                self._backend = _PhoBERTNERBackend(ner_model_dir)
+                self._backend_name = "phobert-ner"
+                if self._log_backend:
+                    print(f"[NER] Backend: PhoBERT NER ({ner_model_dir})")
+                if cache_path:
+                    self.load_cache(cache_path)
+                return
+            except Exception as e:
+                print(f"[NER] PhoBERT NER lỗi: {e}")
+
+        # Priority 3: HuggingFace pretrained (--use-model flag)
         if use_transformer and _TRANSFORMERS_AVAILABLE:
             try:
                 self._hf_pipe = _hf_pipeline(
@@ -563,6 +797,7 @@ class VietnameseNER:
             except Exception as e:
                 print(f"[NER] Transformer lỗi: {e}")
 
+        # Priority 4: underthesea
         if _UNDERTHESEA_AVAILABLE:
             self._backend = _UndertheseaBackend()
             self._backend_name = "underthesea"
@@ -572,6 +807,7 @@ class VietnameseNER:
                 self.load_cache(cache_path)
             return
 
+        # Priority 5: rule-based (regex only)
         if self._log_backend:
             print("[NER] Backend: rule-based (fallback)")
         if cache_path:

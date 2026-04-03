@@ -104,8 +104,19 @@ class _FaissBackend:
         self._ids = ids
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         normed = (embeddings / np.where(norms == 0, 1e-8, norms)).astype(np.float32)
-        self._index = faiss.IndexFlatIP(d)
-        self._index.add(normed)
+
+        if n > 50_000:
+            # IVFFlat: much faster search for large indices, minimal recall loss
+            nlist = min(256, int(n ** 0.5))
+            quantizer = faiss.IndexFlatIP(d)
+            self._index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+            self._index.train(normed)
+            self._index.add(normed)
+            self._index.nprobe = 32  # search 32/nlist clusters
+            print(f"[FAISS] IVFFlat index: {n} vectors, nlist={nlist}, nprobe=32")
+        else:
+            self._index = faiss.IndexFlatIP(d)
+            self._index.add(normed)
 
     def search(self, qvec: np.ndarray, k: int) -> Tuple[List[str], List[float]]:
         if self._index is None:
@@ -240,22 +251,45 @@ class CrossEncoderReranker:
     Cross-encoder encode cặp (query, passage) → relevance score.
     Chính xác hơn bi-encoder nhưng O(n) inference → chỉ dùng trên top candidates.
 
+    Priority:
+      1. Custom fine-tuned model (reranker_model_dir)
+      2. Default pre-trained model (CROSS_ENCODER_MODEL)
     Nếu không có model → trả về candidates không đổi thứ tự.
     """
 
-    def __init__(self, model_name: str = CROSS_ENCODER_MODEL):
+    def __init__(
+        self,
+        model_name: str = CROSS_ENCODER_MODEL,
+        reranker_model_dir: str = None,
+    ):
         self._model = None
         self._available = False
-        if _CROSS_ENCODER_AVAILABLE:
-            try:
-                print(f"[CrossEncoder] Tải model: {model_name}")
-                self._model = CrossEncoder(model_name)
-                self._available = True
-                print("[CrossEncoder] Sẵn sàng.")
-            except Exception as e:
-                print(f"[CrossEncoder] Lỗi tải model: {e} → reranking bị tắt")
-        else:
+
+        if not _CROSS_ENCODER_AVAILABLE:
             print("[CrossEncoder] sentence-transformers chưa cài → reranking tắt")
+            return
+
+        # Priority 1: custom fine-tuned model
+        if reranker_model_dir:
+            model_path = Path(reranker_model_dir)
+            if model_path.exists() and (model_path / "config.json").exists():
+                try:
+                    print(f"[CrossEncoder] Tải custom model: {reranker_model_dir}")
+                    self._model = CrossEncoder(str(model_path))
+                    self._available = True
+                    print("[CrossEncoder] Custom model sẵn sàng.")
+                    return
+                except Exception as e:
+                    print(f"[CrossEncoder] Custom model lỗi: {e} → fallback")
+
+        # Priority 2: default pre-trained model
+        try:
+            print(f"[CrossEncoder] Tải model: {model_name}")
+            self._model = CrossEncoder(model_name)
+            self._available = True
+            print("[CrossEncoder] Sẵn sàng.")
+        except Exception as e:
+            print(f"[CrossEncoder] Lỗi tải model: {e} → reranking bị tắt")
 
     def rerank(
         self,
@@ -335,6 +369,7 @@ class Retriever:
         use_bm25: bool = True,
         use_cross_encoder: bool = True,
         cross_encoder_model: str = CROSS_ENCODER_MODEL,
+        reranker_model_dir: str = None,
     ):
         self._backend = (
             _FaissBackend() if (use_faiss and _FAISS_AVAILABLE) else _NumpyBackend()
@@ -345,7 +380,11 @@ class Retriever:
 
         self._bm25 = BM25Backend() if use_bm25 else None
         self._reranker = (
-            CrossEncoderReranker(cross_encoder_model) if use_cross_encoder else None
+            CrossEncoderReranker(
+                cross_encoder_model,
+                reranker_model_dir=reranker_model_dir,
+            )
+            if use_cross_encoder else None
         )
         self._em = None
         self._documents: Dict[str, Dict] = {}  # doc_id → full document
@@ -505,6 +544,7 @@ class Retriever:
         seed_entities: List[str] = None,
         rerank: bool = True,
         fetch_multiplier: int = 3,
+        apply_decay: bool = True,
     ) -> List[Dict]:
         """
         Retrieve top-k documents.
@@ -515,10 +555,14 @@ class Retriever:
             seed_entities:   Entity từ query để tính PPR boost
             rerank:          Có dùng cross-encoder rerank không
             fetch_multiplier: Lấy K×multiplier candidates trước khi rerank/dedupe
+            apply_decay:     Có apply date decay không.
+                             Đặt False khi gọi từ multi_query_retrieve để
+                             tránh double-apply (decay chỉ xảy ra 1 lần sau merge).
 
         Returns:
             List document dicts với các fields:
-            retrieval_score, vector_score, graph_boost, cross_encoder_score (nếu có)
+            retrieval_score, vector_score, graph_boost, cross_encoder_score (nếu có),
+            date_decay_weight (nếu apply_decay=True)
         """
         if self._em is None:
             return []
@@ -582,8 +626,10 @@ class Retriever:
             )
 
         candidates = self._rerank(query, candidates, top_k=top_k, rerank=rerank)
-        # Date decay: áp dụng sau rerank để cross-encoder score không bị ảnh hưởng
-        candidates = self._apply_date_decay(candidates)
+        # Date decay: áp dụng sau rerank để cross-encoder score không bị ảnh hưởng.
+        # apply_decay=False khi gọi từ multi_query_retrieve để tránh double-apply.
+        if apply_decay:
+            candidates = self._apply_date_decay(candidates)
 
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k]
@@ -595,6 +641,7 @@ class Retriever:
         seed_entities: List[str] = None,
         rerank: bool = True,
         fetch_multiplier: int = 3,
+        apply_decay: bool = True,
     ) -> List[Dict]:
         return self.search(
             query,
@@ -602,6 +649,7 @@ class Retriever:
             seed_entities=seed_entities,
             rerank=rerank,
             fetch_multiplier=fetch_multiplier,
+            apply_decay=apply_decay,
         )
 
     def _rerank(

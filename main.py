@@ -107,6 +107,8 @@ class NewsSearchSystem:
         use_phobert_re: bool = False,
         phobert_dir: str = None,
         index_dir: str = None,
+        ner_model_dir: str = None,
+        reranker_model_dir: str = None,
     ):
         """
         Args:
@@ -114,6 +116,8 @@ class NewsSearchSystem:
             use_model: True → dùng HuggingFace NER model (cần internet/GPU)
             use_faiss: True → dùng FAISS index (cần cài faiss-cpu)
             use_llm: True → thử dùng Claude API (cần ANTHROPIC_API_KEY)
+            ner_model_dir: Thư mục PhoBERT NER fine-tuned (mặc định: data/ner_model)
+            reranker_model_dir: Thư mục cross-encoder reranker (mặc định: data/reranker_model)
         """
         self.data_path = data_path or str(DATA_DIR / "vnexpress_articles.csv")
         self._index_dir = Path(index_dir or INDEX_DIR)
@@ -126,6 +130,7 @@ class NewsSearchSystem:
         # ── Khởi tạo các component ──────────────────────────────────────────
         self.ner = VietnameseNER(
             use_model=use_model,
+            ner_model_dir=ner_model_dir,
             cache_path=str(self._index_dir / "ner_cache.json"),
         )
         self.linker = EntityLinker()
@@ -139,7 +144,10 @@ class NewsSearchSystem:
         self.em = EmbeddingManager(use_sbert=use_model)
         self.ranker = GraphRanker()
         self.query_proc = QueryProcessor(self.ner, self.linker)
-        self.retriever = Retriever(use_faiss=use_faiss)
+        self.retriever = Retriever(
+            use_faiss=use_faiss,
+            reranker_model_dir=reranker_model_dir,
+        )
         self.rag = RAGPipeline(self.retriever, use_llm=use_llm)
         self.viz = KnowledgeGraphVisualizer()
 
@@ -204,13 +212,13 @@ class NewsSearchSystem:
         print("\n🗺️  Bước 5/6: Xây dựng Knowledge Graph...")
         stage_t0 = time.time()
         self.kg.build_from_documents(docs)
-        print("   Thêm similarity edges...")
-        SimilarityGraphBuilder(threshold=0.80).build(self.kg, self.em)
 
-        # PageRank
+        # PageRank (chạy trước similarity để KG đã sạch)
         print("   Tính PageRank...")
         self._importance_scores = self.ranker.compute_importance_scores(self.kg)
         self._log_stage_done("knowledge graph + pagerank", stage_t0)
+
+        # NOTE: SimilarityGraphBuilder chạy ở bước 6 SAU khi có entity vectors.
 
         # ── 6. Embedding + Retrieval Index ────────────────────────────────
         print("\n🔢 Bước 6/6: Tạo Embedding Index...")
@@ -225,6 +233,10 @@ class NewsSearchSystem:
         self.em.build_document_index(
             [{"id": c["chunk_id"], "full_text": c["chunk_text"]} for c in chunks]
         )
+        # SimilarityGraphBuilder dùng entity embeddings — phải chạy SAU
+        # em.build_document_index() mới có vector:
+        print("   Thêm similarity edges vào KG (dùng entity vectors)...")
+        SimilarityGraphBuilder(threshold=0.80).build(self.kg, self.em)
         self.retriever.build(
             chunks,
             self.em,
@@ -507,6 +519,18 @@ def parse_args(argv=None):
         default=str(DATA_DIR / "phobert_re"),
         help="Thư mục model PhoBERT RE đã fine-tune",
     )
+    parser.add_argument(
+        "--ner-model-dir",
+        type=str,
+        default=None,
+        help="Thư mục model PhoBERT NER đã fine-tune (mặc định: data/ner_model nếu tồn tại)",
+    )
+    parser.add_argument(
+        "--reranker-model-dir",
+        type=str,
+        default=None,
+        help="Thư mục model cross-encoder reranker đã fine-tune (mặc định: data/reranker_model nếu tồn tại)",
+    )
     return parser.parse_args(argv)
 
 
@@ -524,6 +548,8 @@ def main():
         use_phobert_re=args.use_phobert_re,
         phobert_dir=args.phobert_dir,
         index_dir=args.index_dir,
+        ner_model_dir=args.ner_model_dir,
+        reranker_model_dir=args.reranker_model_dir,
     )
 
     if args.load_index:
