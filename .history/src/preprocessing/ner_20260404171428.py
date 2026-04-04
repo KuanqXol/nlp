@@ -449,3 +449,77 @@ def ner_with_checkpoint(
 
     print(f"[NER] Hoàn tất {len(result)}/{len(documents)} docs")
     return result
+
+
+def resolve_coreference(documents: List[Dict]) -> List[Dict]:
+    """
+    Giải quyết coreference đơn giản: ông/bà/tổ chức này → entity gần nhất.
+    Giữ lại để tương thích — không thay đổi logic.
+    """
+    PRONOUNS = {
+        "ông": "PER",
+        "ông ấy": "PER",
+        "bà": "PER",
+        "bà ấy": "PER",
+        "anh ấy": "PER",
+        "cô ấy": "PER",
+        "tổ chức này": "ORG",
+        "công ty này": "ORG",
+        "thành phố này": "LOC",
+        "quốc gia này": "LOC",
+        "nước này": "LOC",
+    }
+    resolved = []
+    for doc in documents:
+        entities = sorted(
+            doc.get("entities", []),
+            key=lambda e: (e.get("start", -1), e.get("end", -1)),
+        )
+        text = doc.get("full_text", doc.get("content", ""))
+        if not text or not entities:
+            resolved.append(doc)
+            continue
+
+        coref = []
+        history: List[Dict] = []
+        for sent in _split_sentences(text):
+            sent_ents = [
+                e for e in entities if sent["start"] <= e.get("start", -1) < sent["end"]
+            ]
+            sl = sent["text"].lower()
+            for pronoun, etype in PRONOUNS.items():
+                for m in re.finditer(re.escape(pronoun), sl):
+                    ante = next(
+                        (c for c in reversed(history) if c.get("type") == etype), None
+                    )
+                    if not ante:
+                        continue
+                    coref.append(
+                        _make_entity(
+                            ante.get("text", pronoun),
+                            ante.get("type", etype),
+                            sent["start"] + m.start(),
+                            sent["start"] + m.end(),
+                            sent["sentence_id"],
+                            round(float(ante.get("score", 0.8)) * 0.85, 3),
+                        )
+                    )
+            history.extend(sent_ents)
+
+        merged = entities + coref
+        seen, deduped = set(), []
+        for e in merged:
+            key = (
+                e.get("start"),
+                e.get("end"),
+                e.get("type"),
+                e.get("text", "").lower(),
+            )
+            if key not in seen:
+                seen.add(key)
+                deduped.append(e)
+
+        out = dict(doc)
+        out["entities"] = deduped
+        resolved.append(out)
+    return resolved

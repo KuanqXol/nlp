@@ -29,6 +29,10 @@ matplotlib>=3.7.0
 huggingface_hub>=0.20.0
 datasets>=2.14.0
 
+# ── Vietnamese tokenizer (dùng trong train_ner.py để word tokenize tiếng Việt) ─
+# Chỉ cần khi train, không cần khi inference
+# vncorenlp>=1.0.3   # optional, cần Java
+
 # ── Scraping (news.py / newsurl.py) ───────────────────────────────────────────
 beautifulsoup4>=4.12.0
 lxml>=4.9.0

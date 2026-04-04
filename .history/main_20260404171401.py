@@ -4,7 +4,7 @@ main.py — Vietnamese KG-Enhanced News Search System
 Pipeline:
   1. DataLoader: load CSV/JSON VnExpress
   2. PhoBERT NER fine-tuned trên VLSP2016
-  3. EntityLinker → KnowledgeGraph (co-occurrence + PPR)
+  3. EntityLinker + RelationExtractor (rule-based, cho graph)
   4. KnowledgeGraph + PPR query expansion
   5. FAISS vector search (vietnamese-bi-encoder) top-50 chunks
   6. Cross-encoder rerank → top-10
@@ -28,7 +28,12 @@ INDEX_DIR = DATA_DIR / "index"
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.data_loader import NewsDataLoader
-from src.preprocessing import VietnameseNER, EntityLinker, ner_with_checkpoint
+from src.preprocessing import (
+    VietnameseNER,
+    EntityLinker,
+    ner_with_checkpoint,
+    resolve_coreference,
+)
 from src.graph import (
     KnowledgeGraph,
     GraphRanker,
@@ -207,8 +212,12 @@ class NewsSearchSystem:
         for doc in self._documents:
             doc["linked_entities"] = self.linker.link_entities(doc.get("entities", []))
 
-        # Build Knowledge Graph từ linked entities (co-occurrence + PPR)
-        print("\n🕸️  Đang xây dựng Knowledge Graph...")
+        # Coreference resolution
+        self._documents = resolve_coreference(self._documents)
+
+        # Relation extraction (rule-based) + build KG
+        # API đúng: kg.build_from_documents() xử lý toàn bộ (RE + add_relation bên trong)
+        print("\n🕸️  Đang trích xuất quan hệ và xây dựng KG...")
         self.kg.build_from_documents(self._documents)
 
         # Similarity edges (entity embedding similarity)

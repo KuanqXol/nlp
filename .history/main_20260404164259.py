@@ -4,7 +4,7 @@ main.py — Vietnamese KG-Enhanced News Search System
 Pipeline:
   1. DataLoader: load CSV/JSON VnExpress
   2. PhoBERT NER fine-tuned trên VLSP2016
-  3. EntityLinker → KnowledgeGraph (co-occurrence + PPR)
+  3. EntityLinker + RelationExtractor (rule-based, cho graph)
   4. KnowledgeGraph + PPR query expansion
   5. FAISS vector search (vietnamese-bi-encoder) top-50 chunks
   6. Cross-encoder rerank → top-10
@@ -28,7 +28,13 @@ INDEX_DIR = DATA_DIR / "index"
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.data_loader import NewsDataLoader
-from src.preprocessing import VietnameseNER, EntityLinker, ner_with_checkpoint
+from src.preprocessing import (
+    VietnameseNER,
+    EntityLinker,
+    RelationExtractor,
+    ner_with_checkpoint,
+    resolve_coreference,
+)
 from src.graph import (
     KnowledgeGraph,
     GraphRanker,
@@ -81,15 +87,18 @@ def get_popular_queries(
     Trả về list query string từ top entity.
     """
     try:
-        # API đúng: compute_importance_scores (không phải get_importance_scores)
-        scores = graph_ranker.compute_importance_scores(kg)
+        scores = graph_ranker.get_importance_scores(kg)
         top_entities = sorted(scores.items(), key=lambda x: -x[1])[: n * 2]
 
         queries = []
-        seen_types: dict = {}
-        for entity, _ in top_entities:
-            info = kg.get_entity_info(entity) or {}
-            etype = info.get("type", "MISC")
+        seen_types = {}
+        for entity, score in top_entities:
+            etype = (
+                kg._graph.nodes.get(entity, {}).get("type", "MISC")
+                if hasattr(kg, "_graph")
+                else "MISC"
+            )
+            # Giới hạn tối đa 3 entity mỗi loại để đa dạng
             seen_types[etype] = seen_types.get(etype, 0) + 1
             if seen_types[etype] <= 3:
                 queries.append(entity)
@@ -165,6 +174,7 @@ class NewsSearchSystem:
 
         self.ner = VietnameseNER(model_dir=ner_model_dir)
         self.linker = EntityLinker()
+        self.rel_extractor = RelationExtractor()
         self.kg = KnowledgeGraph()
         self.em = EmbeddingManager()
         self.ranker = GraphRanker()
@@ -207,19 +217,29 @@ class NewsSearchSystem:
         for doc in self._documents:
             doc["linked_entities"] = self.linker.link_entities(doc.get("entities", []))
 
-        # Build Knowledge Graph từ linked entities (co-occurrence + PPR)
-        print("\n🕸️  Đang xây dựng Knowledge Graph...")
-        self.kg.build_from_documents(self._documents)
+        # Coreference resolution
+        self._documents = resolve_coreference(self._documents)
+
+        # Relation extraction (rule-based cho graph)
+        print("\n🕸️  Đang trích xuất quan hệ và xây dựng KG...")
+        for doc in self._documents:
+            triples = self.rel_extractor.extract_relations(
+                doc.get("linked_entities", []),
+                doc.get("full_text", doc.get("content", "")),
+                doc_id=doc.get("id", ""),
+                date=doc.get("date", ""),
+            )
+            for triple in triples:
+                self.kg.add_triple(triple)
 
         # Similarity edges (entity embedding similarity)
-        # API đúng: sim_builder.build(kg, embedding_manager)
-        sim_builder = SimilarityGraphBuilder()
-        sim_builder.build(self.kg, self.em)
+        sim_builder = SimilarityGraphBuilder(self.em)
+        sim_builder.add_similar_edges(self.kg)
 
         # PageRank
         print("\n📊 Đang tính PageRank...")
         self.ranker.compute_pagerank(self.kg)
-        importance_scores = self.ranker.compute_importance_scores(self.kg)
+        importance_scores = self.ranker.get_importance_scores(self.kg)
 
         # Query expander
         self._expander = QueryExpander(self.kg, self.ranker)
@@ -282,15 +302,14 @@ class NewsSearchSystem:
         self.em = EmbeddingManager.from_state(state["embedding"])
 
         self.ranker.compute_pagerank(self.kg)
-        importance_scores = self.ranker.compute_importance_scores(self.kg)
+        importance_scores = self.ranker.get_importance_scores(self.kg)
         self._expander = QueryExpander(self.kg, self.ranker)
 
         chunks_dict = state.get("chunks", {})
         doc_to_chunks = state.get("doc_to_chunks", {})
         chunks_list = list(chunks_dict.values())
 
-        # API đúng: attach_state (public method)
-        self.retriever.attach_state(
+        self.retriever._attach_state(
             embedding_manager=self.em,
             documents=self._documents,
             chunks=chunks_list,
@@ -383,35 +402,32 @@ class NewsSearchSystem:
             display_results(results, user_input, elapsed)
 
     def _print_kg_stats(self):
-        stats = self.kg.stats()
-        print(
-            f"\n📊 Knowledge Graph: {stats.get('n_entities', 0)} entity, {stats.get('n_relations', 0)} quan hệ"
-        )
+        n_nodes = len(self.kg._graph.nodes) if hasattr(self.kg, "_graph") else 0
+        n_edges = len(self.kg._graph.edges) if hasattr(self.kg, "_graph") else 0
+        print(f"\n📊 Knowledge Graph: {n_nodes} entity, {n_edges} quan hệ")
 
     def _print_top_entities(self, n: int = 20):
-        scores = self.ranker.compute_importance_scores(self.kg)
+        scores = self.ranker.get_importance_scores(self.kg)
         top = sorted(scores.items(), key=lambda x: -x[1])[:n]
         print(f"\n🏆 Top {n} entity quan trọng nhất:")
         for i, (entity, score) in enumerate(top, 1):
-            info = self.kg.get_entity_info(entity) or {}
-            etype = info.get("type", "")
-            suffix = f" ({etype})" if etype else ""
-            print(f"   {i:2d}. {entity}{suffix}  —  {score:.4f}")
+            etype = ""
+            if hasattr(self.kg, "_graph") and entity in self.kg._graph.nodes:
+                etype = f" ({self.kg._graph.nodes[entity].get('type', '')})"
+            print(f"   {i:2d}. {entity}{etype}  —  {score:.4f}")
 
     def _print_suggestions(self, n: int = 10):
         suggestions = get_popular_queries(self.kg, self.ranker, n=n)
-        print(f"\n💡 Gợi ý query phổ biến:")
+        print(f"\n💡 Gợi ý query phổ biến ({n} entity top PageRank):")
         for i, s in enumerate(suggestions, 1):
             print(f"   {i}. {s}")
 
     def _export_viz(self):
         try:
-            viz = KnowledgeGraphVisualizer()
-            out_path = str(DATA_DIR / "kg_visualization")
-            result = viz.visualize(
-                self.kg, output_path=out_path, top_k=50, interactive=True
-            )
-            print(f"✅ Đã xuất visualization: {result}")
+            viz = KnowledgeGraphVisualizer(self.kg)
+            out_path = DATA_DIR / "kg_visualization.html"
+            viz.export_html(str(out_path))
+            print(f"✅ Đã xuất visualization: {out_path}")
         except Exception as e:
             print(f"❌ Không xuất được: {e}")
 
