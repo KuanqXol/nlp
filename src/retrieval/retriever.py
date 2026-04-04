@@ -471,6 +471,38 @@ class Retriever:
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k]
 
+    # ── Attach State (for load_index path) ───────────────────────────────
+
+    def attach_state(
+        self,
+        embedding_manager,
+        documents: List[Dict],
+        chunks,
+        doc_to_chunks: Dict[str, List[str]],
+        graph_ranker=None,
+        kg=None,
+        importance_scores: Dict[str, float] = None,
+        chunk_mode: bool = True,
+    ):
+        """
+        Gắn lại state đã load từ disk vào Retriever mà không rebuild index.
+        Được gọi bởi NewsSearchSystem.load_index().
+        """
+        self._em = embedding_manager
+        self._documents = {d["id"]: d for d in documents}
+        self._graph_ranker = graph_ranker
+        self._kg = kg
+        self._global_scores = importance_scores or {}
+        self._chunk_mode = chunk_mode
+
+        # chunks có thể là list hoặc dict
+        if isinstance(chunks, dict):
+            self._chunks = chunks
+        else:
+            self._chunks = {c["chunk_id"]: c for c in chunks if "chunk_id" in c}
+
+        self._doc_to_chunks = doc_to_chunks
+
     # ── Persistence ──────────────────────────────────────────────────────
 
     def save_artifacts(self, index_dir: str):
