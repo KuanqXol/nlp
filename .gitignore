@@ -3,4 +3,4 @@
 **/*.pyo
 /.venv
 /data
-/.history
+.history

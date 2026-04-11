@@ -164,9 +164,11 @@ class NewsSearchSystem:
         print("🔧 Đang khởi tạo hệ thống...\n")
 
         self.ner = VietnameseNER(model_dir=ner_model_dir)
-        self.linker = EntityLinker()
-        self.kg = KnowledgeGraph()
         self.em = EmbeddingManager()
+        # EntityLinker dùng chung encoder với EmbeddingManager → cùng vector space,
+        # tiết kiệm ~1-2 GB RAM so với load 2 model riêng.
+        self.linker = EntityLinker(shared_encoder=self.em._enc)
+        self.kg = KnowledgeGraph()
         self.ranker = GraphRanker()
         self.query_proc = QueryProcessor(self.ner, self.linker)
         self.retriever = Retriever(

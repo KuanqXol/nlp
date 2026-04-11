@@ -105,6 +105,11 @@ class EmbeddingManager:
         self._enc = VietnameseBiEncoder(model_name)
         self._doc_embeddings: Optional[np.ndarray] = None
         self._doc_ids: List[str] = []
+        # Query cache: dict đơn giản.
+        # Tác dụng thực tế hạn chế trong CLI (user hiếm khi repeat query y chang),
+        # nhưng zero cost khi hit và hữu ích trong batch eval / web service.
+        # Không dùng LRU vì: (1) encode query ~2ms, không phải bottleneck thật;
+        # (2) cache sẽ bị clear khi process restart — không tích lũy lâu dài.
         self._query_cache: Dict[str, np.ndarray] = {}
 
     # ── Build index ────────────────────────────────────────────────────────
@@ -131,10 +136,20 @@ class EmbeddingManager:
     # ── Query ──────────────────────────────────────────────────────────────
 
     def encode_query(self, query: str) -> np.ndarray:
+        """Encode query với cache đơn giản.
+
+        Cache hữu ích trong batch eval (cùng query set chạy nhiều lần)
+        và web service (nhiều user search cùng từ khóa phổ biến).
+        Với CLI 1 session, ít khi hit nhưng cũng không có overhead đáng kể.
+        """
         key = hashlib.sha1(query.encode("utf-8")).hexdigest()
         if key not in self._query_cache:
             self._query_cache[key] = self._enc.encode(query)
         return self._query_cache[key]
+
+    def clear_query_cache(self):
+        """Xóa query cache — hữu ích khi test hoặc đổi model."""
+        self._query_cache.clear()
 
     def encode_entities(self, entity_names: List[str]) -> Dict[str, np.ndarray]:
         """Encode entity names để dùng trong similarity graph."""

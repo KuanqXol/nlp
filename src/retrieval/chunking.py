@@ -19,6 +19,9 @@ Chiến lược chunking:
 import re
 from typing import Dict, List, Optional, Tuple
 
+# Dùng shared sentence splitter — nhất quán với ner.py
+from src.utils.text import split_sentences as _split_sentences
+
 
 # ── Cấu hình ─────────────────────────────────────────────────────────────────
 
@@ -30,10 +33,8 @@ DEFAULT_OVERLAP_SENTENCES = 1  # Số câu overlap giữa 2 chunk liên tiếp
 # ── Chunking functions ────────────────────────────────────────────────────────
 
 
-def _split_sentences(text: str) -> List[str]:
-    """Tách câu tiếng Việt."""
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [s.strip() for s in sentences if len(s.strip()) >= 10]
+# _split_sentences được import từ src.utils.text (split_sentences)
+# Xem: from src.utils.text import split_sentences as _split_sentences
 
 
 def chunk_by_sentences(

@@ -39,7 +39,9 @@ except ImportError:
     _SBERT_AVAILABLE = False
 
 DEFAULT_MODEL = "keepitreal/vietnamese-sbert"
-DEFAULT_THRESHOLD = 0.80  # lowered from 0.85 to catch more embedding matches before Levenshtein
+DEFAULT_THRESHOLD = (
+    0.80  # lowered from 0.85 to catch more embedding matches before Levenshtein
+)
 LEVENSHTEIN_MIN_LEN = 4
 LEVENSHTEIN_SHORT_MAX_DISTANCE = 1
 LEVENSHTEIN_LONG_MAX_DISTANCE = 2
@@ -70,7 +72,14 @@ def _make_entity_id(canonical: str) -> str:
 
 
 LEVENSHTEIN_BLACKLIST_PAIRS = {
-    tuple(sorted((_remove_diacritics(_normalize_text(left)), _remove_diacritics(_normalize_text(right)))))
+    tuple(
+        sorted(
+            (
+                _remove_diacritics(_normalize_text(left)),
+                _remove_diacritics(_normalize_text(right)),
+            )
+        )
+    )
     for left, right in [
         ("Hà Nội", "Hà Nam"),
         ("Viettel", "Vietjet"),
@@ -127,24 +136,60 @@ class _EmbeddingBackend:
         return np.asarray(vecs, dtype=np.float32)
 
 
+class _SharedEncoderAdapter:
+    """Adapter bọc VietnameseBiEncoder (từ EmbeddingManager) thành interface
+    tương thích với _EmbeddingBackend.encode(list_of_texts) → np.ndarray.
+
+    Mục đích: cho phép EntityLinker dùng chung model với EmbeddingManager
+    thay vì load thêm 1 model riêng (tiết kiệm RAM ~1-2 GB, thống nhất
+    vector space giữa entity linking và document embedding).
+    """
+
+    def __init__(self, encoder):
+        # encoder là VietnameseBiEncoder hoặc bất kỳ object nào có .encode()
+        self._enc = encoder
+
+    def encode(self, texts: List[str]) -> np.ndarray:
+        vecs = self._enc.encode(texts)
+        if vecs.ndim == 1:
+            vecs = vecs.reshape(1, -1)
+        return np.asarray(vecs, dtype=np.float32)
+
+
 class EntityLinker:
     """
     Entity linker production-style với index embedding entity.
 
     - Exact match: normalized key
+    - Levenshtein fuzzy match
     - Embedding match: cosine similarity qua FAISS / numpy
     - Cache:
       + embedding cache theo text
       + link result cache theo (surface, type)
+
+    Tham số shared_encoder (tùy chọn):
+        Truyền vào VietnameseBiEncoder từ EmbeddingManager để dùng chung
+        1 model thay vì load riêng. Điều này đảm bảo entity linking và
+        document embedding nằm trong cùng 1 vector space.
+
+        Ví dụ trong main.py:
+            em = EmbeddingManager()
+            linker = EntityLinker(shared_encoder=em._enc)
     """
 
     def __init__(
         self,
         similarity_threshold: float = DEFAULT_THRESHOLD,
         model_name: str = DEFAULT_MODEL,
+        shared_encoder=None,
     ):
         self.similarity_threshold = similarity_threshold
-        self._embed = _EmbeddingBackend(model_name=model_name)
+        if shared_encoder is not None:
+            # Dùng encoder chung — không load model mới
+            self._embed = _SharedEncoderAdapter(shared_encoder)
+        else:
+            # Fallback: load model riêng (backward compat)
+            self._embed = _EmbeddingBackend(model_name=model_name)
 
         # entity_id -> metadata
         self._entities: Dict[str, Dict] = {}
@@ -311,8 +356,10 @@ class EntityLinker:
                 continue
 
             sim = 1.0 - (dist / max_len)
-            if best_dist is None or dist < best_dist or (
-                dist == best_dist and sim > best_score
+            if (
+                best_dist is None
+                or dist < best_dist
+                or (dist == best_dist and sim > best_score)
             ):
                 best_id = entity_id
                 best_dist = dist

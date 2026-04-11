@@ -26,21 +26,21 @@ from typing import Dict, List, Optional, Set, Tuple
 
 # Per-relation expansion weights (replaces binary HIGH_VALUE/EXCLUDE sets)
 RELATION_EXPANSION_WEIGHT = {
-    "leads":           1.0,
-    "attacks":         1.0,
-    "supports":        0.9,
-    "invests_in":      0.9,
+    "leads": 1.0,
+    "attacks": 1.0,
+    "supports": 0.9,
+    "invests_in": 0.9,
     "signs_deal_with": 0.8,
-    "appointed":       0.8,
+    "appointed": 0.8,
     "cooperates_with": 0.7,
-    "warns_about":     0.7,
-    "found_in":        0.6,
-    "located_in":      0.5,
-    "sanctions":       0.8,
-    "acquires":        0.8,
-    "member_of":       0.6,
-    "co_occurrence":   0.15,   # keep but heavily penalized
-    "similar_to":      0.1,
+    "warns_about": 0.7,
+    "found_in": 0.6,
+    "located_in": 0.5,
+    "sanctions": 0.8,
+    "acquires": 0.8,
+    "member_of": 0.6,
+    "co_occurrence": 0.15,  # keep but heavily penalized
+    "similar_to": 0.1,
 }
 
 # Backward compat: sets derived from weights
@@ -56,17 +56,23 @@ MAX_TOTAL_ENTITIES = 12
 def should_expand(processed_query: Dict) -> bool:
     """Gate: only expand when query is entity-focused.
 
-    Skip expansion when:
-      - No entities detected
-      - Too many keywords (broad/unfocused query)
-      - Temporal intent (user wants recent news, not related entities)
+    Trước: `len(keywords) <= 5` — quá cứng. Query "Samsung đầu tư Việt Nam 5 năm"
+    có 5 keywords và 2 entity nhưng vẫn cần expand.
+
+    Sau: dùng entity_ratio = n_entities / max(n_keywords, 1).
+    Expand khi có ít nhất 1 entity VÀ entity chiếm ít nhất 20% keywords
+    (tức query không quá lan man so với số entity có).
+    Vẫn skip khi temporal_query để tránh expand ra entity không liên quan.
     """
     entities = processed_query.get("entities", [])
     keywords = processed_query.get("keywords", [])
     intent = processed_query.get("intent", "")
+    n_ents = len(entities)
+    n_kws = max(len(keywords), 1)
+    entity_ratio = n_ents / n_kws
     return (
-        len(entities) >= 1
-        and len(keywords) <= 5
+        n_ents >= 1
+        and entity_ratio >= 0.20  # ít nhất 1 entity per 5 keyword
         and intent != "temporal_query"
     )
 
@@ -144,7 +150,10 @@ class QueryExpander:
             seeds = processed_query.get("keywords", [])[:3]
 
         # Expansion gate: skip if query is not entity-focused
-        if not should_expand(processed_query) and seeds == processed_query.get("keywords", [])[:3]:
+        if (
+            not should_expand(processed_query)
+            and seeds == processed_query.get("keywords", [])[:3]
+        ):
             return {
                 "seed_entities": seeds,
                 "hop1_entities": [],
@@ -353,9 +362,7 @@ class QueryExpander:
                 else str(rel_info)
             )
             confidence = float(
-                rel_info.get("confidence", 1.0)
-                if isinstance(rel_info, dict)
-                else 1.0
+                rel_info.get("confidence", 1.0) if isinstance(rel_info, dict) else 1.0
             )
             rel_weight = RELATION_EXPANSION_WEIGHT.get(rel, 0.3)
             weighted = rel_weight * confidence

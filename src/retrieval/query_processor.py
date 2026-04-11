@@ -148,6 +148,30 @@ def _extract_year(text: str) -> Optional[str]:
     return m.group() if m else None
 
 
+# Từ khóa chỉ ý định tìm tin tức theo thời gian (không cần expand entity)
+_TEMPORAL_PATTERNS = re.compile(
+    r"\b(mới nhất|gần đây|hôm nay|tuần này|tháng này|năm nay"
+    r"|latest|recent|today|breaking|vừa|vừa qua|mới đây"
+    r"|trong \d+ (ngày|tuần|tháng|năm) (qua|gần đây|vừa rồi))\b",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+
+def _detect_intent(text: str, year_filter: Optional[str]) -> str:
+    """Phân loại intent của query.
+
+    Returns:
+        'temporal_query' : query tập trung vào thời gian → không nên expand entity
+        'news_search'    : tìm kiếm tin tức thông thường
+    """
+    if _TEMPORAL_PATTERNS.search(text):
+        return "temporal_query"
+    # Có năm cụ thể trong query nhưng không có entity → temporal
+    if year_filter and len(text.split()) <= 3:
+        return "temporal_query"
+    return "news_search"
+
+
 def _detect_topic(text: str) -> Optional[str]:
     tl = text.lower()
     scores = {t: sum(1 for kw in kws if kw in tl) for t, kws in TOPIC_KEYWORDS.items()}
@@ -186,6 +210,7 @@ class QueryProcessor:
         keywords = _extract_keywords(normalized)
         topic = _detect_topic(normalized)
         year = _extract_year(normalized)
+        intent = _detect_intent(normalized, year)
 
         return {
             "original": query,
@@ -194,7 +219,7 @@ class QueryProcessor:
             "keywords": keywords,
             "topic": topic,
             "year_filter": year,
-            "intent": "news_search",
+            "intent": intent,
         }
 
     def _empty(self, query: str) -> Dict:

@@ -17,6 +17,7 @@ Yêu cầu: faiss-cpu, sentence-transformers
 import math
 import pickle
 from collections import defaultdict
+
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -45,6 +46,7 @@ GRAPH_BOOST_ALPHA = 0.15  # Trọng số graph boost
 DEFAULT_TOP_K = 10  # Số doc trả về mặc định
 DATE_DECAY_HALFLIFE = 365.0  # Ngày → decay = exp(-days/365)
 DATE_DECAY_ENABLED = True
+DATE_DECAY_WEIGHT = 0.08  # Contribution của date decay vào final score (0→tắt, 1→full)
 MAX_CHUNKS_PER_DOC = 2  # Tối đa giữ N chunk/doc khi dedupe
 
 # Cross-encoder: dùng model fine-tuned nếu có, fallback ms-marco
@@ -332,30 +334,45 @@ class Retriever:
         vec_scores: Dict[str, float],
         ppr_scores: Dict[str, float],
     ) -> List[Dict]:
-        """Chunk → dedupe theo doc, giữ chunk có score cao nhất mỗi doc."""
-        best: Dict[str, Tuple[float, Dict]] = {}
+        """Chunk → dedupe theo doc, giữ tối đa MAX_CHUNKS_PER_DOC chunk/doc.
+
+        Trước đây chỉ giữ 1 chunk duy nhất (best dict không dùng MAX_CHUNKS_PER_DOC).
+        Giờ gom top-N chunk/doc, chọn chunk_text từ chunk có vscore cao nhất
+        nhưng tính retrieval_score từ mean top-N để ổn định hơn.
+        """
+        # Gom tất cả chunk theo doc_id
+        per_doc: Dict[str, List[Tuple[float, Dict]]] = defaultdict(list)
         for cid in chunk_ids:
             chunk = self._chunks.get(cid)
             if not chunk:
                 continue
             doc_id = chunk.get("doc_id", "")
             vscore = vec_scores.get(cid, 0.0)
-            if doc_id not in best or vscore > best[doc_id][0]:
-                best[doc_id] = (vscore, chunk)
+            per_doc[doc_id].append((vscore, chunk))
 
         candidates = []
-        for doc_id, (vscore, chunk) in best.items():
+        for doc_id, scored_chunks in per_doc.items():
+            # Sắp xếp giảm dần theo vscore, giữ tối đa MAX_CHUNKS_PER_DOC
+            scored_chunks.sort(key=lambda x: -x[0])
+            top_chunks = scored_chunks[:MAX_CHUNKS_PER_DOC]
+
+            # vscore đại diện = chunk tốt nhất (top-1)
+            best_vscore, best_chunk = top_chunks[0]
+
             doc = self._documents.get(doc_id, {})
             graph_boost = self._graph_boost(doc, ppr_scores)
-            final = vscore * (1 + GRAPH_BOOST_ALPHA * graph_boost)
+            final = best_vscore * (1 + GRAPH_BOOST_ALPHA * graph_boost)
+
             result = dict(doc)
             result.update(
                 {
                     "retrieval_score": round(final, 4),
-                    "vector_score": round(vscore, 4),
+                    "vector_score": round(best_vscore, 4),
                     "graph_boost": round(graph_boost, 4),
-                    "chunk_text": chunk.get("chunk_text", ""),
-                    "chunk_id": chunk.get("chunk_id", ""),
+                    "chunk_text": best_chunk.get("chunk_text", ""),
+                    "chunk_id": best_chunk.get("chunk_id", ""),
+                    # Metadata: tất cả chunk_id được dùng (hữu ích khi debug)
+                    "matched_chunk_ids": [c.get("chunk_id", "") for _, c in top_chunks],
                 }
             )
             candidates.append(result)
@@ -399,23 +416,35 @@ class Retriever:
     # ── Date decay ────────────────────────────────────────────────────────
 
     def _apply_date_decay(self, candidates: List[Dict]) -> List[Dict]:
-        if not DATE_DECAY_ENABLED:
+        """Áp dụng date decay theo công thức additive blend:
+            final = score * (1 - w) + score * decay * w
+                  = score * (1 - w * (1 - decay))
+
+        Với w = DATE_DECAY_WEIGHT = 0.08, bài 1 năm trước chỉ giảm tối đa
+        8% thay vì 63% như khi nhân trực tiếp (exp(-1) ≈ 0.37).
+        Bài không có ngày được gán decay = 0.85 (tương đương ~60 ngày tuổi)
+        thay vì 0.5 như trước.
+        """
+        if not DATE_DECAY_ENABLED or DATE_DECAY_WEIGHT <= 0:
             return candidates
         today = date.today()
         for doc in candidates:
             raw = doc.get("date", "")
-            weight = 0.5
+            decay = 0.85  # fallback khi không parse được ngày
             if raw:
                 for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
                     try:
                         d = datetime.strptime(str(raw)[:10], fmt).date()
                         days_ago = max((today - d).days, 0)
-                        weight = math.exp(-days_ago / DATE_DECAY_HALFLIFE)
+                        decay = math.exp(-days_ago / DATE_DECAY_HALFLIFE)
                         break
                     except ValueError:
                         continue
-            doc["date_decay_weight"] = round(weight, 4)
-            doc["retrieval_score"] = round(doc["retrieval_score"] * weight, 4)
+            doc["date_decay_weight"] = round(decay, 4)
+            # Additive blend: chỉ DATE_DECAY_WEIGHT phần trăm score bị ảnh hưởng bởi decay
+            doc["retrieval_score"] = round(
+                doc["retrieval_score"] * (1.0 - DATE_DECAY_WEIGHT * (1.0 - decay)), 4
+            )
         return candidates
 
     # ── Multi-query retrieve ───────────────────────────────────────────────
@@ -429,7 +458,22 @@ class Retriever:
     ) -> List[Dict]:
         """
         Retrieve từ nhiều query variant (từ query expansion).
-        Merge kết quả theo max score, rerank 1 lần cuối.
+
+        Luồng:
+          1. Mỗi query variant → FAISS riêng → lấy top_k*2 candidates
+          2. Merge theo max vector score (mỗi doc giữ lần xuất hiện tốt nhất)
+          3. Rerank toàn bộ merged pool 1 lần duy nhất với queries[0]
+          4. Date decay → sort → top_k
+
+        Tại sao rerank chỉ dùng queries[0] (query gốc):
+          Cross-encoder đọc [query | doc] như 1 chuỗi — attention cross chạy
+          giữa từng token của query với từng token của doc. Query gốc ngắn, sạch,
+          rõ intent → cross-encoder score chính xác nhất.
+          Concat thêm expansion vào query ("nga ukraine Putin NATO Zelensky") không
+          giúp cross-encoder vì nó đã có đủ token để attend; ngược lại làm dài
+          chuỗi input, tăng latency, có thể nhiễu attention với entity không liên quan.
+          Expansion chỉ có tác dụng ở bước FAISS (bi-encoder) — nơi mỗi query
+          variant được encode thành vector riêng, bắt được candidate khác nhau.
         """
         if not queries:
             return []
@@ -438,7 +482,7 @@ class Retriever:
                 queries[0], top_k=top_k, seed_entities=seed_entities, rerank=rerank
             )
 
-        # Thu thập candidates từ mỗi query, không apply decay
+        # Bước 1: FAISS retrieval riêng cho từng query variant, không decay
         merged: Dict[str, Dict] = {}
         for q in queries:
             results = self.retrieve(
@@ -458,15 +502,14 @@ class Retriever:
 
         candidates = sorted(merged.values(), key=lambda x: -x["retrieval_score"])
 
-        # Rerank merged candidates
+        # Bước 2: Rerank 1 lần với query gốc (queries[0]) — KHÔNG concat expansion
         if rerank and self._reranker and candidates:
             text_field = "chunk_text" if self._chunk_mode else "full_text"
-            main_query = queries[0]
             candidates = self._reranker.rerank(
-                main_query, candidates[:FAISS_FETCH_K], text_field=text_field
+                queries[0], candidates[:FAISS_FETCH_K], text_field=text_field
             )
 
-        # Apply decay 1 lần sau merge
+        # Bước 3: Date decay sau rerank, sort, trả về top_k
         candidates = self._apply_date_decay(candidates)
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k]

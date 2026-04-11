@@ -29,6 +29,9 @@ import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Dùng shared sentence splitter — nhất quán với chunking.py
+from src.utils.text import split_sentences_spans as _split_sentences
+
 try:
     from transformers import AutoModelForTokenClassification, AutoTokenizer
     import torch
@@ -47,28 +50,8 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _split_sentences(text: str) -> List[Dict]:
-    spans = []
-    for i, m in enumerate(re.finditer(r"[^.!?]+[.!?]?", text, flags=re.UNICODE)):
-        sent = m.group().strip()
-        if not sent:
-            continue
-        start = m.start()
-        while start < len(text) and text[start].isspace():
-            start += 1
-        spans.append(
-            {"sentence_id": i, "text": sent, "start": start, "end": start + len(sent)}
-        )
-    if not spans and text.strip():
-        spans.append(
-            {
-                "sentence_id": 0,
-                "text": text.strip(),
-                "start": 0,
-                "end": len(text.strip()),
-            }
-        )
-    return spans
+# _split_sentences được import từ src.utils.text (split_sentences_spans)
+# Xem: from src.utils.text import split_sentences_spans as _split_sentences
 
 
 def _make_entity(text, ent_type, start, end, sentence_id, score) -> Dict:
