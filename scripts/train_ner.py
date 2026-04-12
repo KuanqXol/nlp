@@ -6,6 +6,16 @@ Fine-tune vinai/phobert-base-v2 for Vietnamese NER on news domain.
 Data strategy:
   1. Gold: data/ner_ground_truth.json (hand-labeled sentences)
   2. Silver: underthesea predictions on N news articles (filtered by confidence)
+
+Subword alignment:
+  PhoBERT uses BPE → a Vietnamese word may split into 2+ sub-tokens.
+  First sub-token gets the word's BIO label; continuation sub-tokens get I- label
+  (or -100 to ignore in loss, configurable).
+
+Usage:
+    python scripts/train_ner.py --help
+    python scripts/train_ner.py --output-dir data/ner_model --epochs 5
+    python scripts/train_ner.py --no-silver --output-dir data/ner_model_gold_only
 """
 
 from __future__ import annotations
@@ -616,7 +626,7 @@ def train(args):
         effective_batch = 4
         print(f"[train_ner] CPU mode: batch={effective_batch}, grad_accum={grad_accum}")
 
-    warmup_steps = int(len(train_data) / effective_batch * args.epochs * 0.1)
+    warmup_steps = int(len(train_samples) / effective_batch * args.epochs * 0.1)
 
     training_args = TrainingArguments(
         output_dir=str(output_dir / "checkpoints"),
@@ -697,8 +707,8 @@ def train(args):
         "gold_samples": len(gold_samples),
         "silver_samples": len(silver_samples),
         "total_samples": len(all_samples),
-        "train_size": len(train_data),
-        "dev_size": len(dev_data),
+        "train_size": len(train_samples),
+        "dev_size": len(dev_samples),
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
