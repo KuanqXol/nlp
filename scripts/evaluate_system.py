@@ -1,6 +1,4 @@
 """
-evaluate_system.py
-──────────────────
 Đánh giá end-to-end toàn bộ pipeline Vietnamese KG-Enhanced News Search.
 
 Tasks:
@@ -11,13 +9,6 @@ Tasks:
   graph      — PageRank distribution, Gini, PPR sanity check, top entities
   embedding  — Coverage, norm stats, intra/inter-query cosine similarity
   smoke      — 8 query cố định, kiểm tra field, score order, không crash
-
-Cách chạy:
-    python scripts/evaluate_system.py --load-index
-    python scripts/evaluate_system.py --load-index --tasks ner,retrieval
-    python scripts/evaluate_system.py --load-index --retrieval-qrels data/qrels.json
-    python scripts/evaluate_system.py --data data/vnexpress_articles.csv
-    python scripts/evaluate_system.py --load-index --output data/eval_results.json
 """
 
 from __future__ import annotations
@@ -38,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 # ═══════════════════════════════════════════════════════════════════════════════
 # Metric helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _prf(tp: int, fp: int, fn: int) -> Tuple[float, float, float]:
     p = tp / (tp + fp) if (tp + fp) else 0.0
@@ -64,7 +56,9 @@ def mrr_at_k(retrieved, relevant, k):
 
 def ndcg_at_k(retrieved, relevant, k):
     rel = set(relevant)
-    dcg = sum(1.0 / math.log2(r + 1) for r, d in enumerate(retrieved[:k], 1) if d in rel)
+    dcg = sum(
+        1.0 / math.log2(r + 1) for r, d in enumerate(retrieved[:k], 1) if d in rel
+    )
     idcg = sum(1.0 / math.log2(r + 1) for r in range(1, min(len(rel), k) + 1))
     return dcg / idcg if idcg else 0.0
 
@@ -94,8 +88,10 @@ def _hdr(title: str):
 # 1. NER EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def _norm(text: str) -> str:
     import re, unicodedata
+
     t = unicodedata.normalize("NFKC", text or "").lower()
     t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
     return re.sub(r"\s+", " ", t).strip()
@@ -150,12 +146,16 @@ def evaluate_ner(ner_engine, ground_truth_path: str, verbose: bool = False) -> D
             matched, tp, fp = set(), 0, 0
             for pe in p_e:
                 found = next(
-                    (i for i, ge in enumerate(g_e)
-                     if i not in matched and _soft_match(pe["text"], ge["text"])),
+                    (
+                        i
+                        for i, ge in enumerate(g_e)
+                        if i not in matched and _soft_match(pe["text"], ge["text"])
+                    ),
                     None,
                 )
                 if found is not None:
-                    matched.add(found); tp += 1
+                    matched.add(found)
+                    tp += 1
                 else:
                     fp += 1
             counts[etype]["tp"] += tp
@@ -164,19 +164,40 @@ def evaluate_ner(ner_engine, ground_truth_path: str, verbose: bool = False) -> D
 
         if verbose:
             print(f"  [{n}] {sent[:60]}")
-            print(f"    gold={[e['text'] for e in gold]}  pred={[e['text'] for e in pred]}")
+            print(
+                f"    gold={[e['text'] for e in gold]}  pred={[e['text'] for e in pred]}"
+            )
 
-    results: Dict = {"n_samples": n, "ner_backend": getattr(ner_engine, "backend_name", "?")}
+    results: Dict = {
+        "n_samples": n,
+        "ner_backend": getattr(ner_engine, "backend_name", "?"),
+    }
     mtp = mfp = mfn = 0
     for etype in TYPES:
         tp, fp, fn = counts[etype]["tp"], counts[etype]["fp"], counts[etype]["fn"]
         p, r, f = _prf(tp, fp, fn)
-        results[etype] = {"precision": round(p, 4), "recall": round(r, 4), "f1": round(f, 4),
-                          "tp": tp, "fp": fp, "fn": fn, "support": tp + fn}
-        mtp += tp; mfp += fp; mfn += fn
+        results[etype] = {
+            "precision": round(p, 4),
+            "recall": round(r, 4),
+            "f1": round(f, 4),
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "support": tp + fn,
+        }
+        mtp += tp
+        mfp += fp
+        mfn += fn
     p, r, f = _prf(mtp, mfp, mfn)
-    results["micro_avg"] = {"precision": round(p, 4), "recall": round(r, 4), "f1": round(f, 4),
-                            "tp": mtp, "fp": mfp, "fn": mfn, "support": mtp + mfn}
+    results["micro_avg"] = {
+        "precision": round(p, 4),
+        "recall": round(r, 4),
+        "f1": round(f, 4),
+        "tp": mtp,
+        "fp": mfp,
+        "fn": mfn,
+        "support": mtp + mfn,
+    }
     return results
 
 
@@ -193,24 +214,28 @@ def print_ner_results(res: Dict):
         if key not in res:
             continue
         r = res[key]
-        print(f"  {key:<10}{r['tp']:>6}{r['fp']:>6}{r['fn']:>6}"
-              f"{r['precision']:>9.3f}{r['recall']:>9.3f}{r['f1']:>9.3f}{r['support']:>9}")
+        print(
+            f"  {key:<10}{r['tp']:>6}{r['fp']:>6}{r['fn']:>6}"
+            f"{r['precision']:>9.3f}{r['recall']:>9.3f}{r['f1']:>9.3f}{r['support']:>9}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2. RETRIEVAL EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def _synthetic_qrels(system, n: int = 30) -> List[Dict]:
     scores = system.ranker.compute_importance_scores(system.kg)
-    top = sorted(scores.items(), key=lambda x: -x[1])[:n * 2]
+    top = sorted(scores.items(), key=lambda x: -x[1])[: n * 2]
     qrels, seen = [], set()
     for entity, _ in top:
         if len(qrels) >= n or entity.lower() in seen:
             continue
         seen.add(entity.lower())
         relevant = [
-            doc["id"] for doc in system._documents
+            doc["id"]
+            for doc in system._documents
             if any(e.get("canonical") == entity for e in doc.get("linked_entities", []))
         ]
         if relevant:
@@ -218,8 +243,12 @@ def _synthetic_qrels(system, n: int = 30) -> List[Dict]:
     return qrels
 
 
-def evaluate_retrieval(system, qrels: List[Dict], ks=(5, 10, 20), verbose: bool = False) -> Dict:
-    bucket = {k: {"recall": [], "precision": [], "mrr": [], "ndcg": [], "ap": []} for k in ks}
+def evaluate_retrieval(
+    system, qrels: List[Dict], ks=(5, 10, 20), verbose: bool = False
+) -> Dict:
+    bucket = {
+        k: {"recall": [], "precision": [], "mrr": [], "ndcg": [], "ap": []} for k in ks
+    }
     latencies, errors = [], []
 
     for item in qrels:
@@ -239,26 +268,28 @@ def evaluate_retrieval(system, qrels: List[Dict], ks=(5, 10, 20), verbose: bool 
                 bucket[k]["ndcg"].append(ndcg_at_k(ids, relevant, k))
                 bucket[k]["ap"].append(average_precision(ids, relevant))
             if verbose:
-                print(f"  {query!r}  ids={ids[:4]}  mrr@10={mrr_at_k(ids, relevant, 10):.3f}")
+                print(
+                    f"  {query!r}  ids={ids[:4]}  mrr@10={mrr_at_k(ids, relevant, 10):.3f}"
+                )
         except Exception as e:
             errors.append({"query": query, "error": str(e)})
 
     out: Dict = {"n_queries": len(bucket[ks[0]]["recall"])}
     for k in ks:
         out[f"@{k}"] = {
-            "Recall":    _avg(bucket[k]["recall"]),
+            "Recall": _avg(bucket[k]["recall"]),
             "Precision": _avg(bucket[k]["precision"]),
-            "MRR":       _avg(bucket[k]["mrr"]),
-            "NDCG":      _avg(bucket[k]["ndcg"]),
-            "MAP":       _avg(bucket[k]["ap"]),
+            "MRR": _avg(bucket[k]["mrr"]),
+            "NDCG": _avg(bucket[k]["ndcg"]),
+            "MAP": _avg(bucket[k]["ap"]),
         }
     if latencies:
         sl = sorted(latencies)
         out["latency_ms"] = {
-            "mean":   round(sum(sl) / len(sl), 1),
+            "mean": round(sum(sl) / len(sl), 1),
             "median": round(sl[len(sl) // 2], 1),
-            "p95":    round(sl[int(len(sl) * 0.95)], 1),
-            "max":    round(sl[-1], 1),
+            "p95": round(sl[int(len(sl) * 0.95)], 1),
+            "max": round(sl[-1], 1),
         }
     if errors:
         out["errors"] = errors
@@ -278,17 +309,22 @@ def print_retrieval_results(res: Dict):
         print(h)
         print("  " + "─" * (len(h) - 2))
         for m in ("Recall", "Precision", "MRR", "NDCG", "MAP"):
-            row = f"  {m:<12}" + "".join(f"{res.get(f'@{k}', {}).get(m, 0):>10.4f}" for k in ks)
+            row = f"  {m:<12}" + "".join(
+                f"{res.get(f'@{k}', {}).get(m, 0):>10.4f}" for k in ks
+            )
             print(row)
     lat = res.get("latency_ms", {})
     if lat:
-        print(f"\n  Latency  mean={lat['mean']}ms  median={lat['median']}ms  "
-              f"p95={lat['p95']}ms  max={lat['max']}ms")
+        print(
+            f"\n  Latency  mean={lat['mean']}ms  median={lat['median']}ms  "
+            f"p95={lat['p95']}ms  max={lat['max']}ms"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3. GRAPH EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _gini(vals):
     if len(vals) <= 1:
@@ -311,11 +347,15 @@ def evaluate_graph(system) -> Dict:
 
     global_scores = ranker.compute_importance_scores(kg)
     vals = sorted(global_scores.values(), reverse=True)
-    pr_dist = {
-        "top1":       round(vals[0], 6),
-        "top10_mean": round(sum(vals[:10]) / min(10, len(vals)), 6),
-        "gini":       round(_gini(vals), 4),
-    } if vals else {}
+    pr_dist = (
+        {
+            "top1": round(vals[0], 6),
+            "top10_mean": round(sum(vals[:10]) / min(10, len(vals)), 6),
+            "gini": round(_gini(vals), 4),
+        }
+        if vals
+        else {}
+    )
 
     # PPR sanity: 2 seed khác nhau → top-3 phải khác nhau
     ppr_check = {}
@@ -326,8 +366,13 @@ def evaluate_graph(system) -> Dict:
         ppr2 = ranker.personalized_pagerank(kg, seeds=[s2])
         t1 = [e for e, _ in sorted(ppr1.items(), key=lambda x: -x[1])[:3]]
         t2 = [e for e, _ in sorted(ppr2.items(), key=lambda x: -x[1])[:3]]
-        ppr_check = {"seed_1": s1, "top3_ppr1": t1, "seed_2": s2, "top3_ppr2": t2,
-                     "diverges": t1 != t2}
+        ppr_check = {
+            "seed_1": s1,
+            "top3_ppr1": t1,
+            "seed_2": s2,
+            "top3_ppr2": t2,
+            "diverges": t1 != t2,
+        }
 
     type_counts: Dict[str, int] = defaultdict(int)
     for _, d in kg.graph.nodes(data=True):
@@ -355,7 +400,9 @@ def print_graph_results(res: Dict):
         print("  Types    : " + "  ".join(f"{t}={c}" for t, c in sorted(ec.items())))
     pr = res.get("pagerank_distribution", {})
     if pr:
-        print(f"\n  PageRank  top1={pr['top1']}  top10_mean={pr['top10_mean']}  gini={pr['gini']}")
+        print(
+            f"\n  PageRank  top1={pr['top1']}  top10_mean={pr['top10_mean']}  gini={pr['gini']}"
+        )
         print(f"    gini=0 → flat  gini=1 → tập trung 1 node")
     ppr = res.get("ppr_sanity_check", {})
     if ppr:
@@ -374,8 +421,10 @@ def print_graph_results(res: Dict):
 # 4. EMBEDDING EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def evaluate_embedding(system) -> Dict:
     import numpy as np
+
     em = system.em
     if em.doc_embeddings is None:
         return {"error": "Chưa có embedding"}
@@ -386,10 +435,16 @@ def evaluate_embedding(system) -> Dict:
     zero = norms < 1e-6
     coverage = round(1.0 - zero.mean(), 4)
     vn = norms[~zero]
-    norm_stats = {
-        "mean": round(float(vn.mean()), 4), "std": round(float(vn.std()), 4),
-        "min":  round(float(vn.min()), 4),  "max": round(float(vn.max()), 4),
-    } if len(vn) else {}
+    norm_stats = (
+        {
+            "mean": round(float(vn.mean()), 4),
+            "std": round(float(vn.std()), 4),
+            "min": round(float(vn.min()), 4),
+            "max": round(float(vn.max()), 4),
+        }
+        if len(vn)
+        else {}
+    )
 
     test_queries = [
         "chiến tranh nga ukraine",
@@ -400,6 +455,7 @@ def evaluate_embedding(system) -> Dict:
     ]
     intra, inter = [], []
     try:
+
         def nv(v):
             nn = np.linalg.norm(v)
             return v / nn if nn > 1e-8 else v
@@ -415,8 +471,15 @@ def evaluate_embedding(system) -> Dict:
         return {"error": str(e), "n_docs": n}
 
     return {
-        "n_docs": n, "dim": dim, "coverage": coverage, "norm_stats": norm_stats,
-        "intra_top1_sim": {"mean": _avg(intra), "min": round(min(intra), 4), "max": round(max(intra), 4)},
+        "n_docs": n,
+        "dim": dim,
+        "coverage": coverage,
+        "norm_stats": norm_stats,
+        "intra_top1_sim": {
+            "mean": _avg(intra),
+            "min": round(min(intra), 4),
+            "max": round(max(intra), 4),
+        },
         "inter_query_sim": {"mean": _avg(inter)},
     }
 
@@ -426,13 +489,19 @@ def print_embedding_results(res: Dict):
     if "error" in res:
         print(f"  ❌ {res['error']}")
         return
-    print(f"  Docs: {res['n_docs']}   dim: {res['dim']}   coverage: {res['coverage']:.2%}")
+    print(
+        f"  Docs: {res['n_docs']}   dim: {res['dim']}   coverage: {res['coverage']:.2%}"
+    )
     ns = res.get("norm_stats", {})
     if ns:
-        print(f"  Norms  mean={ns['mean']}  std={ns['std']}  min={ns['min']}  max={ns['max']}")
+        print(
+            f"  Norms  mean={ns['mean']}  std={ns['std']}  min={ns['min']}  max={ns['max']}"
+        )
     iq = res.get("intra_top1_sim", {})
     if iq:
-        print(f"\n  Intra-query top-1 sim  mean={iq['mean']}  min={iq['min']}  max={iq['max']}")
+        print(
+            f"\n  Intra-query top-1 sim  mean={iq['mean']}  min={iq['min']}  max={iq['max']}"
+        )
         print(f"    ↑ cao → query khớp đúng doc liên quan")
     iq2 = res.get("inter_query_sim", {})
     if iq2:
@@ -443,6 +512,7 @@ def print_embedding_results(res: Dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. SMOKE TEST
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def run_smoke_test(system, top_k: int = 5) -> Dict:
     QUERIES = [
@@ -475,7 +545,9 @@ def run_smoke_test(system, top_k: int = 5) -> Dict:
                     isinstance(s, (int, float)) and not math.isnan(s) and s >= 0
                     for s in scores
                 )
-                row["scores_sorted"] = all(scores[i] >= scores[i+1] for i in range(len(scores)-1))
+                row["scores_sorted"] = all(
+                    scores[i] >= scores[i + 1] for i in range(len(scores) - 1)
+                )
                 row["top1_score"] = round(scores[0], 4)
                 row["top1_title"] = docs[0].get("title", "")[:55]
             else:
@@ -488,11 +560,12 @@ def run_smoke_test(system, top_k: int = 5) -> Dict:
 
     n_ok = sum(1 for r in rows if r.get("status") == "ok")
     return {
-        "n_queries": len(QUERIES), "n_ok": n_ok,
+        "n_queries": len(QUERIES),
+        "n_ok": n_ok,
         "pass_rate": round(n_ok / len(QUERIES), 4),
         "latency_ms": {
             "mean": round(sum(latencies) / len(latencies), 1) if latencies else 0,
-            "max":  round(max(latencies), 1) if latencies else 0,
+            "max": round(max(latencies), 1) if latencies else 0,
         },
         "per_query": rows,
     }
@@ -503,14 +576,18 @@ def print_smoke_results(res: Dict):
     n_ok, n_total = res["n_ok"], res["n_queries"]
     icon = "✅" if n_ok == n_total else ("⚠️" if n_ok else "❌")
     lat = res.get("latency_ms", {})
-    print(f"  {icon} {n_ok}/{n_total} passed   mean={lat.get('mean')}ms  max={lat.get('max')}ms\n")
+    print(
+        f"  {icon} {n_ok}/{n_total} passed   mean={lat.get('mean')}ms  max={lat.get('max')}ms\n"
+    )
     for r in res.get("per_query", []):
         q = r["query"][:42]
         if r.get("status") == "ok":
             v = "✓" if r.get("scores_valid") else "✗SCORE"
             s = "✓" if r.get("scores_sorted") else "✗ORDER"
             miss = f" MISS:{r['missing_fields']}" if r.get("missing_fields") else ""
-            print(f"  ✓ {q:<44} n={r['n']} {r['ms']:6.0f}ms top1={r.get('top1_score',0):.3f} {v} {s}{miss}")
+            print(
+                f"  ✓ {q:<44} n={r['n']} {r['ms']:6.0f}ms top1={r.get('top1_score',0):.3f} {v} {s}{miss}"
+            )
         else:
             print(f"  ✗ {q:<44} ERROR: {r.get('error','')[:45]}")
 
@@ -518,6 +595,7 @@ def print_smoke_results(res: Dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def print_summary(all_results: Dict):
     _hdr("SUMMARY")
@@ -537,8 +615,20 @@ def print_summary(all_results: Dict):
 
     graph = all_results.get("graph", {})
     if graph and "error" not in graph:
-        rows.append(("KG entities",  str(graph["n_entities"]),  "✓" if graph["n_entities"] > 0 else "✗"))
-        rows.append(("KG relations", str(graph["n_relations"]), "✓" if graph["n_relations"] > 0 else "✗"))
+        rows.append(
+            (
+                "KG entities",
+                str(graph["n_entities"]),
+                "✓" if graph["n_entities"] > 0 else "✗",
+            )
+        )
+        rows.append(
+            (
+                "KG relations",
+                str(graph["n_relations"]),
+                "✓" if graph["n_relations"] > 0 else "✗",
+            )
+        )
         ok = graph.get("ppr_sanity_check", {}).get("diverges", False)
         rows.append(("PPR personalizes", "yes" if ok else "no", "✓" if ok else "⚠"))
 
@@ -550,7 +640,13 @@ def print_summary(all_results: Dict):
     smoke = all_results.get("smoke", {})
     if smoke and "error" not in smoke:
         pr = smoke.get("pass_rate", 0)
-        rows.append(("Smoke pass rate", f"{pr:.0%}", "✓" if pr == 1.0 else ("⚠" if pr >= 0.8 else "✗")))
+        rows.append(
+            (
+                "Smoke pass rate",
+                f"{pr:.0%}",
+                "✓" if pr == 1.0 else ("⚠" if pr >= 0.8 else "✗"),
+            )
+        )
 
     if rows:
         w = max(len(r[0]) for r in rows) + 2
@@ -563,15 +659,25 @@ def print_summary(all_results: Dict):
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def parse_args():
-    p = argparse.ArgumentParser(description="End-to-end evaluation — Vietnamese KG News Search")
+    p = argparse.ArgumentParser(
+        description="End-to-end evaluation — Vietnamese KG News Search"
+    )
     p.add_argument("--load-index", action="store_true")
     p.add_argument("--data", "-d", type=str, default=None)
     p.add_argument("--index-dir", type=str, default=None)
-    p.add_argument("--ner-ground-truth", type=str,
-                   default=str(ROOT / "data" / "ner_ground_truth.json"))
-    p.add_argument("--retrieval-qrels", type=str, default=None,
-                   help='JSON: [{"query":"...", "relevant_doc_ids":[...]}]')
+    p.add_argument(
+        "--ner-ground-truth",
+        type=str,
+        default=str(ROOT / "data" / "ner_ground_truth.json"),
+    )
+    p.add_argument(
+        "--retrieval-qrels",
+        type=str,
+        default=None,
+        help='JSON: [{"query":"...", "relevant_doc_ids":[...]}]',
+    )
     p.add_argument("--tasks", type=str, default="ner,retrieval,graph,embedding,smoke")
     p.add_argument("--top-k", "-k", type=int, default=10)
     p.add_argument("--output", type=str, default=None)
@@ -592,6 +698,7 @@ def main():
 
     if need_system:
         from main import NewsSearchSystem
+
         system = NewsSearchSystem(data_path=args.data, index_dir=args.index_dir)
         if args.load_index:
             print("\n📂 Loading index...")
@@ -615,9 +722,13 @@ def main():
     if "ner" in tasks:
         print("\n⏳ NER evaluation...")
         # Cần data/ner_model/ đã train (python scripts/train_ner.py)
-        ner_engine = system.ner if system is not None else __import__(
-            "src.preprocessing.ner", fromlist=["VietnameseNER"]
-        ).VietnameseNER()
+        ner_engine = (
+            system.ner
+            if system is not None
+            else __import__(
+                "src.preprocessing.ner", fromlist=["VietnameseNER"]
+            ).VietnameseNER()
+        )
         res = evaluate_ner(ner_engine, args.ner_ground_truth, verbose=args.verbose)
         all_results["ner"] = res
         print_ner_results(res)

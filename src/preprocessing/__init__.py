@@ -1,5 +1,3 @@
-"""Preprocessing package: NER, entity linking."""
-
 from src.preprocessing.ner import (
     VietnameseNER,
     get_entities_by_type,

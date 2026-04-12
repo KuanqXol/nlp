@@ -1,5 +1,3 @@
-"""Retrieval package: embedding, chunking, retriever, query processing."""
-
 from src.retrieval.embedding import EmbeddingManager
 from src.retrieval.chunking import chunk_document, chunk_documents
 from src.retrieval.retriever import Retriever

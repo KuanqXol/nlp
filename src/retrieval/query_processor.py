@@ -1,6 +1,5 @@
 """
-query_processor.py
-──────────────────
+
 Xử lý query tiếng Việt: NFC normalize → NER → entity linking → keyword extract.
 
 Input:  "chiến tranh nga ukraine 2024"

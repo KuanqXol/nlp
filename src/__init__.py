@@ -1,6 +1,5 @@
 """
 Vietnamese KG-Enhanced News Search & RAG System
-================================================
 Hệ thống tìm kiếm tin tức tiếng Việt tích hợp:
   - NER (Named Entity Recognition)
   - Entity Linking

@@ -1,6 +1,4 @@
 """
-chunking.py
-───────────
 Document chunking để cải thiện embedding quality.
 
 Vấn đề v1: mỗi document được encode thành 1 vector duy nhất cho toàn bộ
@@ -43,10 +41,6 @@ def chunk_by_sentences(
     overlap: int = DEFAULT_OVERLAP_SENTENCES,
     min_chars: int = DEFAULT_MIN_CHUNK_CHARS,
 ) -> List[str]:
-    """
-    Sliding window qua sentences.
-    Mỗi chunk tối đa max_chars ký tự, overlap N câu với chunk trước.
-    """
     sentences = _split_sentences(text)
     if not sentences:
         return [text[:max_chars]] if len(text) >= min_chars else []

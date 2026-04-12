@@ -1,22 +1,3 @@
-"""
-knowledge_graph.py
-─────────────────────
-KG nâng cấp — fixes 4 vấn đề nghiêm trọng của v1:
-
-  1. Co-occurrence edge explosion (v1 tạo O(n²) edge/doc → nhiễu PageRank)
-     Fix: co-occurrence chỉ thêm khi không có relation cụ thể, và giới hạn
-          MAX_COOCCUR_PER_DOC cặp có confidence cao nhất.
-
-  2. Không có temporal dimension (v1 merge hết vào 1 edge)
-     Fix: mỗi triple lưu kèm timestamp, truy vấn được "relation tại thời điểm T".
-
-  3. Confidence filtering bị bỏ qua (v1 nhận mọi triple)
-     Fix: chỉ thêm edge khi triple.confidence >= ngưỡng tối thiểu.
-
-  4. Type inconsistency khi merge entity (v1 dùng type đầu tiên gặp)
-     Fix: giữ type theo majority vote từ NER.
-"""
-
 import pickle
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
@@ -56,22 +37,6 @@ class TemporalEdge:
 
 
 class KnowledgeGraph:
-    """
-    Knowledge Graph nâng cấp.
-
-    Thay đổi so với v1:
-    - Co-occurrence: chỉ thêm khi cặp entity KHÔNG có relation cụ thể,
-      giới hạn theo MAX_COOCCUR_PER_DOC và entity link_score.
-    - Temporal: mỗi edge lưu list TemporalEdge → query theo thời gian.
-    - Confidence filtering: triple.confidence < MIN_TRIPLE_CONFIDENCE → bỏ qua.
-    - Type majority vote: type entity nhất quán hơn.
-
-    Usage:
-        kg = KnowledgeGraph()
-        kg.build_from_documents(docs)
-        kg.save("kg.pkl")
-        kg.load("kg.pkl")
-    """
 
     def __init__(self, min_confidence: float = MIN_TRIPLE_CONFIDENCE):
         if not _NX_AVAILABLE:
@@ -262,10 +227,6 @@ class KnowledgeGraph:
         confidence: Optional[float] = None,
         source_sentence: str = "",
     ):
-        """
-        Public API để thêm relation edge từ module bên ngoài.
-        Nếu node chưa tồn tại sẽ tạo node mặc định type=MISC.
-        """
         if not subj or not obj or subj == obj:
             return
 
@@ -304,14 +265,6 @@ class KnowledgeGraph:
         exclude_cooccur: bool = True,
         min_edge_confidence: float = 0.0,
     ) -> Dict[str, List]:
-        """
-        Lấy neighbors với các filter nâng cấp.
-
-        Args:
-            exclude_cooccur: Bỏ co-occurrence edges khi expand (default True)
-                             → expansion theo relation có nghĩa, không phải đồng xuất hiện
-            min_edge_confidence: Chỉ lấy edge có max_confidence >= ngưỡng này
-        """
         result = {"hop1": [], "hop2": []}
         if entity not in self.graph:
             return result

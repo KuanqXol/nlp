@@ -6,16 +6,6 @@ Fine-tune vinai/phobert-base-v2 for Vietnamese NER on news domain.
 Data strategy:
   1. Gold: data/ner_ground_truth.json (hand-labeled sentences)
   2. Silver: underthesea predictions on N news articles (filtered by confidence)
-
-Subword alignment:
-  PhoBERT uses BPE → a Vietnamese word may split into 2+ sub-tokens.
-  First sub-token gets the word's BIO label; continuation sub-tokens get I- label
-  (or -100 to ignore in loss, configurable).
-
-Usage:
-    python scripts/train_ner.py --help
-    python scripts/train_ner.py --output-dir data/ner_model --epochs 5
-    python scripts/train_ner.py --no-silver --output-dir data/ner_model_gold_only
 """
 
 from __future__ import annotations
@@ -498,18 +488,33 @@ def compute_metrics_factory(id2label: Dict[int, str]):
 
 
 class NERDataset:
-    """Simple dataset wrapper for HuggingFace Trainer."""
+    """Dataset wrapper: tokenize lazily tại __getitem__ để tiết kiệm RAM.
+    Thay vì pre-tokenize toàn bộ 69k samples vào RAM một lúc,
+    mỗi sample chỉ được tokenize khi Trainer cần.
+    """
 
-    def __init__(self, data: List[Dict]):
-        self.data = data
+    def __init__(self, samples: List[Dict], tokenizer, max_length: int = 256):
+        self.samples = samples
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
     def __len__(self):
-        return len(self.data)
+        return len(self.samples)
 
     def __getitem__(self, idx):
         import torch
 
-        item = self.data[idx]
+        sample = self.samples[idx]
+        words, labels = sentence_to_bio(sample["sentence"], sample["entities"])
+        if not words:
+            words, labels = ["[UNK]"], ["O"]
+        item = tokenize_and_align_labels(
+            words,
+            labels,
+            self.tokenizer,
+            max_length=self.max_length,
+            label_all_tokens=True,
+        )
         return {
             "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
             "attention_mask": torch.tensor(item["attention_mask"], dtype=torch.long),
@@ -593,24 +598,15 @@ def train(args):
         print("[train_ner] ERROR: Not enough training data. Need at least 5 samples.")
         return
 
-    # ── Tokenize + align ─────────────────────────────────────────────────
-    print("[train_ner] Tokenizing and aligning labels...")
-    tokenized_data = prepare_dataset(
-        all_samples,
-        tokenizer,
-        max_length=args.max_seq_length,
-        label_all_tokens=True,
-    )
-    print(f"[train_ner] Tokenized samples: {len(tokenized_data)}")
-
     # ── Split train/dev ──────────────────────────────────────────────────
-    dev_size = max(1, int(len(tokenized_data) * args.dev_split))
-    dev_data = tokenized_data[:dev_size]
-    train_data = tokenized_data[dev_size:]
-    print(f"[train_ner] Train: {len(train_data)}, Dev: {len(dev_data)}")
+    # Lazy tokenize: không pre-tokenize hết vào RAM, tokenize từng sample khi cần
+    dev_size = max(1, int(len(all_samples) * args.dev_split))
+    dev_samples = all_samples[:dev_size]
+    train_samples = all_samples[dev_size:]
+    print(f"[train_ner] Train: {len(train_samples)}, Dev: {len(dev_samples)}")
 
-    train_dataset = NERDataset(train_data)
-    dev_dataset = NERDataset(dev_data)
+    train_dataset = NERDataset(train_samples, tokenizer, max_length=args.max_seq_length)
+    dev_dataset = NERDataset(dev_samples, tokenizer, max_length=args.max_seq_length)
 
     # ── Training arguments ───────────────────────────────────────────────
     effective_batch = args.batch_size

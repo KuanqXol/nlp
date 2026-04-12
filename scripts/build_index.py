@@ -1,13 +1,6 @@
 """
-build_index.py
-──────────────
 Build toàn bộ pipeline offline và lưu index ra disk.
 Chạy một lần, sau đó dùng --load-index để search nhanh.
-
-Cách chạy:
-    python scripts/build_index.py
-    python scripts/build_index.py --data data/vnexpress_articles.csv
-    python scripts/build_index.py --data data/vnexpress_articles.csv --index-dir data/index_v2
 """
 
 import argparse

@@ -8,15 +8,6 @@ Training data (theo thứ tự ưu tiên):
   1. MMARCO-Vi (unicamp-dl/mmarco, "vietnamese") — 532k pair, base ranking knowledge
   2. UIT-ViQuAD2.0 — câu hỏi tự nhiên tiếng Việt
   3. 150k bài báo VnExpress — pseudo query từ title + BM25 hard negative
-
-Curriculum:
-  Epoch 1 = MMARCO-Vi random sample + ViQuAD random negatives
-  Epoch 2-3 = BM25 hard negatives từ corpus tin tức
-
-Usage:
-    python scripts/train_reranker.py --help
-    python scripts/train_reranker.py --output-dir data/reranker_model
-    python scripts/train_reranker.py --no-viquad --epochs 3
 """
 
 from __future__ import annotations

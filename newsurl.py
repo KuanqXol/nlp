@@ -2,13 +2,6 @@
 VnExpress URL Collector
 =======================
 Chỉ thu thập URL bài báo và lưu vào file txt.
-Chạy file này trước, sau đó chạy 2_article_crawler.py.
-
-Cài đặt:
-    pip install requests beautifulsoup4
-
-Chạy:
-    python 1_url_collector.py
 """
 
 import requests
@@ -25,13 +18,13 @@ from urllib.parse import urljoin
 # CẤU HÌNH
 # ─────────────────────────────────────────────
 CONFIG = {
-    "start_date":      datetime(2001, 1, 1),  # Từ ngày
-    "end_date":        datetime.now(),         # Đến ngày
-    "output_urls":     "vnexpress_urls.txt",   # File lưu URL
+    "start_date": datetime(2001, 1, 1),  # Từ ngày
+    "end_date": datetime.now(),  # Đến ngày
+    "output_urls": "vnexpress_urls.txt",  # File lưu URL
     "request_timeout": 15,
-    "max_retries":     3,
+    "max_retries": 3,
     # Chuyên mục muốn lấy — để None để lấy tất cả
-    "categories":      None,
+    "categories": None,
 }
 
 HEADERS = {
@@ -47,20 +40,20 @@ HEADERS = {
 BASE_URL = "https://vnexpress.net"
 
 CATEGORY_IDS = {
-    "thoi-su":    1001005,
-    "the-gioi":   1001002,
+    "thoi-su": 1001005,
+    "the-gioi": 1001002,
     "kinh-doanh": 1003159,
-    "giai-tri":   1002691,
-    "the-thao":   1002565,
-    "phap-luat":  1001007,
-    "giao-duc":   1003497,
-    "suc-khoe":   1003750,
-    "du-lich":    1003231,
-    "khoa-hoc":   1001009,
-    "so-hoa":     1002592,
-    "xe":         1001006,
-    "y-kien":     1001012,
-    "tam-su":     1001014,
+    "giai-tri": 1002691,
+    "the-thao": 1002565,
+    "phap-luat": 1001007,
+    "giao-duc": 1003497,
+    "suc-khoe": 1003750,
+    "du-lich": 1003231,
+    "khoa-hoc": 1001009,
+    "so-hoa": 1002592,
+    "xe": 1001006,
+    "y-kien": 1001012,
+    "tam-su": 1001014,
 }
 
 # ─────────────────────────────────────────────
@@ -108,8 +101,16 @@ def _is_article_url(url: str) -> bool:
         return False
     if "vnexpress.net" not in url:
         return False
-    skip = ["/topic/", "/tag/", "/category/", "/author/",
-            "/search/", "/photo/", "/video/", "page="]
+    skip = [
+        "/topic/",
+        "/tag/",
+        "/category/",
+        "/author/",
+        "/search/",
+        "/photo/",
+        "/video/",
+        "page=",
+    ]
     return not any(p in url for p in skip)
 
 
@@ -138,12 +139,15 @@ def extract_urls_from_html(html: str) -> list[str]:
 # SEARCH API — chia theo tháng
 # ─────────────────────────────────────────────
 
+
 def month_chunks(start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
     chunks, cur = [], start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     while cur <= end:
-        nxt = (cur.replace(year=cur.year + 1, month=1, day=1)
-               if cur.month == 12
-               else cur.replace(month=cur.month + 1, day=1))
+        nxt = (
+            cur.replace(year=cur.year + 1, month=1, day=1)
+            if cur.month == 12
+            else cur.replace(month=cur.month + 1, day=1)
+        )
         chunks.append((cur, min(nxt - timedelta(seconds=1), end)))
         cur = nxt
     return chunks
@@ -154,8 +158,10 @@ def fetch_urls_one_month(cat_id: int, from_dt: datetime, to_dt: datetime) -> lis
     from_ts, to_ts = int(from_dt.timestamp()), int(to_dt.timestamp())
 
     for page in range(1, 51):
-        api = (f"https://vnexpress.net/category/day/cateid/{cat_id}"
-               f"/fromdate/{from_ts}/todate/{to_ts}/allcate/0/page/{page}")
+        api = (
+            f"https://vnexpress.net/category/day/cateid/{cat_id}"
+            f"/fromdate/{from_ts}/todate/{to_ts}/allcate/0/page/{page}"
+        )
         html = fetch(api)
         if not html:
             break
@@ -176,12 +182,13 @@ def fetch_urls_one_month(cat_id: int, from_dt: datetime, to_dt: datetime) -> lis
 # MAIN
 # ─────────────────────────────────────────────
 
+
 def main():
-    start      = CONFIG["start_date"]
-    end        = CONFIG["end_date"]
-    url_path   = CONFIG["output_urls"]
-    cats       = CONFIG["categories"] or list(CATEGORY_IDS.keys())
-    chunks     = month_chunks(start, end)
+    start = CONFIG["start_date"]
+    end = CONFIG["end_date"]
+    url_path = CONFIG["output_urls"]
+    cats = CONFIG["categories"] or list(CATEGORY_IDS.keys())
+    chunks = month_chunks(start, end)
 
     logger.info("=" * 55)
     logger.info("  VnExpress URL Collector")
@@ -213,7 +220,7 @@ def main():
         cat_new = 0
         for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
             urls = fetch_urls_one_month(cat_id, chunk_start, chunk_end)
-            new  = [u for u in urls if u not in known]
+            new = [u for u in urls if u not in known]
 
             for u in new:
                 known.add(u)
@@ -221,7 +228,7 @@ def main():
             if new:
                 out.flush()
 
-            cat_new   += len(new)
+            cat_new += len(new)
             total_new += len(new)
 
             logger.info(
@@ -231,7 +238,9 @@ def main():
             )
 
     out.close()
-    logger.info(f"\n✅ Hoàn tất! Thêm {total_new:,} URL mới → tổng {len(known):,} URL trong {url_path}")
+    logger.info(
+        f"\n✅ Hoàn tất! Thêm {total_new:,} URL mới → tổng {len(known):,} URL trong {url_path}"
+    )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,4 @@
 """
-ner.py
-──────
 NER tiếng Việt dùng PhoBERT fine-tuned (vinai/phobert-base-v2).
 
 Yêu cầu:

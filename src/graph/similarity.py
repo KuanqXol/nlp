@@ -26,11 +26,6 @@ class SimilarityGraphBuilder:
     """
 
     def __init__(self, threshold: float = 0.75):
-        """
-        Args:
-            threshold: Ngưỡng cosine similarity tối thiểu để tạo edge.
-                       Giá trị cao hơn → ít edge hơn, precision cao hơn.
-        """
         self.threshold = threshold
 
     def build(self, kg, embedding_manager) -> List[Tuple[str, str, float]]:

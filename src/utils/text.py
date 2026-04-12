@@ -1,17 +1,9 @@
 """
-src/utils/text.py
-─────────────────
 Shared text utilities dùng chung cho NER và chunking.
-
-Vấn đề trước: _split_sentences được định nghĩa 2 lần với 2 regex khác nhau:
-  - ner.py      : regex `[^.!?]+[.!?]?`  → trả về List[Dict] có start/end offset
-  - chunking.py : regex `(?<=[.!?])\\s+` → trả về List[str]
 
 Fix: thống nhất vào 1 module, 2 function với interface rõ ràng.
   - split_sentences_spans() → dùng trong NER (cần offset để map entity về text gốc)
   - split_sentences()       → dùng trong chunking (chỉ cần text thuần)
-
-Cả 2 dùng cùng 1 regex split cơ bản, đảm bảo chunking và NER chia câu nhất quán.
 """
 
 from __future__ import annotations
@@ -30,21 +22,7 @@ DEFAULT_MIN_CHARS = 10
 
 
 def split_sentences(text: str, min_chars: int = DEFAULT_MIN_CHARS) -> List[str]:
-    """Tách câu tiếng Việt, trả về list string.
 
-    Dùng trong: chunking.py
-
-    Args:
-        text: văn bản đầu vào (đã NFC-normalized).
-        min_chars: bỏ qua câu ngắn hơn ngưỡng này.
-
-    Returns:
-        List[str] các câu, đã strip, dài >= min_chars.
-
-    Example:
-        >>> split_sentences("Hà Nội là thủ đô. Việt Nam có 63 tỉnh.")
-        ['Hà Nội là thủ đô.', 'Việt Nam có 63 tỉnh.']
-    """
     text = (text or "").strip()
     if not text:
         return []

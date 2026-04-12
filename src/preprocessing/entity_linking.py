@@ -137,13 +137,6 @@ class _EmbeddingBackend:
 
 
 class _SharedEncoderAdapter:
-    """Adapter bọc VietnameseBiEncoder (từ EmbeddingManager) thành interface
-    tương thích với _EmbeddingBackend.encode(list_of_texts) → np.ndarray.
-
-    Mục đích: cho phép EntityLinker dùng chung model với EmbeddingManager
-    thay vì load thêm 1 model riêng (tiết kiệm RAM ~1-2 GB, thống nhất
-    vector space giữa entity linking và document embedding).
-    """
 
     def __init__(self, encoder):
         # encoder là VietnameseBiEncoder hoặc bất kỳ object nào có .encode()

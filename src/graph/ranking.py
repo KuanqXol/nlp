@@ -1,22 +1,3 @@
-"""
-graph_ranking.py
-───────────────────
-Graph ranking nâng cấp — thêm Personalized PageRank (PPR).
-
-Vấn đề của v1:
-  - PageRank toàn cục: tính một lần offline, không thay đổi theo query.
-  - Entity "Việt Nam" luôn top 1 vì xuất hiện khắp nơi, bất kể query là gì.
-  - Không tận dụng được query context khi expand.
-
-Cải tiến:
-  1. Global PageRank vẫn tính offline để dùng làm prior.
-  2. Personalized PageRank (PPR): tính lại tại query time với
-     personalization vector tập trung vào seed entities.
-     PPR(v | seeds) → entity nào "gần" seed trong graph → điểm cao.
-  3. Combined score: alpha * PPR + beta * frequency + gamma * link_score_quality
-  4. Co-occurrence edges bị loại trước khi tính PageRank (optional).
-"""
-
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np

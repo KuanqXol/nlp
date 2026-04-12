@@ -1,12 +1,9 @@
 """
-embedding.py
-────────────
 Embedding tiếng Việt dùng bkai-foundation-models/vietnamese-bi-encoder.
 
 Model xuất ra vector 768 chiều, đã được pretrain trên corpus tiếng Việt
 domain báo chí và hội thoại — phù hợp với tập VnExpress 150k bài.
-
-Không có TF-IDF fallback. Cần cài:
+Cần cài:
     pip install sentence-transformers
 """
 

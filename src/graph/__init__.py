@@ -1,5 +1,3 @@
-"""Graph package: knowledge graph, ranking, similarity, visualization."""
-
 from src.graph.knowledge_graph import KnowledgeGraph
 from src.graph.ranking import GraphRanker
 from src.graph.similarity import SimilarityGraphBuilder

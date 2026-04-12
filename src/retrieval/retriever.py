@@ -1,6 +1,4 @@
 """
-retriever.py
-────────────
 Retriever dùng FAISS vector search + cross-encoder reranking.
 
 Pipeline:
@@ -266,11 +264,7 @@ class Retriever:
         rerank: bool = True,
         apply_decay: bool = True,
     ) -> List[Dict]:
-        """
-        Tìm kiếm top_k document liên quan đến query.
 
-        Luồng: FAISS(50 chunks) → dedupe doc → graph boost → cross-encoder rerank → date decay
-        """
         if self._em is None:
             return []
 

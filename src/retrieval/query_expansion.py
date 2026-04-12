@@ -1,24 +1,3 @@
-"""
-query_expansion.py
-──────────────────────
-Query expansion nâng cấp — thay string concatenation bằng multi-query strategy.
-
-Vấn đề v1:
-  Expansion = nối entity names vào 1 chuỗi:
-  "nga ukraine putin zelensky nato biden eu liên hợp quốc"
-  → SBERT encode 1 lần → vector bị dilute bởi nhiều entity không liên quan
-  → Precision giảm, recall tăng không có kiểm soát
-
-Cải tiến :
-  1. Multi-query: tạo nhiều query variant từ entity groups
-     Query gốc + mỗi nhóm entity → encode riêng → lấy max similarity
-  2. PPR-guided expansion: dùng Personalized PageRank thay vì
-     global importance để chọn neighbors (entity gần seeds theo context query)
-  3. Relation-aware expansion: ưu tiên neighbor qua relation có nghĩa
-     (leads, attacks, supports) hơn co-occurrence thuần túy
-  4. Expansion trace với confidence score để debug
-"""
-
 from typing import Dict, List, Optional, Set, Tuple
 
 
@@ -54,16 +33,7 @@ MAX_TOTAL_ENTITIES = 12
 
 
 def should_expand(processed_query: Dict) -> bool:
-    """Gate: only expand when query is entity-focused.
 
-    Trước: `len(keywords) <= 5` — quá cứng. Query "Samsung đầu tư Việt Nam 5 năm"
-    có 5 keywords và 2 entity nhưng vẫn cần expand.
-
-    Sau: dùng entity_ratio = n_entities / max(n_keywords, 1).
-    Expand khi có ít nhất 1 entity VÀ entity chiếm ít nhất 20% keywords
-    (tức query không quá lan man so với số entity có).
-    Vẫn skip khi temporal_query để tránh expand ra entity không liên quan.
-    """
     entities = processed_query.get("entities", [])
     keywords = processed_query.get("keywords", [])
     intent = processed_query.get("intent", "")
