@@ -49,9 +49,100 @@ def _normalize_text(text: str) -> str:
     return " ".join((text or "").strip().split())
 
 
+def load_vlsp2016(max_samples: int = 999999) -> List[Dict]:
+    """Load VLSP2016 NER trực tiếp từ HuggingFace.
+    Dataset: datnth1709/VLSP2016-NER-data
+    Format: mỗi sample có 'tokens' và 'ner_tags' (BIO string list)
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("[train_ner] datasets not installed: pip install datasets")
+        return []
+
+    print("[train_ner] Loading VLSP2016 from HuggingFace...")
+    try:
+        ds = load_dataset("datnth1709/VLSP2016-NER-data", trust_remote_code=True)
+    except Exception as e:
+        print(f"[train_ner] Cannot load VLSP2016: {e}")
+        return []
+
+    # Map VLSP label strings về PER/LOC/ORG (bỏ MISC)
+    VLSP_MAP = {
+        "B-PER": "PER",
+        "I-PER": "PER",
+        "B-LOC": "LOC",
+        "I-LOC": "LOC",
+        "B-ORG": "ORG",
+        "I-ORG": "ORG",
+        "B-MISC": None,
+        "I-MISC": None,
+        "O": None,
+    }
+
+    samples = []
+    for split in ["train", "validation", "test"]:
+        if split not in ds:
+            continue
+        for item in ds[split]:
+            tokens = item.get("tokens") or item.get("words") or []
+            ner_tags = item.get("ner_tags") or []
+
+            # ner_tags có thể là int (index) hoặc string
+            # Nếu là int, cần label_names để convert
+            if ner_tags and isinstance(ner_tags[0], int):
+                label_names = ds[split].features["ner_tags"].feature.names
+                ner_tags = [label_names[t] for t in ner_tags]
+
+            if not tokens or not ner_tags:
+                continue
+
+            # Tái tạo entities từ BIO tags
+            sentence = " ".join(tokens)
+            entities = []
+            i = 0
+            while i < len(tokens):
+                tag = ner_tags[i] if i < len(ner_tags) else "O"
+                ent_type = VLSP_MAP.get(tag)
+                if ent_type and tag.startswith("B-"):
+                    span = [tokens[i]]
+                    j = i + 1
+                    while j < len(tokens):
+                        next_tag = ner_tags[j] if j < len(ner_tags) else "O"
+                        if (
+                            next_tag.startswith("I-")
+                            and VLSP_MAP.get(next_tag) == ent_type
+                        ):
+                            span.append(tokens[j])
+                            j += 1
+                        else:
+                            break
+                    entities.append({"text": " ".join(span), "type": ent_type})
+                    i = j
+                else:
+                    i += 1
+
+            if sentence and entities:
+                samples.append(
+                    {"sentence": sentence, "entities": entities, "source": "vlsp2016"}
+                )
+
+        if len(samples) >= max_samples:
+            break
+
+    print(f"[train_ner] VLSP2016 loaded: {len(samples)} samples")
+    return samples[:max_samples]
+
+
 def load_gold_data(path: str | Path) -> List[Dict]:
-    """Load ner_ground_truth.json → list of {sentence, entities}."""
-    with open(path, encoding="utf-8") as f:
+    """Load ner_ground_truth.json → list of {sentence, entities}.
+    Fallback: nếu file không tồn tại, trả về list rỗng (sẽ dùng VLSP2016 thay thế).
+    """
+    p = Path(path)
+    if not p.exists():
+        print(f"[train_ner] Gold file not found: {p} — skipping local gold data")
+        return []
+    with open(p, encoding="utf-8") as f:
         payload = json.load(f)
     samples = payload.get("samples", payload if isinstance(payload, list) else [])
     out = []
@@ -86,6 +177,7 @@ def load_news_articles(csv_path: str | Path, max_articles: int = 10000) -> List[
 def _split_sentences(text: str) -> List[str]:
     """Split text into sentences (simple regex-based)."""
     import re
+
     sentences = []
     for m in re.finditer(r"[^.!?]+[.!?]?", text, flags=re.UNICODE):
         sent = m.group().strip()
@@ -110,9 +202,12 @@ def generate_silver_labels(
         return []
 
     NER_MAP = {
-        "B-PER": "PER", "I-PER": "PER",
-        "B-LOC": "LOC", "I-LOC": "LOC",
-        "B-ORG": "ORG", "I-ORG": "ORG",
+        "B-PER": "PER",
+        "I-PER": "PER",
+        "B-LOC": "LOC",
+        "I-LOC": "LOC",
+        "B-ORG": "ORG",
+        "I-ORG": "ORG",
     }
 
     silver = []
@@ -153,28 +248,38 @@ def generate_silver_labels(
                     conf = 0.88 if len(span) >= 2 else 0.82
                     if conf < min_confidence:
                         all_high_conf = False
-                    entities.append({
-                        "text": entity_text,
-                        "type": ent_type,
-                        "confidence": conf,
-                    })
+                    entities.append(
+                        {
+                            "text": entity_text,
+                            "type": ent_type,
+                            "confidence": conf,
+                        }
+                    )
                     i = j
                 else:
                     i += 1
 
             # Only keep sentences where ALL entities meet confidence threshold
             if entities and all_high_conf:
-                silver.append({
-                    "sentence": sent,
-                    "entities": [{"text": e["text"], "type": e["type"]} for e in entities],
-                    "source": "silver",
-                })
+                silver.append(
+                    {
+                        "sentence": sent,
+                        "entities": [
+                            {"text": e["text"], "type": e["type"]} for e in entities
+                        ],
+                        "source": "silver",
+                    }
+                )
                 total_sentences += 1
 
         if (article_idx + 1) % 1000 == 0:
-            print(f"  Silver labeling: {article_idx+1} articles processed, {len(silver)} sentences kept")
+            print(
+                f"  Silver labeling: {article_idx+1} articles processed, {len(silver)} sentences kept"
+            )
 
-    print(f"[train_ner] Silver labels: {len(silver)} sentences from {len(articles)} articles")
+    print(
+        f"[train_ner] Silver labels: {len(silver)} sentences from {len(articles)} articles"
+    )
     return silver
 
 
@@ -214,11 +319,13 @@ def sentence_to_bio(sentence: str, entities: List[Dict]) -> Tuple[List[str], Lis
             continue
 
         # Map character span to word indices
-        ent_word_indices = sorted(set(
-            char_to_word.get(ch, -1)
-            for ch in range(idx, idx + len(ent_text))
-            if ch in char_to_word
-        ))
+        ent_word_indices = sorted(
+            set(
+                char_to_word.get(ch, -1)
+                for ch in range(idx, idx + len(ent_text))
+                if ch in char_to_word
+            )
+        )
         ent_word_indices = [i for i in ent_word_indices if i >= 0]
 
         if not ent_word_indices:
@@ -304,7 +411,9 @@ def prepare_dataset(
         if not words:
             continue
         tokenized = tokenize_and_align_labels(
-            words, labels, tokenizer,
+            words,
+            labels,
+            tokenizer,
             max_length=max_length,
             label_all_tokens=label_all_tokens,
         )
@@ -318,7 +427,12 @@ def prepare_dataset(
 def compute_metrics_factory(id2label: Dict[int, str]):
     """Create a compute_metrics function for HuggingFace Trainer."""
     try:
-        from seqeval.metrics import f1_score, precision_score, recall_score, classification_report
+        from seqeval.metrics import (
+            f1_score,
+            precision_score,
+            recall_score,
+            classification_report,
+        )
     except ImportError:
         raise ImportError("seqeval is required: pip install seqeval")
 
@@ -363,6 +477,7 @@ def compute_metrics_factory(id2label: Dict[int, str]):
 
 class NERDataset:
     """Simple dataset wrapper for HuggingFace Trainer."""
+
     def __init__(self, data: List[Dict]):
         self.data = data
 
@@ -371,6 +486,7 @@ class NERDataset:
 
     def __getitem__(self, idx):
         import torch
+
         item = self.data[idx]
         return {
             "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
@@ -412,13 +528,20 @@ def train(args):
         id2label=ID2LABEL,
         label2id=LABEL2ID,
     )
-    print(f"[train_ner] Model loaded. Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(
+        f"[train_ner] Model loaded. Parameters: {sum(p.numel() for p in model.parameters()):,}"
+    )
 
     # ── Load data ────────────────────────────────────────────────────────
-    print(f"\n[train_ner] Loading gold data from: {args.ground_truth}")
-    gold_samples = load_gold_data(args.ground_truth)
-    print(f"[train_ner] Gold samples: {len(gold_samples)}")
+    # 1. VLSP2016 từ HuggingFace (gold, ~16k)
+    vlsp_samples = load_vlsp2016()
 
+    # 2. Local gold (nếu có file tự label thêm)
+    print(f"\n[train_ner] Loading local gold data from: {args.ground_truth}")
+    local_gold = load_gold_data(args.ground_truth)
+    print(f"[train_ner] Local gold samples: {len(local_gold)}")
+
+    # 3. Silver từ 150k bài báo
     silver_samples = []
     if not args.no_silver:
         print(f"\n[train_ner] Generating silver labels from: {args.data_csv}")
@@ -432,10 +555,17 @@ def train(args):
     else:
         print("[train_ner] Silver labels disabled (--no-silver)")
 
-    all_samples = gold_samples + silver_samples
+    # Mix: VLSP2016 × 3 + local_gold × 3 + silver × 1
+    # Oversample gold/VLSP vì quality cao hơn silver
+    gold_samples = vlsp_samples + local_gold
+    all_samples = gold_samples * 3 + silver_samples
     random.seed(args.seed)
     random.shuffle(all_samples)
-    print(f"\n[train_ner] Total samples: {len(all_samples)} (gold={len(gold_samples)}, silver={len(silver_samples)})")
+    print(
+        f"\n[train_ner] Mix: VLSP2016={len(vlsp_samples)}, local_gold={len(local_gold)}, "
+        f"silver={len(silver_samples)}"
+    )
+    print(f"[train_ner] Total after 3× oversample gold: {len(all_samples)} samples")
 
     if len(all_samples) < 5:
         print("[train_ner] ERROR: Not enough training data. Need at least 5 samples.")
@@ -444,7 +574,8 @@ def train(args):
     # ── Tokenize + align ─────────────────────────────────────────────────
     print("[train_ner] Tokenizing and aligning labels...")
     tokenized_data = prepare_dataset(
-        all_samples, tokenizer,
+        all_samples,
+        tokenizer,
         max_length=args.max_seq_length,
         label_all_tokens=True,
     )
@@ -495,7 +626,9 @@ def train(args):
 
     callbacks = []
     if args.early_stopping > 0:
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping))
+        callbacks.append(
+            EarlyStoppingCallback(early_stopping_patience=args.early_stopping)
+        )
 
     # ── Train ────────────────────────────────────────────────────────────
     trainer = Trainer(
@@ -576,19 +709,23 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--model-name", default="vinai/phobert-base-v2",
+        "--model-name",
+        default="vinai/phobert-base-v2",
         help="HuggingFace model ID for base model",
     )
     parser.add_argument(
-        "--ground-truth", default=str(ROOT_DIR / "data" / "ner_ground_truth.json"),
+        "--ground-truth",
+        default=str(ROOT_DIR / "data" / "ner_ground_truth.json"),
         help="Path to NER ground truth JSON",
     )
     parser.add_argument(
-        "--data-csv", default=str(ROOT_DIR / "data" / "vnexpress_articles.csv"),
+        "--data-csv",
+        default=str(ROOT_DIR / "data" / "vnexpress_articles.csv"),
         help="Path to news articles CSV for silver labels",
     )
     parser.add_argument(
-        "--output-dir", default=str(ROOT_DIR / "data" / "ner_model"),
+        "--output-dir",
+        default=str(ROOT_DIR / "data" / "ner_model"),
         help="Output directory for fine-tuned model",
     )
     parser.add_argument("--epochs", type=int, default=5)
@@ -597,14 +734,27 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--max-seq-length", type=int, default=256)
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--dev-split", type=float, default=0.1)
-    parser.add_argument("--early-stopping", type=int, default=2,
-                        help="Early stopping patience (0 to disable)")
-    parser.add_argument("--silver-count", type=int, default=10000,
-                        help="Number of articles for silver labeling")
-    parser.add_argument("--silver-confidence", type=float, default=0.85,
-                        help="Minimum confidence for silver labels")
-    parser.add_argument("--no-silver", action="store_true",
-                        help="Disable silver label generation")
+    parser.add_argument(
+        "--early-stopping",
+        type=int,
+        default=2,
+        help="Early stopping patience (0 to disable)",
+    )
+    parser.add_argument(
+        "--silver-count",
+        type=int,
+        default=10000,
+        help="Number of articles for silver labeling",
+    )
+    parser.add_argument(
+        "--silver-confidence",
+        type=float,
+        default=0.85,
+        help="Minimum confidence for silver labels",
+    )
+    parser.add_argument(
+        "--no-silver", action="store_true", help="Disable silver label generation"
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args(argv)
 
