@@ -62,7 +62,7 @@ def load_vlsp2016(max_samples: int = 999999) -> List[Dict]:
 
     print("[train_ner] Loading VLSP2016 from HuggingFace...")
     try:
-        ds = load_dataset("datnth1709/VLSP2016-NER-data", trust_remote_code=True)
+        ds = load_dataset("datnth1709/VLSP2016-NER-data")
     except Exception as e:
         print(f"[train_ner] Cannot load VLSP2016: {e}")
         return []
@@ -88,11 +88,33 @@ def load_vlsp2016(max_samples: int = 999999) -> List[Dict]:
             tokens = item.get("tokens") or item.get("words") or []
             ner_tags = item.get("ner_tags") or []
 
-            # ner_tags có thể là int (index) hoặc string
-            # Nếu là int, cần label_names để convert
+            # ner_tags có thể là:
+            # 1. List[str]: ["O", "B-PER", ...] → dùng thẳng
+            # 2. List[int]: [0, 1, 2, ...] → map qua label_names
             if ner_tags and isinstance(ner_tags[0], int):
-                label_names = ds[split].features["ner_tags"].feature.names
-                ner_tags = [label_names[t] for t in ner_tags]
+                try:
+                    feat = ds[split].features["ner_tags"]
+                    # Sequence(ClassLabel) → .feature.names
+                    label_names = feat.feature.names
+                except AttributeError:
+                    try:
+                        label_names = feat.names
+                    except AttributeError:
+                        # Fallback mapping cứng VLSP2016
+                        label_names = [
+                            "O",
+                            "B-PER",
+                            "I-PER",
+                            "B-ORG",
+                            "I-ORG",
+                            "B-LOC",
+                            "I-LOC",
+                            "B-MISC",
+                            "I-MISC",
+                        ]
+                ner_tags = [
+                    label_names[t] if t < len(label_names) else "O" for t in ner_tags
+                ]
 
             if not tokens or not ner_tags:
                 continue
