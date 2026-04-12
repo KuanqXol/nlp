@@ -1,376 +1,239 @@
-# Vietnamese KG-Enhanced News Search & RAG System
+# Vietnamese KG-Enhanced News Search
 
-Hệ thống tìm kiếm tin tức tiếng Việt kết hợp:
+Hệ thống tìm kiếm tin tức tiếng Việt kết hợp Knowledge Graph, FAISS vector search và cross-encoder reranking. Dữ liệu: 150k bài báo VnExpress (CSV).
 
-- Knowledge Graph
-- Personalized PageRank
-- Chunk-based retrieval
-- FAISS / NumPy vector search
-- BM25 + Reciprocal Rank Fusion
-- Cross-encoder reranking
-- PhoBERT-based Relation Extraction (optional / offline)
-- RAG summary
+## Kiến trúc
 
-Project hiện ưu tiên dữ liệu CSV thật từ VnExpress, nhưng `DataLoader` cũng hỗ trợ JSON array.
-
-## Kiến trúc hiện tại
-
-```text
-CSV / JSON news data
-        ↓
-DataLoader
-  - parse_vn_date()
-  - strip_author()
-  - dedup theo URL
-  - lang filter (viet_ratio)
-        ↓
-VietnameseNER
-  - underthesea mặc định
-  - HuggingFace nếu --use-model và load được
-  - ner_with_checkpoint() + ner_cache.json
-        ↓
-EntityLinker
-  - exact alias
-  - Levenshtein fuzzy match
-  - embedding match nếu có sentence-transformers
-        ↓
-RelationExtractor
-  - Rule-based mặc định
-  - Hybrid + PhoBERT nếu có checkpoint
-        ↓
-KnowledgeGraph + SimilarityGraphBuilder
-        ↓
-GraphRanker
-  - Global PageRank
-  - Query-time Personalized PageRank
-        ↓
-Chunking + EmbeddingManager
-        ↓
-Retriever
-  - FAISS mặc định nếu có
-  - NumPy fallback
-  - BM25 + RRF hybrid retrieval
-  - Cross-encoder rerank top-20 nếu model load được
-        ↓
-RAGPipeline
-  - Claude nếu có ANTHROPIC_API_KEY
-  - Template summary fallback
+```
+CSV / JSON
+    ↓
+DataLoader          parse ngày, dedup URL, lọc ngôn ngữ
+    ↓
+VietnameseNER       PhoBERT fine-tuned → PER / LOC / ORG
+    ↓
+EntityLinker        exact match → Levenshtein → embedding
+                    (dùng chung vietnamese-bi-encoder với FAISS)
+    ↓
+KnowledgeGraph      co-occurrence + relation edges, temporal, confidence filter
+SimilarityGraphBuilder  thêm edge dựa trên embedding similarity
+GraphRanker         Global PageRank (offline) + PPR query-time
+    ↓
+Chunking            sentence_window, ~400 ký tự, 1 câu overlap
+EmbeddingManager    vietnamese-bi-encoder (bkai-foundation-models)
+FAISS index         FlatIP ≤50k chunks | IVFFlat >50k chunks
+    ↓
+QueryProcessor      normalize → NER → entity link → intent detection
+QueryExpander       PPR-guided, 2-hop, relation-weighted, multi-query
+    ↓
+Retriever           FAISS top-50 → graph boost → cross-encoder rerank → date decay
+    ↓
+Kết quả: title + URL + snippet + score
 ```
 
-## Cấu trúc project
+## Cấu trúc thư mục
 
-```text
-news_kg_rag/
+```
+nlp/
+├── main.py                         entry point, NewsSearchSystem
+├── requirements.txt
 ├── data/
-│   ├── ner_ground_truth.json
-│   ├── relation_ground_truth.json
-│   ├── vnexpress_articles.csv
-│   └── index/
+│   ├── vnexpress_articles.csv      dữ liệu 150k bài (bạn cung cấp)
+│   ├── ner_model/                  PhoBERT NER sau khi fine-tune
+│   ├── reranker_model/             ViDeBERTa cross-encoder sau khi fine-tune
+│   └── index/                      index build xong (tự tạo khi chạy)
 │       ├── state.pkl
-│       ├── bm25.pkl
-│       └── knowledge_graph.pkl
+│       ├── knowledge_graph.pkl
+│       ├── vector.index            FAISS
+│       ├── ner_checkpoint.json     resume nếu bị ngắt
+│       └── ner_cache.json
 ├── scripts/
-│   ├── build_index.py
-│   ├── run_re_ablation.py
-│   └── train_phobert_re.py
-├── src/
-│   ├── data_loader.py
-│   ├── evaluation_nlp.py
-│   ├── evaluation_re.py
-│   ├── preprocessing/
-│   │   ├── ner.py
-│   │   ├── entity_linking.py
-│   │   ├── relation_extraction.py
-│   │   └── relation_extraction_phobert.py
-│   ├── graph/
-│   │   ├── knowledge_graph.py
-│   │   ├── ranking.py
-│   │   ├── similarity.py
-│   │   └── visualization.py
-│   ├── retrieval/
-│   │   ├── chunking.py
-│   │   ├── embedding.py
-│   │   ├── query_processor.py
-│   │   ├── query_expansion.py
-│   │   └── retriever.py
-│   └── rag/
-│       └── pipeline.py
-├── main.py
-├── test_system.py
-└── README.md
+│   ├── build_index.py              build index offline
+│   ├── train_ner.py                fine-tune PhoBERT NER
+│   ├── train_reranker.py           fine-tune ViDeBERTa cross-encoder
+│   └── evaluate_system.py          đánh giá toàn pipeline
+└── src/
+    ├── data_loader.py
+    ├── evaluation_nlp.py
+    ├── utils/
+    │   └── text.py                 split_sentences dùng chung NER + chunking
+    ├── preprocessing/
+    │   ├── ner.py                  PhoBERT NER + cache + checkpoint
+    │   └── entity_linking.py       3-stage linker, shared encoder
+    ├── graph/
+    │   ├── knowledge_graph.py      MultiDiGraph, temporal, confidence filter
+    │   ├── ranking.py              PageRank + PPR
+    │   ├── similarity.py           embedding-based edges
+    │   └── visualization.py        Pyvis export
+    └── retrieval/
+        ├── chunking.py             sentence_window
+        ├── embedding.py            VietnameseBiEncoder, EmbeddingManager
+        ├── query_processor.py      normalize, NER, intent detection
+        ├── query_expansion.py      multi-query, PPR-guided, relation-weighted
+        └── retriever.py            FAISS + graph boost + rerank + date decay
 ```
 
 ## Cài đặt
 
-### Core
-
 ```bash
 python -m venv venv
-source venv/bin/activate      # Linux / Mac
-# venv\Scripts\activate       # Windows
+source venv/bin/activate        # Linux/Mac
+# venv\Scripts\activate         # Windows
 
 pip install -r requirements.txt
 ```
 
-### Tùy chọn
+Yêu cầu Python 3.10+. GPU không bắt buộc để search (chỉ cần cho training).
+
+## Thứ tự chạy lần đầu
+
+### Bước 1 — Fine-tune NER (Kaggle GPU, ~45 phút)
+
+Upload `kaggle_train_ner.ipynb` lên Kaggle, thêm CSV, chạy. Download `ner_model.zip`, giải nén vào `data/ner_model/`.
+
+Nếu muốn bỏ qua bước này: hệ thống dùng `underthesea` làm fallback NER, chất lượng thấp hơn nhưng chạy được ngay.
+
+### Bước 2 — Fine-tune cross-encoder (Kaggle GPU, ~2-3 giờ)
+
+Upload `kaggle_train_reranker.ipynb` lên Kaggle, thêm CSV, chạy. Download `reranker_model.zip`, giải nén vào `data/reranker_model/`.
+
+Nếu muốn bỏ qua: hệ thống dùng `cross-encoder/ms-marco-MiniLM-L6-v2` (tiếng Anh) làm fallback.
+
+### Bước 3 — Build index (chạy 1 lần, ~1-8 giờ tùy phần cứng)
 
 ```bash
-# Nếu muốn Claude summary
-export ANTHROPIC_API_KEY="sk-ant-..."
+python scripts/build_index.py --data data/vnexpress_articles.csv
 ```
 
-## Dữ liệu đầu vào
+NER chạy qua 150k bài với checkpoint tự động — nếu bị ngắt thì chạy lại lệnh trên, hệ thống resume từ điểm dừng.
 
-### CSV
+### Bước 4 — Chạy demo
 
-CSV chuẩn hiện tại:
+```bash
+# Interactive
+python main.py --load-index
 
-```text
+# One-shot query
+python main.py --load-index --query "Samsung đầu tư Việt Nam"
+
+# Chỉ định NER và reranker model
+python main.py --load-index \
+    --ner-model-dir data/ner_model \
+    --reranker-dir data/reranker_model
+```
+
+## Định dạng dữ liệu đầu vào
+
+### CSV (VnExpress)
+
+```
 url,date,category,title,text
 ```
 
-Ví dụ:
-
 ```csv
-https://vnexpress.net/example.html,"Thứ sáu, 31/7/2020, 18:15 (GMT+7)",thế giới,Tiêu đề bài báo,"Nội dung bài báo..."
+https://vnexpress.net/bai-bao.html,"Thứ hai, 15/1/2024, 08:00 (GMT+7)",kinh-te,Tiêu đề,"Nội dung..."
 ```
 
-Khi load CSV, hệ thống sẽ tự:
-
-- parse ngày kiểu VnExpress sang `YYYY-MM-DD`
-- cắt dòng tác giả ở cuối bài bằng `strip_author()`
-- dedup theo URL
-- bỏ bài có tỷ lệ tiếng Việt quá thấp (`viet_ratio < 0.05`)
-- suy luận `source=VnExpress` từ URL nếu thiếu
+DataLoader tự parse ngày, dedup URL, lọc bài không phải tiếng Việt.
 
 ### JSON
-
-JSON cần là array các object:
 
 ```json
 [
   {
     "id": "doc_1",
-    "title": "Tiêu đề bài báo",
-    "content": "Nội dung bài báo",
+    "title": "Tiêu đề",
+    "content": "Nội dung",
     "date": "2024-01-15",
-    "source": "VnExpress",
     "url": "https://...",
-    "category": "thế giới"
+    "category": "kinh-te"
   }
 ]
 ```
 
-## Cách chạy
-
-### 1. Build offline index
-
-Khuyến nghị build một lần rồi load lại:
+## CLI
 
 ```bash
-python scripts/build_index.py
-python scripts/build_index.py --data data/vnexpress_articles.csv
-python scripts/build_index.py --data data/custom_news.json --index-dir data/index_custom
+python main.py [options]
 ```
 
-Sau bước này, state sẽ được lưu trong `data/index/` mặc định.
-Các artifact thường gặp:
+| Flag              | Mặc định                      | Mô tả                  |
+| ----------------- | ----------------------------- | ---------------------- |
+| `--query`, `-q`   | None                          | Chạy 1 query rồi thoát |
+| `--data`, `-d`    | `data/vnexpress_articles.csv` | Đường dẫn CSV/JSON     |
+| `--top-k`, `-k`   | 10                            | Số bài trả về          |
+| `--load-index`    | False                         | Load index từ disk     |
+| `--index-dir`     | `data/index`                  | Thư mục index          |
+| `--ner-model-dir` | `data/ner_model`              | Thư mục PhoBERT NER    |
+| `--reranker-dir`  | `data/reranker_model`         | Thư mục cross-encoder  |
+| `--viz`           | False                         | Xuất KG visualization  |
 
-- `state.pkl`: documents, chunks, embedding state
-- `knowledge_graph.pkl`: graph đã build
-- `bm25.pkl`: BM25 backend đã serialize
-- `vector.index`: FAISS index nếu môi trường có FAISS
-- `ner_cache.json`: cache text → entities
-- `ner_checkpoint.json`: tiến độ NER để resume nếu build bị ngắt
-- `ner_results.jsonl`: kết quả NER incremental
+## Lệnh trong interactive mode
 
-### 2. Search từ index đã build
+| Lệnh       | Chức năng                |
+| ---------- | ------------------------ |
+| `<query>`  | Tìm kiếm tin tức         |
+| `:kg`      | Thống kê Knowledge Graph |
+| `:top`     | Top entity theo PageRank |
+| `:suggest` | Gợi ý query từ KG        |
+| `:viz`     | Xuất KG ra file HTML     |
+| `:help`    | Hiển thị trợ giúp        |
+| `:quit`    | Thoát                    |
+
+## Models
+
+| Model                                          | Vai trò                          | Nguồn                                          |
+| ---------------------------------------------- | -------------------------------- | ---------------------------------------------- |
+| `vinai/phobert-base-v2`                        | NER backbone                     | VinAI, fine-tune trên VLSP2016 + silver data   |
+| `bkai-foundation-models/vietnamese-bi-encoder` | Embedding FAISS + entity linking | BKAI, dùng sẵn không cần train                 |
+| `Fsoft-AIC/videberta-base`                     | Cross-encoder reranker backbone  | Fsoft, fine-tune trên MMARCO-Vi + ViQuAD + báo |
+
+## Training data
+
+| Dataset                     | Dùng cho                | Link                                      |
+| --------------------------- | ----------------------- | ----------------------------------------- |
+| VLSP2016 NER                | Fine-tune PhoBERT NER   | `datnth1709/VLSP2016-NER-data`            |
+| 150k bài VnExpress (silver) | Mix vào NER training    | File CSV của bạn                          |
+| MMARCO-Vi                   | Fine-tune cross-encoder | `unicamp-dl/mmarco` (config `vietnamese`) |
+| UIT-ViQuAD 2.0              | Fine-tune cross-encoder | `taidng/UIT-ViQuAD2.0`                    |
+| 150k bài VnExpress (pseudo) | Fine-tune cross-encoder | File CSV của bạn                          |
+
+## Đánh giá
 
 ```bash
-python main.py --load-index
-python main.py --load-index --query "kinh tế việt nam" --no-llm
-python main.py --load-index --index-dir data/index_custom --query "WHO COVID-19"
-python main.py --load-index --use-phobert-re --phobert-dir data/phobert_re
+# Đánh giá toàn pipeline
+python scripts/evaluate_system.py --load-index
+
+# Chỉ đánh giá NER
+python scripts/evaluate_system.py --load-index --tasks ner
+
+# Đánh giá retrieval với qrels file
+python scripts/evaluate_system.py --load-index --tasks retrieval \
+    --retrieval-qrels data/qrels.json
+
+# Lưu kết quả
+python scripts/evaluate_system.py --load-index --output data/eval_results.json
 ```
 
-### 3. Rebuild trực tiếp từ raw data
+Metrics: Precision/Recall/F1 cho NER, Recall@K / MRR@K / NDCG@K cho retrieval.
 
-```bash
-python main.py
-python main.py --data data/vnexpress_articles.csv --query "chiến tranh nga ukraine"
-python main.py --data data/custom_news.json --query "Samsung Hà Nội"
-python main.py --data data/vnexpress_articles.csv --use-phobert-re --phobert-dir data/phobert_re
-```
+## Xử lý sự cố
 
-### 4. Deep Learning workflow cho PhoBERT RE
+**NER crash hoặc bị ngắt giữa chừng**
 
-Chuẩn bị supervised dataset nhỏ từ benchmark annotate tay:
+Chạy lại lệnh build y hệt, hệ thống tự resume từ `data/index/ner_checkpoint.json`.
 
-```bash
-python scripts/train_phobert_re.py --prepare-only
-```
+**Không có FAISS**
 
-Fine-tune PhoBERT RE khi có `torch` + `transformers` và GPU:
+Tự fallback về NumPy. Cài lại: `pip install faiss-cpu`.
 
-```bash
-python scripts/train_phobert_re.py --output-dir data/phobert_re
-```
+**Không có `data/ner_model/`**
 
-Script sẽ tự:
+Hệ thống dùng `underthesea` fallback. Train model: chạy `kaggle_train_ner.ipynb` trên Kaggle GPU.
 
-- tách `relation_ground_truth.json` thành holdout `benchmark_train.json` và `benchmark_test.json`
-- build `re_train_supervised.jsonl` từ phần train
-- fine-tune PhoBERT RE
-- lưu `training_summary.json`, `train_metrics.json`, `test_metrics.json`, `test_ablation.json`
+**Không có `data/reranker_model/`**
 
-Chạy ablation giữa `rule_based`, `hybrid` và `phobert`:
+Hệ thống dùng `cross-encoder/ms-marco-MiniLM-L6-v2` fallback. Train model: chạy `kaggle_train_reranker.ipynb`.
 
-```bash
-python scripts/run_re_ablation.py --ground-truth data/relation_ground_truth.json --phobert-dir data/phobert_re
-python -m src.evaluation_nlp --ground-truth data/ner_ground_truth.json
-```
+**Build index lần đầu rất chậm**
 
-## CLI options
-
-| Flag | Default | Ý nghĩa |
-| --- | --- | --- |
-| `--query`, `-q` | `None` | Chạy một query rồi thoát |
-| `--data`, `-d` | `data/vnexpress_articles.csv` | Đường dẫn raw dataset CSV/JSON |
-| `--top-k`, `-k` | `7` | Số bài báo trả về |
-| `--hops` | `2` | Số hop query expansion |
-| `--use-model` | `False` | Thử dùng HuggingFace NER / SBERT |
-| `--no-llm` | `False` | Tắt Claude summary |
-| `--viz` | `False` | Xuất KG visualization |
-| `--load-index` | `False` | Load index từ disk thay vì rebuild |
-| `--index-dir` | `data/index` | Thư mục chứa `state.pkl` và `knowledge_graph.pkl` |
-| `--use-phobert-re` | `False` | Bật Hybrid Relation Extractor với PhoBERT nếu có model |
-| `--phobert-dir` | `data/phobert_re` | Thư mục model PhoBERT RE đã fine-tune |
-
-## Interactive commands
-
-| Lệnh | Chức năng |
-| --- | --- |
-| `<query>` | Tìm kiếm tin tức |
-| `:kg` | Thống kê Knowledge Graph |
-| `:top` | Top entity quan trọng nhất |
-| `:viz` | Xuất KG ra file HTML/PNG |
-| `:help` | Hướng dẫn |
-| `:quit` | Thoát |
-
-## Mô tả nhanh các module
-
-### `src/data_loader.py`
-
-- `load_json()` và `load_csv()`
-- `parse_vn_date()`
-- `strip_author()`
-- dedup URL + language filter
-
-### `src/preprocessing/ner.py`
-
-- `underthesea` là backend mặc định hiện tại
-- nếu `--use-model` và model load được, có thể dùng HuggingFace
-- có `ner_with_checkpoint()` để resume batch lớn
-- cache NER được persist ra `ner_cache.json`
-- fallback cuối là rule-based
-
-### `src/preprocessing/entity_linking.py`
-
-- alias map
-- Levenshtein fuzzy match cho typo ngắn
-- embedding match nếu có `sentence-transformers`
-
-### `src/preprocessing/relation_extraction_phobert.py`
-
-- `DistantSupervisionBuilder`: tạo dữ liệu train từ corpus + Wikidata
-- `PhoBERTRelationExtractor.train()`: fine-tune classifier head
-- lưu `re_config.json`, `train_metrics.json`, `trainer_log_history.json`, `training_summary.json`
-- script train sẽ lưu thêm `benchmark_split_manifest.json`, `benchmark_test.json`, `test_metrics.json`, `test_ablation.json`
-- `HybridRelationExtractor`: ghép rule-based và PhoBERT
-
-### `src/evaluation_*.py`
-
-- `evaluation_nlp.py`: đánh giá NER trên `data/ner_ground_truth.json`
-- `evaluation_re.py`: đánh giá RE và chạy ablation `rule_based vs hybrid vs phobert`
-
-### `src/graph/*`
-
-- `knowledge_graph.py`: `MultiDiGraph`, temporal edges, confidence filtering
-- `ranking.py`: global PR + PPR
-- `similarity.py`: thêm `similar_to` edges bằng embedding
-- `visualization.py`: Pyvis / Matplotlib
-
-### `src/retrieval/*`
-
-- `chunking.py`: sentence-window chunking
-- `embedding.py`: SBERT hoặc TF-IDF fallback
-- `retriever.py`: FAISS mặc định nếu có, BM25 + RRF, cross-encoder rerank top-20
-- `query_expansion.py`: relation-aware expansion + multi-query support
-
-### `src/rag/pipeline.py`
-
-- build context từ top documents
-- context hiện lấy tối đa `800` ký tự mỗi bài
-- Claude nếu có API key, nếu không dùng template summary
-
-## Test
-
-```bash
-python test_system.py
-```
-
-`test_system.py` hiện dùng fixture CSV nhỏ tự tạo trong thư mục tạm, nên không phụ thuộc vào file dữ liệu lớn trong `data/`.
-Smoke test cũng cover:
-
-- benchmark RE annotate tay
-- `scripts/train_phobert_re.py --prepare-only`
-- `scripts/run_re_ablation.py`
-
-## Lưu ý thực tế
-
-- FAISS được bật mặc định trong `main.py`, nhưng nếu import FAISS thất bại hệ thống sẽ tự rơi về NumPy backend.
-- Nếu có FAISS, index sẽ được lưu thêm ra `vector.index`; nếu không có thì hệ thống vẫn load lại từ embedding state.
-- BM25 luôn được serialize ra `bm25.pkl` để `--load-index` không phải rebuild lexical backend.
-- Cross-encoder được bật mặc định trong `Retriever`, và sẽ rerank top-20 candidates; nếu `sentence-transformers` hoặc model không load được thì hệ thống tự fallback.
-- `--use-phobert-re` sẽ dùng `HybridRelationExtractor`; nếu thiếu model/GPU thì tự fallback về rule-based extractor.
-- benchmark DL trong repo là nhỏ và phục vụ mục đích smoke test / demo workflow; muốn chất lượng tốt cần build thêm training data từ distant supervision hoặc annotate nhiều hơn.
-- checkpoint `data/phobert_re` hiện có thể train được ngay trên máy đã cache model, nhưng kết quả holdout còn thấp nếu chỉ dùng benchmark nhỏ.
-- Build dài có thể resume nhờ `ner_checkpoint.json` và `ner_results.jsonl`.
-- `--use-model` là “best effort”: nếu HuggingFace model không tải được, hệ thống vẫn fallback về backend sẵn có.
-
-## Troubleshooting
-
-### Không load được index
-
-```bash
-python main.py --load-index
-```
-
-Nếu báo thiếu file, hãy build lại:
-
-```bash
-python scripts/build_index.py
-```
-
-Nếu muốn resume NER batch dài sau khi bị ngắt, giữ nguyên `--index-dir` cũ để hệ thống dùng lại `ner_checkpoint.json` và `ner_cache.json`.
-
-### Không có FAISS
-
-- Hệ thống tự dùng NumPy
-- Nếu muốn ép FAISS, cài lại dependency phù hợp môi trường
-
-### Không có `sentence-transformers`
-
-- embedding fallback về TF-IDF
-- entity linking embedding match và cross-encoder rerank sẽ tự giảm cấp
-
-### Chưa có checkpoint PhoBERT RE
-
-- `scripts/run_re_ablation.py` sẽ tự skip phần `phobert`
-- `--use-phobert-re` trong `main.py` vẫn chạy được nhờ `HybridRelationExtractor` fallback về rule-based
-- để train model thật, cần `torch`, `transformers`, và tốt nhất là GPU
-
-### Không có `ANTHROPIC_API_KEY`
-
-- hệ thống vẫn chạy bình thường
-- phần summary sẽ dùng template thay vì LLM
+NER trên CPU mất 5-8 giờ cho 150k bài. Dùng GPU hoặc chạy trên Kaggle. Sau khi build xong dùng `--load-index` thì gần như instantaneous.
