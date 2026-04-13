@@ -369,6 +369,47 @@ def sentence_to_bio(sentence: str, entities: List[Dict]) -> Tuple[List[str], Lis
 # ── Dataset class for HuggingFace Trainer ────────────────────────────────────
 
 
+def _get_word_ids_manual(tokenizer, words: List[str], input_ids: List[int]) -> List:
+    """Tự tính word_ids khi tokenizer không có .word_ids() (slow tokenizer như PhoBERT).
+
+    Cách: encode từng word riêng → biết mỗi word tạo ra bao nhiêu sub-token
+    → gán word_id cho từng position trong input_ids.
+    Special tokens (CLS, SEP, PAD) → None.
+    """
+    special_ids = {
+        tokenizer.cls_token_id,
+        tokenizer.sep_token_id,
+        tokenizer.pad_token_id,
+        tokenizer.unk_token_id,
+    } - {None}
+
+    # Encode từng word riêng, đếm số sub-token
+    word_token_counts = []
+    for word in words:
+        ids = tokenizer.encode(word, add_special_tokens=False)
+        word_token_counts.append(max(len(ids), 1))
+
+    # Build word_ids list song song với input_ids
+    word_ids = []
+    word_idx = 0
+    tokens_in_current_word = 0
+
+    for tok_id in input_ids:
+        if tok_id in special_ids:
+            word_ids.append(None)
+        else:
+            if word_idx < len(word_token_counts):
+                word_ids.append(word_idx)
+                tokens_in_current_word += 1
+                if tokens_in_current_word >= word_token_counts[word_idx]:
+                    word_idx += 1
+                    tokens_in_current_word = 0
+            else:
+                word_ids.append(None)
+
+    return word_ids
+
+
 def tokenize_and_align_labels(
     words: List[str],
     labels: List[str],
@@ -376,12 +417,15 @@ def tokenize_and_align_labels(
     max_length: int = 256,
     label_all_tokens: bool = False,
 ) -> Dict:
-    """Tokenize words and align BIO labels to sub-tokens.
+    """Tokenize words và align BIO labels về sub-token level.
+
+    Hỗ trợ cả fast tokenizer (có .word_ids()) lẫn slow tokenizer (PhoBERT).
+    PhoBERT dùng slow tokenizer nên không có .word_ids() → tự tính thủ công.
 
     Strategy:
-      - First sub-token of each word → word's label
-      - Subsequent sub-tokens → I- label (if label_all_tokens) or -100 (ignore)
-      - Special tokens ([CLS], [SEP], padding) → -100
+      - First sub-token của mỗi word → label của word đó
+      - Sub-token tiếp theo → I- label (label_all_tokens=True) hoặc -100
+      - Special tokens (CLS, SEP, PAD) → -100
     """
     tokenized = tokenizer(
         words,
@@ -392,23 +436,24 @@ def tokenize_and_align_labels(
         return_tensors=None,
     )
 
-    word_ids = tokenized.word_ids()
+    # Thử .word_ids() (fast tokenizer), fallback về manual (slow tokenizer / PhoBERT)
+    try:
+        word_ids = tokenized.word_ids()
+    except (ValueError, AttributeError):
+        word_ids = _get_word_ids_manual(tokenizer, words, tokenized["input_ids"])
+
     aligned_labels = []
     prev_word_id = None
 
     for word_id in word_ids:
         if word_id is None:
-            # Special token
             aligned_labels.append(-100)
         elif word_id != prev_word_id:
-            # First sub-token of a word
             label_str = labels[word_id] if word_id < len(labels) else "O"
             aligned_labels.append(LABEL2ID.get(label_str, 0))
         else:
-            # Continuation sub-token
             if label_all_tokens:
                 label_str = labels[word_id] if word_id < len(labels) else "O"
-                # Convert B- to I- for continuation
                 if label_str.startswith("B-"):
                     label_str = "I-" + label_str[2:]
                 aligned_labels.append(LABEL2ID.get(label_str, 0))
