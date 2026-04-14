@@ -234,23 +234,69 @@ def load_gold_data(path: str | Path) -> List[Dict]:
 
 
 def load_news_articles(csv_path: str | Path, max_articles: int = 10000) -> List[str]:
-    """Load raw text from vnexpress_articles.csv for silver labeling."""
-    texts = []
+    """Load raw text từ CSV, stratified theo category để đảm bảo đa dạng chủ đề.
+
+    Thay vì lấy tuần tự (dễ bị lệch nếu CSV sắp xếp theo category),
+    hàm này nhóm bài theo category rồi lấy 10% mỗi category.
+    Category không xác định được gom vào "unknown".
+    """
     path = Path(csv_path)
     if not path.exists():
         print(f"[train_ner] CSV not found: {path}")
-        return texts
+        return []
 
+    # Gom tất cả bài theo category
+    by_category: Dict[str, List[str]] = {}
     with open(path, encoding="utf-8-sig", errors="replace") as f:
         reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if i >= max_articles * 3:  # read more, filter later
-                break
+        for row in reader:
             text = (row.get("text") or "").strip()
-            if len(text) > 50:
-                texts.append(text)
-    random.shuffle(texts)
-    return texts[:max_articles]
+            if len(text) <= 50:
+                continue
+            cat = (row.get("category") or "unknown").strip().lower() or "unknown"
+            by_category.setdefault(cat, []).append(text)
+
+    # Thống kê phân phối
+    total_available = sum(len(v) for v in by_category.values())
+    print(f"[train_ner] CSV: {total_available} bai, {len(by_category)} category:")
+    for cat, articles in sorted(by_category.items(), key=lambda x: -len(x[1]))[:10]:
+        print(f"  {cat}: {len(articles)}")
+    if len(by_category) > 10:
+        print(f"  ... ({len(by_category)-10} category khac)")
+
+    # Stratified sampling: lấy tỉ lệ đều từ mỗi category
+    sampled: List[str] = []
+    for cat, articles in by_category.items():
+        # Số bài lấy từ category này = tỉ lệ category × max_articles
+        n = max(1, round(len(articles) / total_available * max_articles))
+        random.shuffle(articles)
+        sampled.extend(articles[:n])
+
+    # Shuffle lại sau khi gom để tránh cluster theo category
+    random.shuffle(sampled)
+
+    # Trim hoặc bổ sung nếu lệch so với max_articles
+    if len(sampled) > max_articles:
+        sampled = sampled[:max_articles]
+    elif len(sampled) < max_articles and total_available > len(sampled):
+        # Lấy thêm từ category lớn nhất nếu thiếu
+        extra = []
+        for articles in sorted(by_category.values(), key=len, reverse=True):
+            for a in articles:
+                if a not in set(sampled):
+                    extra.append(a)
+                    if len(sampled) + len(extra) >= max_articles:
+                        break
+            if len(sampled) + len(extra) >= max_articles:
+                break
+        sampled.extend(extra)
+        sampled = sampled[:max_articles]
+        random.shuffle(sampled)
+
+    print(
+        f"[train_ner] Stratified sample: {len(sampled)} bai tu {len(by_category)} category"
+    )
+    return sampled
 
 
 def _split_sentences(text: str) -> List[str]:
