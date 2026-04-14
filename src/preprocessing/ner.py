@@ -1,4 +1,6 @@
 """
+ner.py
+──────
 NER tiếng Việt dùng PhoBERT fine-tuned (vinai/phobert-base-v2).
 
 Yêu cầu:
@@ -27,9 +29,6 @@ import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional
 
-# Dùng shared sentence splitter — nhất quán với chunking.py
-from src.utils.text import split_sentences_spans as _split_sentences
-
 try:
     from transformers import AutoModelForTokenClassification, AutoTokenizer
     import torch
@@ -48,8 +47,28 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-# _split_sentences được import từ src.utils.text (split_sentences_spans)
-# Xem: from src.utils.text import split_sentences_spans as _split_sentences
+def _split_sentences(text: str) -> List[Dict]:
+    spans = []
+    for i, m in enumerate(re.finditer(r"[^.!?]+[.!?]?", text, flags=re.UNICODE)):
+        sent = m.group().strip()
+        if not sent:
+            continue
+        start = m.start()
+        while start < len(text) and text[start].isspace():
+            start += 1
+        spans.append(
+            {"sentence_id": i, "text": sent, "start": start, "end": start + len(sent)}
+        )
+    if not spans and text.strip():
+        spans.append(
+            {
+                "sentence_id": 0,
+                "text": text.strip(),
+                "start": 0,
+                "end": len(text.strip()),
+            }
+        )
+    return spans
 
 
 def _make_entity(text, ent_type, start, end, sentence_id, score) -> Dict:
@@ -102,7 +121,49 @@ class _PhoBERTNERBackend:
         self._model = AutoModelForTokenClassification.from_pretrained(self.model_dir)
         self._model.to(self._device)
         self._model.eval()
+
+        # Load VnCoreNLP word segmenter — bắt buộc để đồng nhất với pretraining
+        # PhoBERT được pretrain trên text đã segment: "Hà_Nội", "Việt_Nam"
+        self._segmenter = None
+        try:
+            import py_vncorenlp
+            from pathlib import Path as _Path
+
+            save_dir = str(_Path(self.model_dir).parents[1] / "vncorenlp")
+            _Path(save_dir).mkdir(parents=True, exist_ok=True)
+            try:
+                import os as _os
+
+                _os.makedirs(save_dir, exist_ok=True)
+                py_vncorenlp.download_model(save_dir=save_dir)
+            except Exception:
+                pass
+            self._segmenter = py_vncorenlp.VnCoreNLP(
+                annotators=["wseg"], save_dir=save_dir
+            )
+            print("[NER/PhoBERT] VnCoreNLP word segmenter ready.")
+        except Exception as e:
+            print(f"[NER/PhoBERT] WARNING: VnCoreNLP unavailable ({e}).")
+            print(
+                "[NER/PhoBERT] Falling back to whitespace split — NER quality will be lower."
+            )
+            print("[NER/PhoBERT] Install: pip install py_vncorenlp")
+
         print("[NER/PhoBERT] Sẵn sàng.")
+
+    def _segment(self, text: str) -> str:
+        """Word-segment: 'Hà Nội' → 'Hà_Nội'. Fallback: trả nguyên text."""
+        if self._segmenter is None:
+            return text
+        try:
+            result = self._segmenter.word_segment(text)
+            return " ".join(result) if isinstance(result, list) else str(result)
+        except Exception:
+            return text
+
+    def _desegment_entity(self, seg_text: str) -> str:
+        """Khôi phục entity text về dạng gốc: 'Hà_Nội' → 'Hà Nội'."""
+        return seg_text.replace("_", " ")
 
     def annotate(self, text: str) -> List[Dict]:
         self._load()
@@ -114,19 +175,23 @@ class _PhoBERTNERBackend:
 
         for batch_start in range(0, len(sentences), self.batch_size):
             batch = sentences[batch_start : batch_start + self.batch_size]
+            # Segment từng câu trước khi đưa vào PhoBERT
+            segmented_texts = [self._segment(s["text"]) for s in batch]
             for sent_info, sent_ents in zip(
-                batch, self._predict_batch([s["text"] for s in batch])
+                batch, self._predict_batch(segmented_texts)
             ):
                 for ent in sent_ents:
-                    local_start = sent_info["text"].find(ent["text"])
+                    # Khôi phục về dạng gốc (bỏ underscore) để map lại vị trí
+                    orig_ent_text = self._desegment_entity(ent["text"])
+                    local_start = sent_info["text"].find(orig_ent_text)
                     if local_start >= 0:
                         gs = sent_info["start"] + local_start
-                        ge = gs + len(ent["text"])
+                        ge = gs + len(orig_ent_text)
                     else:
                         gs = ge = -1
                     all_entities.append(
                         _make_entity(
-                            ent["text"],
+                            orig_ent_text,
                             ent["type"],
                             gs,
                             ge,
@@ -145,6 +210,8 @@ class _PhoBERTNERBackend:
         return unique
 
     def _predict_batch(self, texts: List[str]) -> List[List[Dict]]:
+        # texts đã được segment: "Hà_Nội là thủ_đô Việt_Nam"
+        # split() cho ra ["Hà_Nội", "là", "thủ_đô", "Việt_Nam"]
         results = []
         for text in texts:
             words = text.split()

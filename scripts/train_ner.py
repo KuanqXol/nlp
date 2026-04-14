@@ -35,6 +35,57 @@ import numpy as np
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
+# ── Word segmentation (VnCoreNLP RDRSegmenter) ───────────────────────────────
+# PhoBERT được pretrain trên text đã word-segment: "Hà_Nội", "Việt_Nam"
+# Không segment → model nhận "Hà Nội" thành 2 token riêng → NER sai hoàn toàn.
+
+_SEGMENTER = None
+
+
+def get_segmenter():
+    """Load VnCoreNLP RDRSegmenter một lần, cache lại."""
+    global _SEGMENTER
+    if _SEGMENTER is not None:
+        return _SEGMENTER
+    try:
+        import py_vncorenlp
+
+        # Download model nếu chưa có
+        save_dir = str(ROOT_DIR / "data" / "vncorenlp")
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        try:
+            import os as _os
+
+            _os.makedirs(save_dir, exist_ok=True)
+            py_vncorenlp.download_model(save_dir=save_dir)
+        except Exception:
+            pass  # đã có rồi
+        _SEGMENTER = py_vncorenlp.VnCoreNLP(annotators=["wseg"], save_dir=save_dir)
+        print("[Segmenter] VnCoreNLP RDRSegmenter ready.")
+    except Exception as e:
+        print(
+            f"[Segmenter] VnCoreNLP unavailable ({e}), falling back to whitespace split."
+        )
+        _SEGMENTER = None
+    return _SEGMENTER
+
+
+def word_segment(text: str) -> str:
+    """Tách từ tiếng Việt: 'Hà Nội' → 'Hà_Nội'.
+
+    Nếu không có VnCoreNLP, fallback về whitespace (chất lượng thấp hơn).
+    """
+    seg = get_segmenter()
+    if seg is None:
+        return text
+    try:
+        results = seg.word_segment(text)
+        # VnCoreNLP trả về list[str], mỗi string là 1 câu đã segment
+        return " ".join(results) if isinstance(results, list) else str(results)
+    except Exception:
+        return text
+
+
 # ── Label schema ─────────────────────────────────────────────────────────────
 
 LABEL_LIST = ["O", "B-PER", "I-PER", "B-LOC", "I-LOC", "B-ORG", "I-ORG"]
@@ -145,8 +196,14 @@ def load_vlsp2016(max_samples: int = 999999) -> List[Dict]:
                     i += 1
 
             if sentence and entities:
+                # Word-segment để đồng nhất với PhoBERT pretraining format
+                segmented = word_segment(sentence)
+                seg_ents = [
+                    {"text": word_segment(e["text"]), "type": e["type"]}
+                    for e in entities
+                ]
                 samples.append(
-                    {"sentence": sentence, "entities": entities, "source": "vlsp2016"}
+                    {"sentence": segmented, "entities": seg_ents, "source": "vlsp2016"}
                 )
 
         if len(samples) >= max_samples:
@@ -283,12 +340,17 @@ def generate_silver_labels(
 
             # Only keep sentences where ALL entities meet confidence threshold
             if entities and all_high_conf:
+                # Word-segment câu để đồng nhất với PhoBERT pretraining
+                segmented_sent = word_segment(sent)
+                # Entity text cũng cần segment để match được trong segmented sentence
+                seg_entities = []
+                for e in entities:
+                    seg_text = word_segment(e["text"])
+                    seg_entities.append({"text": seg_text, "type": e["type"]})
                 silver.append(
                     {
-                        "sentence": sent,
-                        "entities": [
-                            {"text": e["text"], "type": e["type"]} for e in entities
-                        ],
+                        "sentence": segmented_sent,
+                        "entities": seg_entities,
                         "source": "silver",
                     }
                 )
@@ -637,33 +699,54 @@ def train(args):
     else:
         print("[train_ner] Silver labels disabled (--no-silver)")
 
-    # Mix: VLSP2016 × 3 + local_gold × 3 + silver × 1
-    # Oversample gold/VLSP vì quality cao hơn silver
+    # ── Curriculum training ──────────────────────────────────────────────
+    # Phase 1 (gold_epochs epoch đầu): chỉ VLSP2016 + local_gold
+    #   → model học pattern NER sạch trước khi thấy nhiễu từ silver
+    # Phase 2 (epochs còn lại): gold × 3 + silver (50% silver, confidence cao hơn)
+    #   → mở rộng vocabulary entity domain báo chí, LR thấp hơn để không overwrite
     gold_samples = vlsp_samples + local_gold
-    all_samples = gold_samples * 3 + silver_samples
-    random.seed(args.seed)
-    random.shuffle(all_samples)
-    print(
-        f"\n[train_ner] Mix: VLSP2016={len(vlsp_samples)}, local_gold={len(local_gold)}, "
-        f"silver={len(silver_samples)}"
-    )
-    print(f"[train_ner] Total after 3× oversample gold: {len(all_samples)} samples")
 
-    if len(all_samples) < 5:
-        print("[train_ner] ERROR: Not enough training data. Need at least 5 samples.")
+    if not gold_samples:
+        print("[train_ner] ERROR: Không có gold data. Cần ít nhất VLSP2016.")
         return
 
-    # ── Split train/dev ──────────────────────────────────────────────────
-    # Lazy tokenize: không pre-tokenize hết vào RAM, tokenize từng sample khi cần
-    dev_size = max(1, int(len(all_samples) * args.dev_split))
-    dev_samples = all_samples[:dev_size]
-    train_samples = all_samples[dev_size:]
-    print(f"[train_ner] Train: {len(train_samples)}, Dev: {len(dev_samples)}")
+    random.seed(args.seed)
 
-    train_dataset = NERDataset(train_samples, tokenizer, max_length=args.max_seq_length)
-    dev_dataset = NERDataset(dev_samples, tokenizer, max_length=args.max_seq_length)
+    # Dev set lấy từ gold để evaluation không bị ảnh hưởng bởi silver noise
+    dev_size = max(1, int(len(gold_samples) * args.dev_split))
+    random.shuffle(gold_samples)
+    dev_samples = gold_samples[:dev_size]
+    gold_train = gold_samples[dev_size:]
 
-    # ── Training arguments ───────────────────────────────────────────────
+    # Phase 1: gold × 3
+    phase1_samples = gold_train * 3
+    random.shuffle(phase1_samples)
+
+    # Phase 2: gold × 3 + silver (chỉ lấy 50% silver để giảm noise thêm)
+    silver_trimmed = (
+        random.sample(silver_samples, len(silver_samples) // 2)
+        if silver_samples
+        else []
+    )
+    phase2_samples = gold_train * 3 + silver_trimmed
+    random.shuffle(phase2_samples)
+
+    mix_epochs = args.epochs - args.gold_epochs
+
+    print(f"\n[train_ner] Curriculum setup:")
+    print(
+        f"  Phase 1 — gold only:    {args.gold_epochs} epochs × {len(phase1_samples)} samples"
+    )
+    print(
+        f"  Phase 2 — gold+silver:  {mix_epochs} epochs × {len(phase2_samples)} samples"
+    )
+    print(f"  Dev (gold only):        {len(dev_samples)} samples")
+    print(f"  Silver dùng: {len(silver_trimmed)}/{len(silver_samples)} (50%)")
+
+    if len(phase1_samples) < 5:
+        print("[train_ner] ERROR: Not enough training data.")
+        return
+
     effective_batch = args.batch_size
     grad_accum = 1
     if device == "cpu" and args.batch_size > 4:
@@ -671,17 +754,28 @@ def train(args):
         effective_batch = 4
         print(f"[train_ner] CPU mode: batch={effective_batch}, grad_accum={grad_accum}")
 
-    warmup_steps = int(len(train_samples) / effective_batch * args.epochs * 0.1)
+    compute_metrics = compute_metrics_factory(ID2LABEL)
+    dev_dataset = NERDataset(dev_samples, tokenizer, max_length=args.max_seq_length)
 
-    training_args = TrainingArguments(
-        output_dir=str(output_dir / "checkpoints"),
-        num_train_epochs=args.epochs,
+    t0 = time.time()
+
+    # ── Phase 1: gold only ────────────────────────────────────────────────
+    print(f"\n{'='*56}")
+    print(
+        f"  Phase 1: Gold only — {args.gold_epochs} epochs, LR={args.learning_rate:.0e}"
+    )
+    print(f"{'='*56}")
+
+    warmup_p1 = int(len(phase1_samples) / effective_batch * args.gold_epochs * 0.1)
+    p1_args = TrainingArguments(
+        output_dir=str(output_dir / "checkpoints_p1"),
+        num_train_epochs=args.gold_epochs,
         per_device_train_batch_size=effective_batch,
         per_device_eval_batch_size=effective_batch * 2,
         gradient_accumulation_steps=grad_accum,
         learning_rate=args.learning_rate,
         weight_decay=0.01,
-        warmup_steps=warmup_steps,
+        warmup_steps=warmup_p1,
         label_smoothing_factor=args.label_smoothing,
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -694,67 +788,97 @@ def train(args):
         report_to="none",
         seed=args.seed,
     )
-
-    compute_metrics = compute_metrics_factory(ID2LABEL)
-
-    callbacks = []
-    if args.early_stopping > 0:
-        callbacks.append(
-            EarlyStoppingCallback(early_stopping_patience=args.early_stopping)
-        )
-
-    # ── Train ────────────────────────────────────────────────────────────
     trainer = Trainer(
         model=model,
-        args=training_args,
-        train_dataset=train_dataset,
+        args=p1_args,
+        train_dataset=NERDataset(
+            phase1_samples, tokenizer, max_length=args.max_seq_length
+        ),
         eval_dataset=dev_dataset,
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=callbacks,
+        callbacks=(
+            [EarlyStoppingCallback(args.early_stopping)]
+            if args.early_stopping > 0
+            else []
+        ),
     )
-
-    print(f"\n[train_ner] Starting training...")
-    print(f"  Model:          {model_name}")
-    print(f"  Labels:         {LABEL_LIST}")
-    print(f"  Epochs:         {args.epochs}")
-    print(f"  Batch size:     {effective_batch} (grad_accum={grad_accum})")
-    print(f"  Learning rate:  {args.learning_rate}")
-    print(f"  Label smooth:   {args.label_smoothing}")
-    print(f"  Max seq length: {args.max_seq_length}")
-    print(f"  Warmup steps:   {warmup_steps}")
-    print(f"  Device:         {device}")
-    print()
-
-    t0 = time.time()
     trainer.train()
-    elapsed = time.time() - t0
-    print(f"\n[train_ner] Training completed in {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    p1_result = trainer.evaluate()
+    print(f"  Phase 1 done — F1: {p1_result.get('eval_f1', 0):.4f}")
 
-    # ── Evaluate ─────────────────────────────────────────────────────────
-    print("\n[train_ner] Final evaluation on dev set:")
+    # ── Phase 2: gold + silver (nếu có) ──────────────────────────────────
+    if mix_epochs > 0 and phase2_samples:
+        phase2_lr = (
+            args.learning_rate * 0.3
+        )  # LR thấp hơn để không overwrite gold knowledge
+        warmup_p2 = int(len(phase2_samples) / effective_batch * mix_epochs * 0.05)
+
+        print(f"\n{'='*56}")
+        print(f"  Phase 2: Gold+Silver — {mix_epochs} epochs, LR={phase2_lr:.0e}")
+        print(f"{'='*56}")
+
+        p2_args = TrainingArguments(
+            output_dir=str(output_dir / "checkpoints_p2"),
+            num_train_epochs=mix_epochs,
+            per_device_train_batch_size=effective_batch,
+            per_device_eval_batch_size=effective_batch * 2,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=phase2_lr,
+            weight_decay=0.01,
+            warmup_steps=warmup_p2,
+            label_smoothing_factor=args.label_smoothing,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            logging_steps=50,
+            save_total_limit=2,
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
+            greater_is_better=True,
+            fp16=(device == "cuda"),
+            report_to="none",
+            seed=args.seed,
+        )
+        trainer = Trainer(
+            model=model,
+            args=p2_args,
+            train_dataset=NERDataset(
+                phase2_samples, tokenizer, max_length=args.max_seq_length
+            ),
+            eval_dataset=dev_dataset,
+            processing_class=tokenizer,
+            compute_metrics=compute_metrics,
+        )
+        trainer.train()
+
+    elapsed = time.time() - t0
+    print(f"\n[train_ner] Total time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+
+    # ── Final evaluation ──────────────────────────────────────────────────
+    print("\n[train_ner] Final evaluation:")
     eval_result = trainer.evaluate()
     for key, value in sorted(eval_result.items()):
         if isinstance(value, float):
             print(f"  {key}: {value:.4f}")
 
-    # ── Save model ───────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────
     final_dir = output_dir
-    print(f"\n[train_ner] Saving model to: {final_dir}")
+    print(f"\n[train_ner] Saving to: {final_dir}")
     trainer.save_model(str(final_dir))
     tokenizer.save_pretrained(str(final_dir))
 
-    # Save training metadata
     metadata = {
         "model_name": model_name,
         "labels": LABEL_LIST,
         "num_labels": NUM_LABELS,
         "gold_samples": len(gold_samples),
         "silver_samples": len(silver_samples),
-        "total_samples": len(all_samples),
-        "train_size": len(train_samples),
+        "silver_used": len(silver_trimmed),
+        "phase1_samples": len(phase1_samples),
+        "phase2_samples": len(phase2_samples),
         "dev_size": len(dev_samples),
-        "epochs": args.epochs,
+        "gold_epochs": args.gold_epochs,
+        "total_epochs": args.epochs,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "max_seq_length": args.max_seq_length,
@@ -801,7 +925,16 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         default=str(ROOT_DIR / "data" / "ner_model"),
         help="Output directory for fine-tuned model",
     )
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument(
+        "--epochs", type=int, default=10, help="Tổng số epoch (phase1 + phase2)"
+    )
+    parser.add_argument(
+        "--gold-epochs",
+        type=int,
+        default=2,
+        help="Số epoch Phase 1 chỉ train gold (VLSP + local). "
+        "Phần còn lại train gold+silver với LR × 0.3",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--max-seq-length", type=int, default=256)
@@ -822,8 +955,8 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument(
         "--silver-confidence",
         type=float,
-        default=0.85,
-        help="Minimum confidence for silver labels",
+        default=0.90,
+        help="Minimum confidence cho silver labels (tăng lên 0.90 để giảm nhiễu)",
     )
     parser.add_argument(
         "--no-silver", action="store_true", help="Disable silver label generation"
