@@ -106,11 +106,22 @@ class _FaissBackend:
 
 
 class _CrossEncoderReranker:
-    def __init__(self, model_dir: str):
+    def __init__(self, model_dir: str, device: str = None):
         if not _CROSS_ENCODER_AVAILABLE:
             raise ImportError("Cần cài sentence-transformers để dùng cross-encoder.")
-        print(f"[Reranker] Đang load: {model_dir}")
-        self._model = CrossEncoder(model_dir)
+        # Auto-detect GPU
+        if device is None:
+            try:
+                import torch
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+        self._device = device
+        # Batch size tối ưu: GPU 128, CPU 32
+        self._batch_size = 128 if device.startswith("cuda") else 32
+        print(f"[Reranker] Đang load: {model_dir} (device={device})")
+        self._model = CrossEncoder(model_dir, device=device)
         print("[Reranker] Sẵn sàng.")
 
     def rerank(
@@ -124,7 +135,7 @@ class _CrossEncoderReranker:
             return candidates
 
         pairs = [(query, c.get(text_field, c.get("full_text", ""))) for c in candidates]
-        scores = self._model.predict(pairs)
+        scores = self._model.predict(pairs, batch_size=self._batch_size)
 
         for cand, score in zip(candidates, scores):
             cand["cross_encoder_score"] = round(float(score), 4)
@@ -157,6 +168,14 @@ class Retriever:
         if not _FAISS_AVAILABLE:
             raise ImportError("Cần cài faiss-cpu: pip install faiss-cpu")
 
+        # Auto-detect GPU device (dùng cho cross-encoder)
+        try:
+            import torch
+
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            self._device = "cpu"
+
         self._backend = _FaissBackend()
 
         # Cross-encoder: ưu tiên fine-tuned model nếu có
@@ -173,7 +192,7 @@ class Retriever:
                     else DEFAULT_CROSS_ENCODER
                 )
             try:
-                self._reranker = _CrossEncoderReranker(model_path)
+                self._reranker = _CrossEncoderReranker(model_path, device=self._device)
             except Exception as e:
                 print(f"[Reranker] Không load được ({e}), tắt rerank.")
 

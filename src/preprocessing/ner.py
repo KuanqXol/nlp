@@ -1,13 +1,13 @@
 """
 ner.py
 ──────
-NER tiếng Việt dùng PhoBERT fine-tuned (vinai/phobert-base-v2).
+NER tieng Viet dung PhoBERT fine-tuned (vinai/phobert-base-v2).
 
-Yêu cầu:
-  - Checkpoint đã fine-tune tại data/ner_model/  (chạy scripts/train_ner.py trước)
-  - transformers, torch
+Yeu cau:
+  - Checkpoint da fine-tune tai data/ner_model/
+  - transformers, torch, py_vncorenlp, java 8+
 
-Output entity chuẩn:
+Output entity chuan:
 {
     "text":        "Vladimir Putin",
     "type":        "PER",          # PER | LOC | ORG
@@ -42,7 +42,6 @@ except ImportError:
 
 
 def _normalize_text(text: str) -> str:
-    """Chuẩn hóa unicode NFC, bỏ khoảng trắng thừa."""
     text = unicodedata.normalize("NFC", text or "")
     return re.sub(r"\s+", " ", text).strip()
 
@@ -89,8 +88,12 @@ def _make_entity(text, ent_type, start, end, sentence_id, score) -> Dict:
 
 class _PhoBERTNERBackend:
     """
-    Token classification với PhoBERT fine-tuned trên VLSP2016 NER.
+    Token classification voi PhoBERT fine-tuned tren VLSP2016 NER.
     Labels: O, B-PER, I-PER, B-LOC, I-LOC, B-ORG, I-ORG
+
+    - Word segmentation bang VnCoreNLP (bat buoc de dong nhat voi pretraining)
+    - Batch tokenize that: nhanh hon 3-5x tren GPU
+    - word_ids bang SentencePiece prefix (U+2581): khong dung word_ids() cua fast tokenizer
     """
 
     _BIO_MAP = {
@@ -102,42 +105,52 @@ class _PhoBERTNERBackend:
         "I-ORG": "ORG",
     }
 
-    def __init__(self, model_dir: str, max_length: int = 256, batch_size: int = 32):
+    def __init__(self, model_dir: str, max_length: int = 256, batch_size: int = None):
         self.model_dir = model_dir
         self.max_length = max_length
-        self.batch_size = batch_size
+        self._batch_size_override = batch_size
         self._model = None
         self._tokenizer = None
         self._device = None
+        self._segmenter = None
 
     def _load(self):
         if self._model is not None:
             return
         if not _TORCH_AVAILABLE:
-            raise RuntimeError("Cần cài transformers và torch để dùng PhoBERT NER.")
+            raise RuntimeError("Can cai transformers va torch de dung PhoBERT NER.")
+
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[NER/PhoBERT] Đang load từ {self.model_dir} (device={self._device})")
+        self.batch_size = self._batch_size_override or (
+            64 if self._device.type == "cuda" else 32
+        )
+        print(
+            f"[NER/PhoBERT] Dang load tu {self.model_dir} (device={self._device}, batch_size={self.batch_size})"
+        )
+
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
         self._model = AutoModelForTokenClassification.from_pretrained(self.model_dir)
         self._model.to(self._device)
         self._model.eval()
 
-        # Load VnCoreNLP word segmenter — bắt buộc để đồng nhất với pretraining
-        # PhoBERT được pretrain trên text đã segment: "Hà_Nội", "Việt_Nam"
+        # VnCoreNLP word segmenter -- bat buoc de PhoBERT tokenize dung
+        # "Ho Chi Minh" -> "Ho_Chi_Minh" -> PhoBERT nhan ra 1 entity
         self._segmenter = None
         try:
             import py_vncorenlp
             from pathlib import Path as _Path
 
-            save_dir = str(_Path(self.model_dir).parents[1] / "vncorenlp")
+            save_dir = str(_Path(self.model_dir).resolve().parent / "vncorenlp")
             _Path(save_dir).mkdir(parents=True, exist_ok=True)
-            try:
-                import os as _os
 
-                _os.makedirs(save_dir, exist_ok=True)
-                py_vncorenlp.download_model(save_dir=save_dir)
-            except Exception:
-                pass
+            # Chi download neu jar chua co -- tranh dung wget tren Windows
+            _jar = _Path(save_dir) / "VnCoreNLP-1.2.jar"
+            if not _jar.exists():
+                try:
+                    py_vncorenlp.download_model(save_dir=save_dir)
+                except Exception:
+                    pass
+
             self._segmenter = py_vncorenlp.VnCoreNLP(
                 annotators=["wseg"], save_dir=save_dir
             )
@@ -145,14 +158,16 @@ class _PhoBERTNERBackend:
         except Exception as e:
             print(f"[NER/PhoBERT] WARNING: VnCoreNLP unavailable ({e}).")
             print(
-                "[NER/PhoBERT] Falling back to whitespace split — NER quality will be lower."
+                "[NER/PhoBERT] Falling back to whitespace split -- NER quality will be lower."
             )
-            print("[NER/PhoBERT] Install: pip install py_vncorenlp")
+            print(
+                "[NER/PhoBERT] Fix: dam bao data/vncorenlp/VnCoreNLP-1.2.jar ton tai va Java da cai."
+            )
 
-        print("[NER/PhoBERT] Sẵn sàng.")
+        print("[NER/PhoBERT] San sang.")
 
     def _segment(self, text: str) -> str:
-        """Word-segment: 'Hà Nội' → 'Hà_Nội'. Fallback: trả nguyên text."""
+        """Word-segment: 'Ha Noi' -> 'Ha_Noi'. Fallback: tra nguyen text."""
         if self._segmenter is None:
             return text
         try:
@@ -162,7 +177,7 @@ class _PhoBERTNERBackend:
             return text
 
     def _desegment_entity(self, seg_text: str) -> str:
-        """Khôi phục entity text về dạng gốc: 'Hà_Nội' → 'Hà Nội'."""
+        """Khoi phuc entity text ve dang goc: 'Ha_Noi' -> 'Ha Noi'."""
         return seg_text.replace("_", " ")
 
     def annotate(self, text: str) -> List[Dict]:
@@ -175,18 +190,17 @@ class _PhoBERTNERBackend:
 
         for batch_start in range(0, len(sentences), self.batch_size):
             batch = sentences[batch_start : batch_start + self.batch_size]
-            # Segment từng câu trước khi đưa vào PhoBERT
             segmented_texts = [self._segment(s["text"]) for s in batch]
             for sent_info, sent_ents in zip(
                 batch, self._predict_batch(segmented_texts)
             ):
                 for ent in sent_ents:
-                    # Khôi phục về dạng gốc (bỏ underscore) để map lại vị trí
                     orig_ent_text = self._desegment_entity(ent["text"])
-                    local_start = sent_info["text"].find(orig_ent_text)
-                    if local_start >= 0:
-                        gs = sent_info["start"] + local_start
-                        ge = gs + len(orig_ent_text)
+                    # Dung re.search thay str.find -- chinh xac hon voi ky tu dac biet
+                    _m = re.search(re.escape(orig_ent_text), sent_info["text"])
+                    if _m:
+                        gs = sent_info["start"] + _m.start()
+                        ge = sent_info["start"] + _m.end()
                     else:
                         gs = ge = -1
                     all_entities.append(
@@ -210,54 +224,70 @@ class _PhoBERTNERBackend:
         return unique
 
     def _predict_batch(self, texts: List[str]) -> List[List[Dict]]:
-        # texts đã được segment: "Hà_Nội là thủ_đô Việt_Nam"
-        # split() cho ra ["Hà_Nội", "là", "thủ_đô", "Việt_Nam"]
+        """
+        texts: list cau da segment ("Ha_Noi la thu_do Viet_Nam")
+
+        - Batch tokenize that -> nhanh hon 3-5x tren GPU
+        - Dung SentencePiece prefix U+2581 (▁) de map token -> word index
+          PhobertTokenizer la slow BPE tokenizer, khong co word_ids()
+        """
+        if not texts:
+            return []
+
+        # Tokenize ca batch 1 lan
+        enc = self._tokenizer(
+            texts,
+            truncation=True,
+            padding=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(self._device) for k, v in enc.items()}
+
+        with torch.no_grad():
+            logits = self._model(**enc).logits
+
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        pred_ids = torch.argmax(logits, dim=-1).cpu().numpy()
+        pred_probs = probs.cpu().numpy()
+
+        id2label = self._model.config.id2label
+        special_tokens = set(self._tokenizer.all_special_tokens)
         results = []
-        for text in texts:
+
+        for b_idx, text in enumerate(texts):
             words = text.split()
-            if not words:
-                results.append([])
-                continue
+            input_ids = enc["input_ids"][b_idx].cpu().tolist()
+            tokens = self._tokenizer.convert_ids_to_tokens(input_ids)
 
-            enc = self._tokenizer(
-                words,
-                is_split_into_words=True,
-                truncation=True,
-                max_length=self.max_length,
-                padding=True,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(self._device) for k, v in enc.items()}
+            # Map token -> word index dung SentencePiece prefix ▁
+            # PhoBERT BPE: token bat dau word moi co prefix ▁ (U+2581)
+            w_ids = []
+            word_idx = -1
+            for tok in tokens:
+                if tok in special_tokens or tok is None:
+                    w_ids.append(None)
+                    continue
+                if tok.startswith("\u2581"):  # bat dau word moi
+                    word_idx += 1
+                elif word_idx == -1:  # token dau tien khong co prefix
+                    word_idx = 0
+                # Guard tranh overflow khi truncate
+                w_ids.append(word_idx if word_idx < len(words) else None)
 
-            with torch.no_grad():
-                logits = self._model(**enc).logits
-
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            pred_ids = torch.argmax(logits, dim=-1)[0].cpu().numpy()
-            pred_probs = probs[0].cpu().numpy()
-
-            # word_ids từ tokenizer (không có return_tensors)
-            plain_enc = self._tokenizer(
-                words,
-                is_split_into_words=True,
-                truncation=True,
-                max_length=self.max_length,
-            )
-            w_ids = plain_enc.word_ids()
-
-            # Aggregate: first sub-token per word
+            # Aggregate: lay token dau tien cua moi word
             word_preds: Dict[int, tuple] = {}
-            for tok_idx, wid in enumerate(w_ids):
-                if wid is None or tok_idx >= len(pred_ids):
+            for t_idx, wid in enumerate(w_ids):
+                if wid is None:
                     continue
                 if wid not in word_preds:
-                    word_preds[wid] = (
-                        int(pred_ids[tok_idx]),
-                        float(pred_probs[tok_idx, int(pred_ids[tok_idx])]),
-                    )
+                    label_id = int(pred_ids[b_idx][t_idx])
+                    prob = float(pred_probs[b_idx][t_idx][label_id])
+                    word_preds[wid] = (label_id, prob)
 
-            id2label = self._model.config.id2label
-            entities, i = [], 0
+            # Decode BIO -> entity spans
+            entities = []
+            i = 0
             while i < len(words):
                 if i not in word_preds:
                     i += 1
@@ -271,7 +301,6 @@ class _PhoBERTNERBackend:
                 if not ent_type:
                     i += 1
                     continue
-
                 span_words, span_probs = [words[i]], [prob]
                 j = i + 1
                 while j < len(words) and j in word_preds:
@@ -283,7 +312,6 @@ class _PhoBERTNERBackend:
                         j += 1
                     else:
                         break
-
                 entities.append(
                     {
                         "text": " ".join(span_words),
@@ -292,8 +320,8 @@ class _PhoBERTNERBackend:
                     }
                 )
                 i = j
-
             results.append(entities)
+
         return results
 
     def close(self):
@@ -303,17 +331,98 @@ class _PhoBERTNERBackend:
             torch.cuda.empty_cache()
 
 
+# ── Underthesea Fallback NER Backend ─────────────────────────────────────────
+
+
+class _UndertheseaNERBackend:
+    """
+    Fallback NER dung underthesea khi khong co PhoBERT model.
+    Chat luong thap hon PhoBERT fine-tuned, nhung khong can training.
+    Cai dat: pip install underthesea
+    """
+
+    _TYPE_MAP = {
+        "B-PER": "PER",
+        "I-PER": "PER",
+        "B-LOC": "LOC",
+        "I-LOC": "LOC",
+        "B-ORG": "ORG",
+        "I-ORG": "ORG",
+        "B-MISC": "MISC",
+        "I-MISC": "MISC",
+    }
+
+    def __init__(self):
+        self._ner_fn = None
+        self._load()
+
+    def _load(self):
+        try:
+            from underthesea import ner as _ner
+
+            self._ner_fn = _ner
+            print("[NER/underthesea] Backend san sang.")
+        except ImportError:
+            print("[NER/underthesea] WARNING: chua cai underthesea.")
+            print("[NER/underthesea] Cai: pip install underthesea")
+            self._ner_fn = None
+
+    def annotate(self, text: str) -> List[Dict]:
+        if not self._ner_fn or not text.strip():
+            return []
+        try:
+            raw = self._ner_fn(text)
+        except Exception as e:
+            print(f"[NER/underthesea] Loi: {e}")
+            return []
+
+        entities: List[Dict] = []
+        i = 0
+        while i < len(raw):
+            word, _, _, tag = raw[i][0], raw[i][1], raw[i][2], raw[i][3]
+            etype = self._TYPE_MAP.get(tag)
+            if etype is None:
+                i += 1
+                continue
+            span_words = [word]
+            j = i + 1
+            while j < len(raw):
+                nw, _, _, nt = raw[j][0], raw[j][1], raw[j][2], raw[j][3]
+                if nt.startswith("I-") and self._TYPE_MAP.get(nt) == etype:
+                    span_words.append(nw)
+                    j += 1
+                else:
+                    break
+            ent_text = " ".join(span_words)
+            start = text.find(ent_text)
+            entities.append(
+                _make_entity(
+                    ent_text,
+                    etype,
+                    start,
+                    start + len(ent_text) if start >= 0 else -1,
+                    0,
+                    0.70,
+                )
+            )
+            i = j
+        return entities
+
+    def close(self):
+        self._ner_fn = None
+
+
 # ── VietnameseNER ─────────────────────────────────────────────────────────────
 
 
 class VietnameseNER:
     """
-    NER tiếng Việt dùng PhoBERT fine-tuned.
+    NER tieng Viet dung PhoBERT fine-tuned.
 
-    Cách dùng:
-        ner = VietnameseNER()                        # load từ data/ner_model/
+    Cach dung:
+        ner = VietnameseNER()                        # load tu data/ner_model/
         ner = VietnameseNER(model_dir="path/to/dir") # custom path
-        entities = ner.extract("Hà Nội là thủ đô Việt Nam.")
+        entities = ner.extract("Ha Noi la thu do Viet Nam.")
     """
 
     DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "ner_model"
@@ -322,29 +431,28 @@ class VietnameseNER:
         self,
         model_dir: Optional[str] = None,
         max_length: int = 256,
-        batch_size: int = 32,
+        batch_size: int = None,
         cache_path: Optional[str] = None,
-        # backward-compat kwargs (bỏ qua)
         **kwargs,
     ):
         resolved_dir = model_dir or str(self.DEFAULT_MODEL_DIR)
-        if not Path(resolved_dir).exists():
-            raise FileNotFoundError(
-                f"[NER] Không tìm thấy model tại: {resolved_dir}\n"
-                "Chạy: python scripts/train_ner.py --output-dir data/ner_model"
-            )
-
-        self._backend = _PhoBERTNERBackend(
-            resolved_dir, max_length=max_length, batch_size=batch_size
-        )
         self._cache: Dict[str, List[Dict]] = {}
-        self.backend_name = "phobert-ner"
-        print(f"[NER] Backend: PhoBERT ({resolved_dir})")
+
+        if Path(resolved_dir).exists():
+            self._backend = _PhoBERTNERBackend(
+                resolved_dir, max_length=max_length, batch_size=batch_size
+            )
+            self.backend_name = "phobert-ner"
+            print(f"[NER] Backend: PhoBERT ({resolved_dir})")
+        else:
+            print(f"[NER] WARNING: Khong tim thay PhoBERT model tai {resolved_dir}.")
+            print("[NER] Dung underthesea lam fallback NER. Chat luong se thap hon.")
+            print("[NER] De dung PhoBERT: giai nen model vao data/ner_model/")
+            self._backend = _UndertheseaNERBackend()
+            self.backend_name = "underthesea-fallback"
 
         if cache_path:
             self.load_cache(cache_path)
-
-    # ── Cache ─────────────────────────────────────────────────────────────
 
     def _cache_key(self, text: str) -> str:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -359,7 +467,7 @@ class VietnameseNER:
             self._cache = {str(k): list(v) for k, v in data.items()}
             print(f"[NER] Cache loaded: {p} ({len(self._cache)} entries)")
         except Exception as e:
-            print(f"[NER] Không load được cache {p}: {e}")
+            print(f"[NER] Khong load duoc cache {p}: {e}")
 
     def save_cache(self, path: str):
         p = Path(path)
@@ -367,10 +475,7 @@ class VietnameseNER:
         with open(p, "w", encoding="utf-8") as f:
             json.dump(self._cache, f, ensure_ascii=False)
 
-    # ── Extraction ────────────────────────────────────────────────────────
-
     def extract(self, text: str) -> List[Dict]:
-        """Trích xuất entity từ text. Dùng cache nếu đã xử lý."""
         text = _normalize_text(text)
         if not text:
             return []
@@ -384,7 +489,6 @@ class VietnameseNER:
     def extract_from_document(self, doc: Dict) -> Dict:
         text = doc.get("full_text", doc.get("content", ""))
         entities = self.extract(text)
-        # Dedup
         seen, unique = set(), []
         for e in entities:
             key = (
@@ -401,13 +505,13 @@ class VietnameseNER:
         return out
 
     def batch_extract(self, documents: List[Dict], log_every: int = 500) -> List[Dict]:
-        print(f"[NER] Xử lý {len(documents)} bài...")
+        print(f"[NER] Xu ly {len(documents)} bai...")
         result = []
         for i, doc in enumerate(documents):
             result.append(self.extract_from_document(doc))
             if (i + 1) % log_every == 0 or (i + 1) == len(documents):
                 print(f"  [{i+1}/{len(documents)}]")
-        print("[NER] Hoàn thành.")
+        print("[NER] Hoan thanh.")
         return result
 
     def close(self):
@@ -430,15 +534,14 @@ def ner_with_checkpoint(
     log_every: int = 500,
 ) -> List[Dict]:
     """
-    Batch NER với checkpoint để resume nếu bị ngắt giữa chừng.
-    Checkpoint lưu tiến độ vào JSON, kết quả append vào JSONL.
+    Batch NER voi checkpoint de resume neu bi ngat giua chung.
+    Checkpoint luu tien do vao JSON, ket qua append vao JSONL.
     """
     import os
 
     checkpoint_file = Path(checkpoint_path)
     results_file = Path(results_path or checkpoint_file.with_suffix(".jsonl"))
 
-    # Fingerprint để xác minh dataset không đổi
     sha = hashlib.sha1()
     for doc in documents:
         sha.update(str(doc.get("id", "")).encode())
@@ -461,9 +564,9 @@ def ner_with_checkpoint(
                     result = [json.loads(l) for l in f if l.strip()]
                 result = result[:start_idx]
                 if start_idx:
-                    print(f"[NER] Resume từ checkpoint: {start_idx}/{len(documents)}")
+                    print(f"[NER] Resume tu checkpoint: {start_idx}/{len(documents)}")
         except Exception as e:
-            print(f"[NER] Bỏ qua checkpoint lỗi: {e}")
+            print(f"[NER] Bo qua checkpoint loi: {e}")
             start_idx, result = 0, []
 
     def _save_checkpoint(idx: int):
@@ -495,5 +598,5 @@ def ner_with_checkpoint(
     if cache_path:
         ner.save_cache(cache_path)
 
-    print(f"[NER] Hoàn tất {len(result)}/{len(documents)} docs")
+    print(f"[NER] Hoan tat {len(result)}/{len(documents)} docs")
     return result

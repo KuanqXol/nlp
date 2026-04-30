@@ -115,8 +115,16 @@ def _levenshtein_distance(left: str, right: str) -> int:
 
 
 class _EmbeddingBackend:
-    def __init__(self, model_name: str = DEFAULT_MODEL):
+    def __init__(self, model_name: str = DEFAULT_MODEL, device: str = None):
         self.model_name = model_name
+        if device is None:
+            try:
+                import torch
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+        self.device = device
         self.model = None
         self.dim = 0
 
@@ -125,7 +133,7 @@ class _EmbeddingBackend:
             return
         if not _SBERT_AVAILABLE:
             raise RuntimeError("sentence-transformers chưa cài")
-        self.model = SentenceTransformer(self.model_name)
+        self.model = SentenceTransformer(self.model_name, device=self.device)
         self.dim = int(self.model.get_sentence_embedding_dimension())
 
     def encode(self, texts: List[str]) -> np.ndarray:

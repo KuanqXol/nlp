@@ -23,9 +23,9 @@ from src.utils.text import split_sentences as _split_sentences
 
 # ── Cấu hình ─────────────────────────────────────────────────────────────────
 
-DEFAULT_MAX_CHUNK_CHARS = 400  # ~100 tokens SBERT
-DEFAULT_MIN_CHUNK_CHARS = 80
-DEFAULT_OVERLAP_SENTENCES = 1  # Số câu overlap giữa 2 chunk liên tiếp
+DEFAULT_MAX_CHUNK_CHARS = 1500  # ~100 tokens SBERT
+DEFAULT_MIN_CHUNK_CHARS = 200
+DEFAULT_OVERLAP_SENTENCES = 2  # Số câu overlap giữa 2 chunk liên tiếp
 
 
 # ── Chunking functions ────────────────────────────────────────────────────────
@@ -66,7 +66,13 @@ def chunk_by_sentences(
         # Overlap: tiến i về sau overlap câu từ đầu chunk hiện tại
         advance = max(1, len(chunk_sents) - overlap)
         i += advance
-
+    # Sau vòng while, gộp chunk cuối nếu quá nhỏ
+    if chunks and len(chunks[-1]) < min_chars:
+        # Gộp vào chunk trước nếu có
+        if len(chunks) >= 2:
+            chunks[-2] = chunks[-2] + " " + chunks[-1]
+            chunks.pop()
+        # Nếu chỉ có 1 chunk thì giữ nguyên dù ngắn
     return chunks
 
 
@@ -273,7 +279,9 @@ if __name__ == "__main__":
         "url": "https://vnexpress.net/001",
     }
 
-    chunks = chunk_document(doc, strategy="sentence_window", max_chars=200, overlap=1)
+    chunks = chunk_document(
+        doc, strategy="sentence_window", max_chars=1500, overlap=2, min_chars=200
+    )
     print(f"Document chia thành {len(chunks)} chunks:\n")
     for c in chunks:
         print(f"  [{c['chunk_index']}] ({len(c['chunk_text'])} chars)")

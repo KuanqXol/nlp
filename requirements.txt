@@ -5,9 +5,9 @@ sentence-transformers>=2.2.0
 accelerate>=0.20.0
 tokenizers>=0.15.0
 safetensors>=0.4.0
-
+py_vncorenlp
 # ── Vector search ──────────────────────────────────────────────────────────────
-faiss-gpu
+faiss-cpu
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
 networkx>=3.0

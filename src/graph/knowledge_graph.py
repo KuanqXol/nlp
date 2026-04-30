@@ -36,6 +36,10 @@ class TemporalEdge:
         self.sentence = sentence
 
 
+def _new_type_dict():
+    return defaultdict(int)
+
+
 class KnowledgeGraph:
 
     def __init__(self, min_confidence: float = MIN_TRIPLE_CONFIDENCE):
@@ -44,9 +48,7 @@ class KnowledgeGraph:
         self.graph = nx.MultiDiGraph()  # MultiDiGraph: nhiều edge giữa 2 node
         self.min_confidence = min_confidence
         self._pagerank: Dict[str, float] = {}
-        self._type_votes: Dict[str, Dict[str, int]] = defaultdict(
-            lambda: defaultdict(int)
-        )
+        self._type_votes: Dict[str, Dict[str, int]] = defaultdict(_new_type_dict)
 
     # ─────────────────────────────────────────────────────────────────────
     # Build

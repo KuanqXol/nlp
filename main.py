@@ -184,13 +184,8 @@ class NewsSearchSystem:
     def build(self):
         """Build toàn bộ pipeline từ raw data."""
         print(f"📂 Đang load data từ: {self.data_path}")
-        loader = NewsDataLoader()
-        ext = Path(self.data_path).suffix.lower()
-        self._documents = (
-            loader.load_csv(self.data_path)
-            if ext == ".csv"
-            else loader.load_json(self.data_path)
-        )
+        loader = NewsDataLoader(self.data_path)
+        self._documents = loader.load()
         print(f"   Đã load {len(self._documents)} bài báo.")
 
         # NER với checkpoint để resume nếu bị ngắt
@@ -229,7 +224,7 @@ class NewsSearchSystem:
         # Chunking + embedding
         print("\n📦 Đang chunking và embedding...")
         chunks, doc_to_chunks = chunk_documents(
-            self._documents, strategy="sentence_window", max_chars=400
+            self._documents, strategy="sentence_window", max_chars=1500
         )
         chunk_dicts = [
             {"id": c["chunk_id"], "full_text": c["chunk_text"]} for c in chunks

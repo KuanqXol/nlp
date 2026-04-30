@@ -38,18 +38,31 @@ class VietnameseBiEncoder:
         vecs = enc.encode(["query 1", "query 2"])          # shape (2, 768)
     """
 
-    def __init__(self, model_name: str = DEFAULT_MODEL):
+    def __init__(self, model_name: str = DEFAULT_MODEL, device: str = None):
         if not _SBERT_AVAILABLE:
             raise ImportError(
                 "Cần cài sentence-transformers: pip install sentence-transformers"
             )
         self.model_name = model_name
+        # Auto-detect GPU nếu không truyền device
+        if device is None:
+            try:
+                import torch
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+        self.device = device
         self._model: Optional[SentenceTransformer] = None
+        # Batch size tối ưu: GPU dùng 256, CPU dùng 64
+        self._default_batch_size = 64 if device.startswith("cuda") else 32
 
     def _load(self):
         if self._model is None:
-            print(f"[Embedding] Đang tải model: {self.model_name} ...")
-            self._model = SentenceTransformer(self.model_name)
+            print(
+                f"[Embedding] Đang tải model: {self.model_name} (device={self.device}) ..."
+            )
+            self._model = SentenceTransformer(self.model_name, device=self.device)
             print(
                 f"[Embedding] Model sẵn sàng. Dim={self._model.get_sentence_embedding_dimension()}"
             )
@@ -57,7 +70,7 @@ class VietnameseBiEncoder:
     def encode(
         self,
         text: Union[str, List[str]],
-        batch_size: int = 64,
+        batch_size: int = None,
         show_progress: bool = False,
     ) -> np.ndarray:
         """
@@ -69,6 +82,8 @@ class VietnameseBiEncoder:
         self._load()
         single = isinstance(text, str)
         texts = [text] if single else text
+        if batch_size is None:
+            batch_size = self._default_batch_size
         vecs = self._model.encode(
             texts,
             batch_size=batch_size,
@@ -97,9 +112,9 @@ class EmbeddingManager:
         vec = em.encode_query("chiến tranh nga ukraine")
     """
 
-    def __init__(self, model_name: str = DEFAULT_MODEL, **kwargs):
+    def __init__(self, model_name: str = DEFAULT_MODEL, device: str = None, **kwargs):
         # kwargs cho backward-compat (use_sbert, v.v.) — bỏ qua
-        self._enc = VietnameseBiEncoder(model_name)
+        self._enc = VietnameseBiEncoder(model_name, device=device)
         self._doc_embeddings: Optional[np.ndarray] = None
         self._doc_ids: List[str] = []
         # Query cache: dict đơn giản.
@@ -111,7 +126,7 @@ class EmbeddingManager:
 
     # ── Build index ────────────────────────────────────────────────────────
 
-    def build_document_index(self, documents: List[Dict], batch_size: int = 64):
+    def build_document_index(self, documents: List[Dict], batch_size: int = None):
         """
         Encode tất cả document (hoặc chunk) và lưu vào index.
         Mỗi dict cần có field 'full_text' hoặc 'content'.
