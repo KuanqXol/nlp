@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vietnamese News Search Demo</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header class="header">
+        <div class="title">Vietnamese News Search Demo</div>
+        <div class="subtitle">FAISS retrieval · optional rerank · optional KG boost</div>
+      </header>
+
+      <section class="card status">
+        <div class="row">
+          <div class="pill {{ 'ok' if state.mode != 'not-ready' else 'warn' }}">
+            {{ state.mode }}
+          </div>
+          <div class="status-text">{{ state.message }}</div>
+        </div>
+        <div class="meta">
+          <div><span class="k">index_dir</span> <span class="v">{{ state.index_dir }}</span></div>
+          <div><span class="k">data_path</span> <span class="v">{{ state.data_path }}</span></div>
+          <div><span class="k">docs</span> <span class="v">{{ state.n_docs }}</span></div>
+          <div><span class="k">chunks</span> <span class="v">{{ state.n_chunks }}</span></div>
+        </div>
+
+        {% if state.mode == 'not-ready' %}
+        <div class="hint">
+          <div class="hint-title">Cách làm cho demo chạy ngay</div>
+          <div class="hint-body">
+            <div>1) Build index trước (khuyến nghị) để startup nhanh và search chuẩn:</div>
+            <pre>python scripts/build_index.py --data data/vnexpress_articles.csv</pre>
+            <div>2) Sau đó chạy web:</div>
+            <pre>python -m uvicorn web_app:app --reload --port 8000</pre>
+            <div>Hoặc nếu bạn chỉ cần demo nhanh (không NER/KG), bật lite build (lấy N bài đầu):</div>
+            <pre>set ALLOW_LITE_BUILD=1
+set DEMO_MAX_DOCS=2000
+python -m uvicorn web_app:app --reload --port 8000</pre>
+          </div>
+        </div>
+        {% endif %}
+      </section>
+
+      <section class="card">
+        <form class="form" method="post" action="/search">
+          <label class="label" for="query">Query</label>
+          <input
+            id="query"
+            name="query"
+            type="text"
+            placeholder="VD: Samsung đầu tư Việt Nam, chiến tranh Nga Ukraine, WHO cảnh báo dịch..."
+            value="{{ query }}"
+            autocomplete="off"
+          />
+
+          <div class="row form-row">
+            <div class="field">
+              <label class="label" for="top_k">Top K</label>
+              <input id="top_k" name="top_k" type="number" min="1" max="50" value="{{ top_k }}" />
+            </div>
+            <button class="btn" type="submit" {{ 'disabled' if state.mode == 'not-ready' else '' }}>
+              Search
+            </button>
+          </div>
+        </form>
+      </section>
+
+      {% if elapsed_ms is not none %}
+      <section class="card">
+        <div class="result-header">
+          <div class="result-title">Kết quả</div>
+          <div class="result-meta">{{ elapsed_ms }}ms · top {{ results | length }}</div>
+        </div>
+
+        {% if results | length == 0 %}
+          <div class="empty">Không có kết quả.</div>
+        {% endif %}
+
+        <ol class="results">
+          {% for doc in results %}
+          <li class="result">
+            <div class="r-title">{{ doc.get('title', '(không có tiêu đề)') }}</div>
+            {% if doc.get('url') %}
+              <div class="r-url"><a href="{{ doc.get('url') }}" target="_blank" rel="noreferrer">{{ doc.get('url') }}</a></div>
+            {% endif %}
+            <div class="r-meta">
+              <span class="tag">score={{ '%.4f' | format(doc.get('retrieval_score', 0.0)) }}</span>
+              {% if doc.get('date') %}<span class="tag">{{ doc.get('date') }}</span>{% endif %}
+              {% if doc.get('category') %}<span class="tag">{{ doc.get('category') }}</span>{% endif %}
+              {% if doc.get('graph_boost') is not none %}<span class="tag">graph={{ '%.4f' | format(doc.get('graph_boost', 0.0)) }}</span>{% endif %}
+              {% if doc.get('vector_score') is not none %}<span class="tag">vec={{ '%.4f' | format(doc.get('vector_score', 0.0)) }}</span>{% endif %}
+              {% if doc.get('cross_encoder_score') is not none %}<span class="tag">ce={{ '%.4f' | format(doc.get('cross_encoder_score', 0.0)) }}</span>{% endif %}
+            </div>
+            {% set snippet = doc.get('chunk_text') or doc.get('content') or '' %}
+            {% if snippet %}
+              <div class="r-snippet">{{ snippet[:240].replace('\n', ' ') }}{% if snippet|length > 240 %}...{% endif %}</div>
+            {% endif %}
+          </li>
+          {% endfor %}
+        </ol>
+      </section>
+      {% endif %}
+
+      <footer class="footer">
+        <div>
+          Tip: set env <code>INDEX_DIR</code> hoặc <code>DATA_PATH</code> nếu bạn muốn đổi đường dẫn.
+        </div>
+      </footer>
+    </div>
+  </body>
+</html>
+

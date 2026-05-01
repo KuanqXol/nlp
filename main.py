@@ -42,6 +42,15 @@ from src.retrieval import (
     QueryProcessor,
     QueryExpander,
 )
+from src.retrieval.chunking import (
+    DEFAULT_MAX_CHUNK_CHARS,
+    DEFAULT_OVERLAP_SENTENCES,
+)
+from src.retrieval.chunking import (
+    DEFAULT_MAX_CHUNK_CHARS,
+    DEFAULT_OVERLAP_SENTENCES,
+    DEFAULT_MIN_CHUNK_CHARS,
+)
 
 
 # ── Banner ────────────────────────────────────────────────────────────────────
@@ -224,7 +233,11 @@ class NewsSearchSystem:
         # Chunking + embedding
         print("\n📦 Đang chunking và embedding...")
         chunks, doc_to_chunks = chunk_documents(
-            self._documents, strategy="sentence_window", max_chars=1500
+            self._documents,
+            strategy="sentence_window",
+            max_chars=DEFAULT_MAX_CHUNK_CHARS,
+            overlap=DEFAULT_OVERLAP_SENTENCES,
+            prepend_title=True,
         )
         chunk_dicts = [
             {"id": c["chunk_id"], "full_text": c["chunk_text"]} for c in chunks

@@ -4,3 +4,5 @@
 /.venv
 /data
 .history
+*.md
+*.ps1
