@@ -10,14 +10,12 @@
     <div class="container">
       <header class="header">
         <div class="title">Vietnamese News Search Demo</div>
-        <div class="subtitle">FAISS retrieval · optional rerank · optional KG boost</div>
+        <div class="subtitle">FAISS · graph boost · rerank · query understanding</div>
       </header>
 
       <section class="card status">
-        <div class="row">
-          <div class="pill {{ 'ok' if state.mode != 'not-ready' else 'warn' }}">
-            {{ state.mode }}
-          </div>
+        <div class="row status-row">
+          <div class="pill {{ 'ok' if state.mode != 'not-ready' else 'warn' }}">{{ state.mode }}</div>
           <div class="status-text">{{ state.message }}</div>
         </div>
         <div class="meta">
@@ -29,17 +27,12 @@
 
         {% if state.mode == 'not-ready' %}
         <div class="hint">
-          <div class="hint-title">Cách làm cho demo chạy ngay</div>
-          <div class="hint-body">
-            <div>1) Build index trước (khuyến nghị) để startup nhanh và search chuẩn:</div>
-            <pre>python scripts/build_index.py --data data/vnexpress_articles.csv</pre>
-            <div>2) Sau đó chạy web:</div>
-            <pre>python -m uvicorn web_app:app --reload --port 8000</pre>
-            <div>Hoặc nếu bạn chỉ cần demo nhanh (không NER/KG), bật lite build (lấy N bài đầu):</div>
-            <pre>set ALLOW_LITE_BUILD=1
+          <div class="hint-title">Cần index để search</div>
+          <div class="hint-body">Build index trước, hoặc bật lite build nếu chỉ cần demo nhanh.</div>
+          <pre>python scripts/build_index.py --data data/vnexpress_articles.csv</pre>
+          <pre>set ALLOW_LITE_BUILD=1
 set DEMO_MAX_DOCS=2000
 python -m uvicorn web_app:app --reload --port 8000</pre>
-          </div>
         </div>
         {% endif %}
       </section>
@@ -47,32 +40,72 @@ python -m uvicorn web_app:app --reload --port 8000</pre>
       <section class="card">
         <form class="form" method="post" action="/search">
           <label class="label" for="query">Query</label>
-          <input
-            id="query"
-            name="query"
-            type="text"
-            placeholder="VD: Samsung đầu tư Việt Nam, chiến tranh Nga Ukraine, WHO cảnh báo dịch..."
-            value="{{ query }}"
-            autocomplete="off"
-          />
+          <input id="query" name="query" type="text" placeholder="VD: Samsung đầu tư Việt Nam" value="{{ query }}" autocomplete="off" />
 
-          <div class="row form-row">
+          <div class="controls">
             <div class="field">
               <label class="label" for="top_k">Top K</label>
               <input id="top_k" name="top_k" type="number" min="1" max="50" value="{{ top_k }}" />
             </div>
-            <button class="btn" type="submit" {{ 'disabled' if state.mode == 'not-ready' else '' }}>
-              Search
-            </button>
+            <div class="field mode-field">
+              <label class="label" for="mode">Mode</label>
+              <select id="mode" name="mode">
+                <option value="full" {{ 'selected' if mode == 'full' else '' }}>full</option>
+                <option value="vector-only" {{ 'selected' if mode == 'vector-only' else '' }}>vector-only</option>
+                <option value="vector-graph" {{ 'selected' if mode == 'vector-graph' else '' }}>vector + graph</option>
+                <option value="vector-rerank" {{ 'selected' if mode == 'vector-rerank' else '' }}>vector + rerank</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="controls actions">
+            <label class="checkbox"><input type="checkbox" name="compare" value="1" {{ 'checked' if compare else '' }} /> compare modes</label>
+            <button class="btn" type="submit" {{ 'disabled' if state.mode == 'not-ready' else '' }}>Search</button>
           </div>
         </form>
       </section>
+
+      {% if analysis %}
+      <section class="card compact">
+        <div class="section-title">Query understanding</div>
+        <div class="chips">
+          <span class="tag">intent={{ analysis.get('intent', 'news_search') }}</span>
+          {% if analysis.get('topic') %}<span class="tag">topic={{ analysis.get('topic') }}</span>{% endif %}
+          {% if analysis.get('year_filter') %}<span class="tag">year={{ analysis.get('year_filter') }}</span>{% endif %}
+          {% for kw in analysis.get('keywords', [])[:5] %}<span class="tag">{{ kw }}</span>{% endfor %}
+        </div>
+        {% if analysis.get('entities') %}
+          <div class="muted small">entities</div>
+          <div class="chips">
+            {% for e in analysis.get('entities', [])[:5] %}
+              <span class="tag">{{ e.get('canonical', e.get('text', '')) }} · {{ e.get('type', '') }}</span>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </section>
+      {% endif %}
+
+      {% if compare and compare_results %}
+      <section class="card compact">
+        <div class="section-title">Compare modes</div>
+        {% for k, docs in compare_results.items() %}
+          <div class="compare-block">
+            <div class="compare-title">{{ k }}</div>
+            <div class="chips">
+              {% for doc in docs[:3] %}
+                <span class="tag">{{ doc.get('title', '(no title)')[:48] }}</span>
+              {% endfor %}
+            </div>
+          </div>
+        {% endfor %}
+      </section>
+      {% endif %}
 
       {% if elapsed_ms is not none %}
       <section class="card">
         <div class="result-header">
           <div class="result-title">Kết quả</div>
-          <div class="result-meta">{{ elapsed_ms }}ms · top {{ results | length }}</div>
+          <div class="result-meta">{{ elapsed_ms }}ms · {{ results | length }} docs</div>
         </div>
 
         {% if results | length == 0 %}
@@ -95,9 +128,7 @@ python -m uvicorn web_app:app --reload --port 8000</pre>
               {% if doc.get('cross_encoder_score') is not none %}<span class="tag">ce={{ '%.4f' | format(doc.get('cross_encoder_score', 0.0)) }}</span>{% endif %}
             </div>
             {% set snippet = doc.get('chunk_text') or doc.get('content') or '' %}
-            {% if snippet %}
-              <div class="r-snippet">{{ snippet[:240].replace('\n', ' ') }}{% if snippet|length > 240 %}...{% endif %}</div>
-            {% endif %}
+            {% if snippet %}<div class="r-snippet">{{ snippet[:200].replace('\n', ' ') }}{% if snippet|length > 200 %}...{% endif %}</div>{% endif %}
           </li>
           {% endfor %}
         </ol>
@@ -105,11 +136,8 @@ python -m uvicorn web_app:app --reload --port 8000</pre>
       {% endif %}
 
       <footer class="footer">
-        <div>
-          Tip: set env <code>INDEX_DIR</code> hoặc <code>DATA_PATH</code> nếu bạn muốn đổi đường dẫn.
-        </div>
+        <div>Tip: set env <code>INDEX_DIR</code>, <code>DATA_PATH</code>, <code>USE_RERANKER</code>, <code>ALLOW_LITE_BUILD</code>.</div>
       </footer>
     </div>
   </body>
 </html>
-

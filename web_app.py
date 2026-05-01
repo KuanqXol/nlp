@@ -6,6 +6,7 @@ Features:
 - Load a saved index from `data/index/`
 - Optional lite demo mode when no index is available
 - Show retrieval metadata and graph/rerank signals when present
+- Compact query understanding and pipeline compare modes
 
 Run:
   pip install fastapi uvicorn jinja2 python-multipart
@@ -27,7 +28,9 @@ from fastapi.templating import Jinja2Templates
 
 from src.data_loader import NewsDataLoader, create_document
 from src.graph.ranking import GraphRanker
-from src.retrieval import EmbeddingManager, Retriever, chunk_documents
+from src.preprocessing.entity_linking import EntityLinker
+from src.preprocessing.ner import VietnameseNER
+from src.retrieval import EmbeddingManager, Retriever, chunk_documents, QueryProcessor
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
@@ -64,12 +67,25 @@ class WebSearchService:
         self.documents: List[Dict[str, Any]] = []
         self.ranker: Optional[GraphRanker] = None
         self.importance_scores: Dict[str, float] = {}
+        self.query_proc: Optional[QueryProcessor] = None
+        self._ner: Optional[VietnameseNER] = None
+        self._linker: Optional[EntityLinker] = None
         self.state = ServiceState(
             mode="not-ready",
             message="Service is starting...",
             index_dir=str(index_dir),
             data_path=str(data_path),
         )
+
+    def _ensure_query_proc(self):
+        if self.query_proc is not None or self.em is None:
+            return
+        try:
+            self._ner = self._ner or VietnameseNER()
+            self._linker = self._linker or EntityLinker(shared_encoder=self.em._enc)
+            self.query_proc = QueryProcessor(self._ner, self._linker)
+        except Exception:
+            self.query_proc = None
 
     def startup(self):
         ok, msg = self._try_load_index()
@@ -139,6 +155,7 @@ class WebSearchService:
             chunk_mode=True,
         )
         self.retriever.load_artifacts(str(self.index_dir))
+        self._ensure_query_proc()
 
         self.state = ServiceState(
             mode="index" if self.ranker is not None else "retrieval-only",
@@ -199,6 +216,7 @@ class WebSearchService:
             self.documents = docs
             self.ranker = None
             self.importance_scores = {}
+            self._ensure_query_proc()
             self.state = ServiceState(
                 mode="retrieval-only",
                 message=f"Lite demo index built from first {len(docs)} docs (no NER/KG).",
@@ -212,12 +230,44 @@ class WebSearchService:
         except Exception as e:
             return False, f"Failed building lite index: {e}"
 
-    def search(self, query: str, top_k: int = 10) -> Tuple[List[Dict[str, Any]], float]:
+    def analyze_query(self, query: str) -> Dict[str, Any]:
+        self._ensure_query_proc()
+        if not self.query_proc:
+            return {
+                "original": query,
+                "normalized": query.strip(),
+                "entities": [],
+                "keywords": [],
+                "topic": None,
+                "year_filter": None,
+                "intent": "news_search",
+            }
+        return self.query_proc.process(query)
+
+    def search(self, query: str, top_k: int = 10, mode: str = "full", page: int = 1) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
         if not self.retriever or not self.em:
-            return [], 0.0
+            return [], 0.0, {}
         t0 = time.time()
-        results = self.retriever.retrieve(query, top_k=top_k, seed_entities=[])
-        return results, time.time() - t0
+        seed_entities: List[str] = []
+        analysis = self.analyze_query(query)
+        if self.query_proc:
+            seed_entities = self.query_proc.get_query_entity_names(analysis)
+        rerank = mode in {"vector-rerank", "full"}
+        use_graph = mode in {"vector-graph", "vector-rerank", "full"}
+        if not use_graph:
+            seed_entities = []
+        fetch_k = max(top_k * page, top_k)
+        results = self.retriever.retrieve(query, top_k=fetch_k, seed_entities=seed_entities, rerank=rerank)
+        start = max(0, (page - 1) * top_k)
+        end = start + top_k
+        return results[start:end], time.time() - t0, analysis
+
+    def compare_modes(self, query: str, top_k: int = 5) -> Dict[str, List[Dict[str, Any]]]:
+        modes = ["vector-only", "vector-graph", "vector-rerank", "full"]
+        out = {}
+        for mode in modes:
+            out[mode], _ = self.search(query, top_k=top_k, mode=mode)
+        return out
 
 
 index_dir = Path(os.getenv("INDEX_DIR", str(DEFAULT_INDEX_DIR)))
@@ -248,19 +298,37 @@ def home(request: Request):
             "results": [],
             "elapsed_ms": None,
             "compare": False,
+            "mode": "full",
+            "analysis": None,
+            "compare_results": None,
         },
     )
 
 
 @app.post("/search", response_class=HTMLResponse)
-def search(request: Request, query: str = Form(...), top_k: int = Form(10)):
+def search(
+    request: Request,
+    query: str = Form(...),
+    top_k: int = Form(10),
+    mode: str = Form("full"),
+    compare: Optional[str] = Form(None),
+):
     query = (query or "").strip()
     top_k = max(1, min(int(top_k or 10), 50))
+    mode = mode if mode in {"vector-only", "vector-graph", "vector-rerank", "full"} else "full"
     results: List[Dict[str, Any]] = []
     elapsed_ms: Optional[int] = None
+    analysis = service.analyze_query(query) if query else None
+    compare_results = None
+    compare_enabled = bool(compare)
     if query and service.state.mode != "not-ready":
-        results, elapsed = service.search(query, top_k=top_k)
-        elapsed_ms = int(elapsed * 1000)
+        if compare_enabled:
+            compare_results = service.compare_modes(query, top_k=min(top_k, 5))
+            results = compare_results.get(mode, [])
+            elapsed_ms = 0
+        else:
+            results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
+            elapsed_ms = int(elapsed * 1000)
 
     return templates.TemplateResponse(
         request=request,
@@ -271,7 +339,10 @@ def search(request: Request, query: str = Form(...), top_k: int = Form(10)):
             "top_k": top_k,
             "results": results,
             "elapsed_ms": elapsed_ms,
-            "compare": False,
+            "compare": compare_enabled,
+            "mode": mode,
+            "analysis": analysis,
+            "compare_results": compare_results,
         },
     )
 
