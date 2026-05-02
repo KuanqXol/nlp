@@ -122,6 +122,17 @@ class _CrossEncoderReranker:
         self._batch_size = 128 if device.startswith("cuda") else 32
         print(f"[Reranker] Đang load: {model_dir} (device={device})")
         self._model = CrossEncoder(model_dir, device=device)
+        # torch.compile: giam CPU overhead, tang GPU utilization
+        try:
+            import torch as _tc
+
+            if hasattr(_tc, "compile") and _tc.cuda.is_available():
+                self._model.model = _tc.compile(
+                    self._model.model, mode="reduce-overhead"
+                )
+                print("[Reranker] torch.compile enabled")
+        except Exception:
+            pass
         print("[Reranker] Sẵn sàng.")
 
     def rerank(

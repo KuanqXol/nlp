@@ -132,6 +132,15 @@ class _PhoBERTNERBackend:
         self._model = AutoModelForTokenClassification.from_pretrained(self.model_dir)
         self._model.to(self._device)
         self._model.eval()
+        # torch.compile: giam CPU overhead, tang GPU utilization
+        try:
+            import torch as _tc
+
+            if hasattr(_tc, "compile") and _tc.cuda.is_available():
+                self._model = _tc.compile(self._model, mode="reduce-overhead")
+                print("[NER] torch.compile enabled")
+        except Exception:
+            pass
 
         # VnCoreNLP word segmenter -- bat buoc de PhoBERT tokenize dung
         # "Ho Chi Minh" -> "Ho_Chi_Minh" -> PhoBERT nhan ra 1 entity
