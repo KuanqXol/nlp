@@ -82,11 +82,14 @@ class WebSearchService:
         if self.query_proc is not None or self.em is None:
             return
         try:
+            print("[WebUI] Initializing query processor...")
             self._ner = self._ner or VietnameseNER()
             self._linker = self._linker or EntityLinker(shared_encoder=self.em._enc)
             self.query_proc = QueryProcessor(self._ner, self._linker)
-        except Exception:
+            print("[WebUI] Query processor ready.")
+        except Exception as e:
             self.query_proc = None
+            print(f"[WebUI] ERROR: failed to initialize query processor: {type(e).__name__}: {e}")
 
     def startup(self):
         ok, msg = self._try_load_index()
@@ -282,6 +285,172 @@ class WebSearchService:
             out[mode] = results
         return out
 
+    def _expand_query_entities(
+        self,
+        query: str,
+        analysis: Dict[str, Any],
+        query_entities: List[Dict[str, Any]],
+        seed_entities: List[str],
+    ) -> List[Dict[str, Any]]:
+        expanded: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add_entity(item: Dict[str, Any]):
+            key = item.get("canonical") or item.get("label") or item.get("id")
+            if not key or key in seen:
+                return
+            seen.add(key)
+            expanded.append(item)
+
+        for idx, ent in enumerate(query_entities):
+            score = float(ent.get("score", ent.get("link_score", 0.5)))
+            add_entity({
+                "id": ent.get("id", f"entity::{ent.get('label', idx)}"),
+                "label": ent.get("label", ent.get("canonical", f"entity_{idx}")),
+                "canonical": ent.get("canonical", ent.get("label", f"entity_{idx}")),
+                "entity_type": ent.get("entity_type", ent.get("type", "MISC")),
+                "score": score,
+                "source": "query",
+                "match_type": ent.get("match_type", "query"),
+                "aliases": ent.get("aliases", []),
+            })
+
+            canonical = ent.get("canonical") or ent.get("label") or f"entity_{idx}"
+            for alias in (ent.get("aliases") or [])[:3]:
+                if alias and alias != canonical:
+                    add_entity({
+                        "id": f"entity::{alias}",
+                        "label": alias,
+                        "canonical": canonical,
+                        "entity_type": ent.get("entity_type", ent.get("type", "MISC")),
+                        "score": max(0.35, score * 0.85),
+                        "source": "expanded",
+                        "match_type": "alias",
+                        "aliases": [alias],
+                    })
+
+        topic = (analysis or {}).get("topic") if analysis else None
+        keywords = (analysis or {}).get("keywords", []) if analysis else []
+        if not expanded:
+            for idx, kw in enumerate(keywords[:4]):
+                add_entity({
+                    "id": f"entity::kw::{kw}",
+                    "label": kw,
+                    "canonical": kw,
+                    "entity_type": "KEYWORD",
+                    "score": max(0.25, 0.55 - idx * 0.06),
+                    "source": "fallback",
+                    "match_type": "keyword",
+                    "aliases": [kw],
+                })
+        if topic:
+            add_entity({
+                "id": f"entity::topic::{topic}",
+                "label": topic,
+                "canonical": topic,
+                "entity_type": "TOPIC",
+                "score": 0.42,
+                "source": "fallback",
+                "match_type": "topic",
+                "aliases": [topic],
+            })
+
+        for idx, seed in enumerate(seed_entities[:6]):
+            add_entity({
+                "id": f"entity::seed::{seed}",
+                "label": seed,
+                "canonical": seed,
+                "entity_type": "SEED",
+                "score": 0.5 - idx * 0.03,
+                "source": "seed",
+                "match_type": "seed",
+                "aliases": [seed],
+            })
+
+        return expanded
+
+    def _build_expanded_ner(
+        self,
+        analysis: Dict[str, Any],
+        seed_entities: List[str],
+    ) -> List[Dict[str, Any]]:
+        entities = analysis.get("entities", []) if analysis else []
+        expanded: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add(item: Dict[str, Any]):
+            key = item.get("canonical") or item.get("label") or item.get("id")
+            if not key or key in seen:
+                return
+            seen.add(key)
+            expanded.append(item)
+
+        for idx, ent in enumerate(entities):
+            canonical = ent.get("canonical") or ent.get("text") or f"entity_{idx}"
+            score = float(ent.get("link_score", 0.5))
+            add({
+                "id": ent.get("entity_id") or f"entity::{canonical}",
+                "label": ent.get("text") or canonical,
+                "canonical": canonical,
+                "type": ent.get("type", "MISC"),
+                "score": score,
+                "source": "query",
+                "match_type": ent.get("match_type", "query"),
+                "aliases": ent.get("aliases", []),
+            })
+            for alias in (ent.get("aliases") or [])[:4]:
+                if alias and alias != canonical:
+                    add({
+                        "id": f"entity::alias::{alias}",
+                        "label": alias,
+                        "canonical": canonical,
+                        "type": ent.get("type", "MISC"),
+                        "score": max(0.35, score * 0.85),
+                        "source": "expanded",
+                        "match_type": "alias",
+                        "aliases": [alias],
+                    })
+
+        if not expanded:
+            for idx, kw in enumerate((analysis.get("keywords", []) if analysis else [])[:4]):
+                add({
+                    "id": f"entity::kw::{kw}",
+                    "label": kw,
+                    "canonical": kw,
+                    "type": "KEYWORD",
+                    "score": max(0.25, 0.55 - idx * 0.06),
+                    "source": "fallback",
+                    "match_type": "keyword",
+                    "aliases": [kw],
+                })
+
+        topic = analysis.get("topic") if analysis else None
+        if topic:
+            add({
+                "id": f"entity::topic::{topic}",
+                "label": topic,
+                "canonical": topic,
+                "type": "TOPIC",
+                "score": 0.42,
+                "source": "fallback",
+                "match_type": "topic",
+                "aliases": [topic],
+            })
+
+        for idx, seed in enumerate(seed_entities[:6]):
+            add({
+                "id": f"entity::seed::{seed}",
+                "label": seed,
+                "canonical": seed,
+                "type": "SEED",
+                "score": max(0.15, 0.5 - idx * 0.03),
+                "source": "seed",
+                "match_type": "seed",
+                "aliases": [seed],
+            })
+
+        return expanded
+
     def _build_graph_payload(
         self,
         query: str,
@@ -289,7 +458,7 @@ class WebSearchService:
         results: List[Dict[str, Any]],
         seed_entities: List[str],
         mode: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         nodes: List[Dict[str, Any]] = []
         edges: List[Dict[str, Any]] = []
         seen_nodes = set()
@@ -302,33 +471,85 @@ class WebSearchService:
             nodes.append(payload)
             seen_nodes.add(node_id)
 
+        def make_entity_node(
+            source: Dict[str, Any],
+            *,
+            kind: str,
+            idx: int,
+            score: float,
+            source_label: str,
+        ) -> Dict[str, Any]:
+            name = source.get("canonical") or source.get("text") or source.get("label") or f"entity_{idx}"
+            entity_id = source.get("entity_id") or f"entity::{name}"
+            return {
+                "id": entity_id,
+                "kind": "entity",
+                "label": name,
+                "canonical": source.get("canonical") or name,
+                "entity_type": source.get("type", "MISC"),
+                "score": float(score),
+                "source": source_label,
+                "match_type": source.get("match_type", kind),
+                "aliases": source.get("aliases", []),
+            }
+
         add_node("query", "query", query or "query", x=0, y=0, fx=0, fy=0, highlight=True)
 
         entities = analysis.get("entities", []) if analysis else []
-        entity_names = []
-        for idx, ent in enumerate(entities[:10]):
-            name = ent.get("canonical") or ent.get("text") or f"entity_{idx}"
-            entity_names.append(name)
-            node_id = f"entity::{name}"
-            strength = float(ent.get("link_score", 0.5))
-            add_node(
-                node_id,
-                "entity",
-                name,
-                entity_type=ent.get("type", "MISC"),
-                score=strength,
-                x=140 + idx * 12,
-                y=40 + idx * 8,
-            )
-            edges.append({"source": "query", "target": node_id, "strength": strength, "kind": "query-entity"})
-
-        if not entity_names and seed_entities:
+        query_entities: List[Dict[str, Any]] = []
+        if entities:
+            for idx, ent in enumerate(entities[:10]):
+                node = make_entity_node(ent, kind=ent.get("match_type", "query"), idx=idx, score=ent.get("link_score", 0.5), source_label="query")
+                query_entities.append(node)
+        elif seed_entities:
             for idx, name in enumerate(seed_entities[:6]):
-                node_id = f"entity::{name}"
-                add_node(node_id, "entity", name, entity_type="SEED", score=0.6, x=160 + idx * 10, y=60 + idx * 10)
-                edges.append({"source": "query", "target": node_id, "strength": 0.6, "kind": "query-entity"})
-                entity_names.append(name)
+                query_entities.append(
+                    {
+                        "id": f"entity::{name}",
+                        "kind": "entity",
+                        "label": name,
+                        "canonical": name,
+                        "entity_type": "SEED",
+                        "score": 0.6,
+                        "source": "fallback",
+                        "match_type": "fallback",
+                        "aliases": [name],
+                    }
+                )
+        elif analysis and analysis.get("keywords"):
+            for idx, kw in enumerate(analysis.get("keywords", [])[:4]):
+                query_entities.append(
+                    {
+                        "id": f"entity::kw::{kw}",
+                        "kind": "entity",
+                        "label": kw,
+                        "canonical": kw,
+                        "entity_type": "KEYWORD",
+                        "score": max(0.25, 0.55 - idx * 0.06),
+                        "source": "fallback",
+                        "match_type": "keyword",
+                        "aliases": [kw],
+                    }
+                )
 
+        expanded_entities = self._expand_query_entities(query, analysis, query_entities, seed_entities)
+        for idx, ent in enumerate(expanded_entities):
+            add_node(
+                ent["id"],
+                "entity",
+                ent["label"],
+                canonical=ent.get("canonical", ent["label"]),
+                entity_type=ent.get("entity_type", "MISC"),
+                score=ent.get("score", 0.5),
+                source=ent.get("source", "query"),
+                match_type=ent.get("match_type", "expanded"),
+                aliases=ent.get("aliases", []),
+                x=0,
+                y=0,
+            )
+            edges.append({"source": "query", "target": ent["id"], "strength": float(ent.get("score", 0.5)), "kind": "query-entity"})
+
+        entity_names = [ent["id"] for ent in expanded_entities]
         top_ids = set()
         for rank, doc in enumerate(results[:10], start=1):
             doc_id = doc.get("id") or f"doc_{rank}"
@@ -342,13 +563,13 @@ class WebSearchService:
                 score=float(doc.get("retrieval_score", 0.0)),
                 title=doc.get("title", ""),
                 url=doc.get("url", ""),
-                x=260 + rank * 10,
-                y=100 + rank * 12,
+                x=0,
+                y=0,
             )
             if entity_names:
                 target_entity = entity_names[(rank - 1) % len(entity_names)]
                 edges.append({
-                    "source": f"entity::{target_entity}",
+                    "source": target_entity,
                     "target": f"doc::{doc_id}",
                     "strength": float(doc.get("retrieval_score", 0.0)),
                     "kind": "entity-document",
@@ -365,6 +586,7 @@ class WebSearchService:
             "results": results,
             "top_ids": list(top_ids),
             "seed_entities": seed_entities,
+            "ner_expansion": expanded_entities,
         }
 
 
@@ -386,6 +608,8 @@ def _startup():
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
+    analysis = None
+    ner_expansion = []
     return templates.TemplateResponse(
         request=request,
         name="index.html",
@@ -397,8 +621,10 @@ def home(request: Request):
             "elapsed_ms": None,
             "compare": False,
             "mode": "full",
-            "analysis": None,
+            "analysis": analysis,
             "compare_results": None,
+            "ner_expansion": ner_expansion,
+            "graph_payload": None,
         },
     )
 
@@ -419,6 +645,7 @@ def search(
     analysis = service.analyze_query(query) if query else None
     compare_results = None
     compare_enabled = bool(compare)
+    graph_payload = None
     if query and service.state.mode != "not-ready":
         if compare_enabled:
             compare_results = service.compare_modes(query, top_k=min(top_k, 5))
@@ -427,7 +654,19 @@ def search(
         else:
             results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
             elapsed_ms = int(elapsed * 1000)
+        graph_payload = service._build_graph_payload(
+            query=query,
+            analysis=analysis or {},
+            results=results,
+            seed_entities=service.query_proc.get_query_entity_names(analysis) if service.query_proc else [],
+            mode=mode,
+        )
+        graph_payload["elapsed_ms"] = elapsed_ms
+        graph_payload["compare"] = compare_enabled
+        graph_payload["compare_results"] = compare_results
+        graph_payload["state"] = service.state.__dict__
 
+    ner_expansion = service._build_expanded_ner(analysis, service.query_proc.get_query_entity_names(analysis) if service.query_proc else []) if query else []
     return templates.TemplateResponse(
         request=request,
         name="index.html",
@@ -441,6 +680,8 @@ def search(
             "mode": mode,
             "analysis": analysis,
             "compare_results": compare_results,
+            "ner_expansion": ner_expansion,
+            "graph_payload": graph_payload,
         },
     )
 
@@ -491,11 +732,12 @@ def api_graph(
     compare_enabled = bool(compare)
     analysis = service.analyze_query(query)
     results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
+    seed_entities = service.query_proc.get_query_entity_names(analysis) if service.query_proc else []
     payload = service._build_graph_payload(
         query=query,
         analysis=analysis,
         results=results,
-        seed_entities=service.query_proc.get_query_entity_names(analysis) if service.query_proc else [],
+        seed_entities=seed_entities,
         mode=mode,
     )
     payload.update({

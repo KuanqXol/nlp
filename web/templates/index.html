@@ -62,7 +62,7 @@
               {% for kw in analysis.get('keywords', [])[:4] %}<span class="tag">{{ kw }}</span>{% endfor %}
             </div>
             {% if analysis.get('entities') %}
-              <div class="muted small">entities</div>
+              <div class="muted small">direct entities</div>
               <div class="chips">
                 {% for e in analysis.get('entities', [])[:4] %}
                   <span class="tag">{{ e.get('canonical', e.get('text', '')) }} · {{ e.get('type', '') }}</span>
@@ -71,6 +71,15 @@
             {% endif %}
           </section>
           {% endif %}
+
+          <section class="card compact" id="ner-expansion-card" {% if not (analysis and (analysis.get('entities') or analysis.get('keywords'))) %}style="display:none"{% endif %}>
+            <div class="section-title">Expanded NER</div>
+            <div class="muted small">Các entity được mở rộng từ query để dùng cho graph.</div>
+            <div class="chips" id="ner-expansion-list">
+              <span class="tag">Đang chờ query...</span>
+            </div>
+            <div class="ner-detail" id="ner-detail">Click một chip để xem vì sao entity này xuất hiện.</div>
+          </section>
 
           {% if compare and compare_results %}
           <section class="card compact">
@@ -168,22 +177,13 @@
       const resultMeta = document.getElementById('result-meta');
       const resultList = document.getElementById('result-list');
       const resultEmpty = document.getElementById('result-empty');
+      const nerExpansionCard = document.getElementById('ner-expansion-card');
+      const nerExpansionList = document.getElementById('ner-expansion-list');
+      const nerDetail = document.getElementById('ner-detail');
       const timers = [];
-      let graphTransform = { scale: 1, tx: 0, ty: 0 };
-      let isDragging = false;
-      let dragStart = null;
-
       function clearTimers() { while (timers.length) clearTimeout(timers.pop()); }
       function clearGraph() { [...svg.querySelectorAll('.node, .edge')].forEach(el => el.remove()); }
       function createNS(name) { return document.createElementNS('http://www.w3.org/2000/svg', name); }
-      function applyGraphTransform() {
-        svg.style.transform = `translate(${graphTransform.tx}px, ${graphTransform.ty}px) scale(${graphTransform.scale})`;
-      }
-      function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
-      function resetGraphTransform() {
-        graphTransform = { scale: 1, tx: 0, ty: 0 };
-        applyGraphTransform();
-      }
       function escLabel(v) { return String(v || '').replace(/\s+/g, ' ').trim(); }
       function setGraphMessage(text) { summary.textContent = text; }
 
@@ -193,6 +193,7 @@
         for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
         return (h % 1000) / 1000;
       }
+      applyGraphTransform();
 
       function buildLayout(payload) {
         const nodes = payload.nodes || [];
@@ -205,13 +206,14 @@
         const querySize = 44;
         const maxEntityScore = Math.max(...entityNodes.map(n => Number(n.score ?? 0.5)), 0.5);
         const maxDocScore = Math.max(...docNodes.map(n => Number(n.score ?? 0.2)), 0.2);
+        const entityCount = Math.max(entityNodes.length, 1);
 
         if (queryNode) positioned.set(queryNode.id, { ...queryNode, x: centerX, y: centerY, delay: 0, r: querySize });
 
         entityNodes.forEach((n, idx) => {
           const seed = hashToUnit(n.id || n.label || idx);
           const score = Number(n.score ?? 0.5);
-          const angle = (idx / Math.max(1, entityNodes.length)) * Math.PI * 2 - Math.PI / 2 + seed * 1.0;
+          const angle = (idx / entityCount) * Math.PI * 2 - Math.PI / 2 + seed * 1.0;
           const orbit = 145 + (1 - score / maxEntityScore) * 55 + seed * 20;
           positioned.set(n.id, {
             ...n,
@@ -282,6 +284,17 @@
           g.setAttribute('class', `node node-${n.kind || 'generic'} ${isTop ? 'is-highlighted' : ''}`);
           g.style.setProperty('--delay', `${p.delay || 0}ms`);
           g.setAttribute('transform', `translate(${p.x}, ${p.y}) scale(0.25)`);
+          g.dataset.nodeId = n.id;
+          g.dataset.kind = n.kind || 'generic';
+          if (n.kind === 'entity') {
+            g.dataset.nerLabel = n.label || '';
+            g.dataset.nerCanonical = n.canonical || n.label || '';
+            g.dataset.nerType = n.entity_type || '';
+            g.dataset.nerSource = n.source || '';
+            g.dataset.nerScore = String(n.score ?? '');
+            g.dataset.nerMatchType = n.match_type || '';
+            g.dataset.nerAliases = (n.aliases || []).join(' | ');
+          }
 
           const r = Math.max(12, Number(n.r || (n.kind === 'query' ? 44 : (n.kind === 'entity' ? 30 : 20))));
           const circle = createNS('circle');
@@ -303,6 +316,21 @@
             rank.setAttribute('dy', 7);
             rank.textContent = `#${n.rank || ''}`;
             g.appendChild(rank);
+          }
+
+          if (n.kind === 'entity' && nerDetail) {
+            g.style.cursor = 'pointer';
+            g.addEventListener('click', () => {
+              nerDetail.innerHTML = `
+                <div><strong>${n.label || n.canonical || n.id || ''}</strong></div>
+                <div class="muted small">canonical: ${n.canonical || ''}</div>
+                <div class="muted small">type: ${n.entity_type || ''} · source: ${n.source || ''}</div>
+                <div class="muted small">match: ${n.match_type || ''} · score: ${Number(n.score || 0).toFixed(2)}</div>
+                ${(n.aliases || []).length ? `<div class="muted small">aliases: ${(n.aliases || []).join(' | ')}</div>` : ''}
+              `;
+              [...svg.querySelectorAll('.node.is-selected')].forEach(el => el.classList.remove('is-selected'));
+              g.classList.add('is-selected');
+            });
           }
 
           svg.appendChild(g);
@@ -342,6 +370,20 @@
       function bindGraphInteractions() {
         const stage = document.querySelector('.graph-stage');
         if (!stage) return;
+        if (nerExpansionList && !nerExpansionList.dataset.bound) {
+          nerExpansionList.dataset.bound = '1';
+          nerExpansionList.addEventListener('click', (ev) => {
+            const btn = ev.target.closest('button[data-ner-id]');
+            if (!btn || !nerDetail) return;
+            nerDetail.innerHTML = `
+              <div><strong>${btn.dataset.nerLabel || ''}</strong></div>
+              <div class="muted small">canonical: ${btn.dataset.nerCanonical || ''}</div>
+              <div class="muted small">type: ${btn.dataset.nerType || ''} · source: ${btn.dataset.nerSource || ''}</div>
+              <div class="muted small">match: ${btn.dataset.nerMatchType || ''} · score: ${btn.dataset.nerScore || ''}</div>
+              ${btn.dataset.nerAliases ? `<div class="muted small">aliases: ${btn.dataset.nerAliases}</div>` : ''}
+            `;
+          });
+        }
         stage.addEventListener('wheel', (ev) => {
           ev.preventDefault();
           const delta = ev.deltaY > 0 ? -0.08 : 0.08;
@@ -373,6 +415,20 @@
         });
       }
 
+      function renderExpandedNER(payload) {
+        if (!nerExpansionList) return;
+        const ner = payload.ner_expansion || [];
+        if (!nerExpansionCard) return;
+        nerExpansionCard.style.display = ner.length ? '' : 'none';
+        nerExpansionList.innerHTML = ner.length ? ner.map((item) => {
+          const sourceClass = item.source === 'query' ? 'tag-query' : (item.source === 'expanded' ? 'tag-doc' : 'tag-entity');
+          return `<button type="button" class="tag ${sourceClass}" data-ner-id="${item.id || ''}" data-ner-label="${item.label || item.canonical || ''}" data-ner-source="${item.source || ''}" data-ner-type="${item.type || ''}" data-ner-score="${Number(item.score || 0).toFixed(2)}" data-ner-canonical="${item.canonical || ''}" data-ner-match-type="${item.match_type || ''}" data-ner-aliases="${(item.aliases || []).join(' | ')}">${item.label || item.canonical || item.id}</button>`;
+        }).join(' ') : '<span class="tag">Không có NER mở rộng.</span>';
+        if (nerDetail) {
+          nerDetail.textContent = ner.length ? 'Click một chip để xem vì sao entity này xuất hiện.' : 'Không có NER mở rộng.';
+        }
+      }
+
       function renderResults(payload) {
         const docs = payload.results || [];
         if (!resultList) return;
@@ -396,6 +452,14 @@
         `).join('') : '<div class="empty">Không có kết quả.</div>';
       }
 
+      function syncSearchState(payload) {
+        drawGraphShell(payload);
+        renderExpandedNER(payload);
+        renderResults(payload);
+        resultMeta.textContent = `${payload.elapsed_ms || 0}ms · ${(payload.results || []).length} docs`;
+        if (resultEmpty) resultEmpty.textContent = payload.results && payload.results.length ? 'Top-k đã được highlight trên graph.' : 'Không có kết quả phù hợp.';
+      }
+
       async function runGraphSearch(ev) {
         ev.preventDefault();
         btn.disabled = true;
@@ -404,10 +468,7 @@
         if (resultEmpty) resultEmpty.textContent = 'Đang tìm và highlight top-k trên graph…';
         try {
           const payload = await fetchGraph();
-          drawGraphShell(payload);
-          renderResults(payload);
-          resultMeta.textContent = `${payload.elapsed_ms || 0}ms · ${(payload.results || []).length} docs`;
-          if (resultEmpty) resultEmpty.textContent = payload.results && payload.results.length ? 'Top-k đã được highlight trên graph.' : 'Không có kết quả phù hợp.';
+          syncSearchState(payload);
         } catch (err) {
           setGraphMessage(`Error: ${err.message}`);
           empty.style.display = 'grid';
@@ -420,13 +481,17 @@
 
       bindGraphInteractions();
       form.addEventListener('submit', runGraphSearch);
-      if ({{ query | tojson }}) {
+      const initialPayload = {{ (graph_payload or none) | tojson }};
+      if (initialPayload) {
+        syncSearchState(initialPayload);
+      } else if ({{ query | tojson }}) {
         drawGraphShell({
           query: {{ query | tojson }},
           mode: 'full',
           nodes: [{ id: 'query', kind: 'query', label: {{ query | tojson }} }],
           edges: [],
           top_ids: [],
+          ner_expansion: [],
         });
       }
     </script>
