@@ -266,6 +266,7 @@ class Retriever:
         seed_entities: List[str] = None,
         rerank: bool = True,
         apply_decay: bool = True,
+        use_graph_boost: bool = True,
     ) -> List[Dict]:
         return self.search(
             query,
@@ -273,6 +274,7 @@ class Retriever:
             seed_entities=seed_entities,
             rerank=rerank,
             apply_decay=apply_decay,
+            use_graph_boost=use_graph_boost,
         )
 
     def search(
@@ -282,6 +284,7 @@ class Retriever:
         seed_entities: List[str] = None,
         rerank: bool = True,
         apply_decay: bool = True,
+        use_graph_boost: bool = True,
     ) -> List[Dict]:
 
         if self._em is None:
@@ -298,7 +301,7 @@ class Retriever:
 
         # PPR scores nếu có seed entities
         ppr_scores: Dict[str, float] = {}
-        if seed_entities and self._graph_ranker and self._kg:
+        if use_graph_boost and seed_entities and self._graph_ranker and self._kg:
             ppr_scores = self._graph_ranker.query_time_scores(
                 self._kg, seeds=seed_entities
             )
@@ -306,11 +309,11 @@ class Retriever:
         # Build candidates (chunk → doc dedup)
         if self._chunk_mode:
             candidates = self._candidates_from_chunks(
-                chunk_ids, vec_score_map, ppr_scores
+                chunk_ids, vec_score_map, ppr_scores if use_graph_boost else {}
             )
         else:
             candidates = self._candidates_from_docs(
-                chunk_ids, vec_score_map, ppr_scores
+                chunk_ids, vec_score_map, ppr_scores if use_graph_boost else {}
             )
 
         # Cross-encoder rerank

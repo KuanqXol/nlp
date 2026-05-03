@@ -70,6 +70,7 @@ class WebSearchService:
         self.query_proc: Optional[QueryProcessor] = None
         self._ner: Optional[VietnameseNER] = None
         self._linker: Optional[EntityLinker] = None
+        self._kg = None
         self.state = ServiceState(
             mode="not-ready",
             message="Service is starting...",
@@ -130,10 +131,12 @@ class WebSearchService:
             try:
                 with open(kg_pkl, "rb") as f:
                     kg = pickle.load(f)
+                self._kg = kg
                 self.ranker = GraphRanker()
                 self.ranker.compute_pagerank(kg)
                 self.importance_scores = self.ranker.compute_importance_scores(kg)
             except Exception:
+                self._kg = None
                 self.ranker = None
                 self.importance_scores = {}
 
@@ -215,6 +218,7 @@ class WebSearchService:
 
             self.documents = docs
             self.ranker = None
+            self._kg = None
             self.importance_scores = {}
             self._ensure_query_proc()
             self.state = ServiceState(
@@ -253,11 +257,19 @@ class WebSearchService:
         if self.query_proc:
             seed_entities = self.query_proc.get_query_entity_names(analysis)
         rerank = mode in {"vector-rerank", "full"}
-        use_graph = mode in {"vector-graph", "vector-rerank", "full"}
+        use_graph = mode in {"vector-graph", "full"}
+        use_decay = mode == "full"
         if not use_graph:
             seed_entities = []
         fetch_k = max(top_k * page, top_k)
-        results = self.retriever.retrieve(query, top_k=fetch_k, seed_entities=seed_entities, rerank=rerank)
+        results = self.retriever.retrieve(
+            query,
+            top_k=fetch_k,
+            seed_entities=seed_entities,
+            rerank=rerank,
+            apply_decay=use_decay,
+            use_graph_boost=use_graph,
+        )
         start = max(0, (page - 1) * top_k)
         end = start + top_k
         return results[start:end], time.time() - t0, analysis
@@ -269,6 +281,91 @@ class WebSearchService:
             results, _, _ = self.search(query, top_k=top_k, mode=mode)
             out[mode] = results
         return out
+
+    def _build_graph_payload(
+        self,
+        query: str,
+        analysis: Dict[str, Any],
+        results: List[Dict[str, Any]],
+        seed_entities: List[str],
+        mode: str,
+    ) -> List[Dict[str, Any]]:
+        nodes: List[Dict[str, Any]] = []
+        edges: List[Dict[str, Any]] = []
+        seen_nodes = set()
+
+        def add_node(node_id: str, kind: str, label: str, **extra: Any):
+            if node_id in seen_nodes:
+                return
+            payload = {"id": node_id, "kind": kind, "label": label}
+            payload.update(extra)
+            nodes.append(payload)
+            seen_nodes.add(node_id)
+
+        add_node("query", "query", query or "query", x=0, y=0, fx=0, fy=0, highlight=True)
+
+        entities = analysis.get("entities", []) if analysis else []
+        entity_names = []
+        for idx, ent in enumerate(entities[:10]):
+            name = ent.get("canonical") or ent.get("text") or f"entity_{idx}"
+            entity_names.append(name)
+            node_id = f"entity::{name}"
+            strength = float(ent.get("link_score", 0.5))
+            add_node(
+                node_id,
+                "entity",
+                name,
+                entity_type=ent.get("type", "MISC"),
+                score=strength,
+                x=140 + idx * 12,
+                y=40 + idx * 8,
+            )
+            edges.append({"source": "query", "target": node_id, "strength": strength, "kind": "query-entity"})
+
+        if not entity_names and seed_entities:
+            for idx, name in enumerate(seed_entities[:6]):
+                node_id = f"entity::{name}"
+                add_node(node_id, "entity", name, entity_type="SEED", score=0.6, x=160 + idx * 10, y=60 + idx * 10)
+                edges.append({"source": "query", "target": node_id, "strength": 0.6, "kind": "query-entity"})
+                entity_names.append(name)
+
+        top_ids = set()
+        for rank, doc in enumerate(results[:10], start=1):
+            doc_id = doc.get("id") or f"doc_{rank}"
+            top_ids.add(doc_id)
+            label = doc.get("title") or doc_id
+            add_node(
+                f"doc::{doc_id}",
+                "document",
+                label,
+                rank=rank,
+                score=float(doc.get("retrieval_score", 0.0)),
+                title=doc.get("title", ""),
+                url=doc.get("url", ""),
+                x=260 + rank * 10,
+                y=100 + rank * 12,
+            )
+            if entity_names:
+                target_entity = entity_names[(rank - 1) % len(entity_names)]
+                edges.append({
+                    "source": f"entity::{target_entity}",
+                    "target": f"doc::{doc_id}",
+                    "strength": float(doc.get("retrieval_score", 0.0)),
+                    "kind": "entity-document",
+                })
+            else:
+                edges.append({"source": "query", "target": f"doc::{doc_id}", "strength": float(doc.get("retrieval_score", 0.0)), "kind": "query-document"})
+
+        return {
+            "query": query,
+            "mode": mode,
+            "analysis": analysis,
+            "nodes": nodes,
+            "edges": edges,
+            "results": results,
+            "top_ids": list(top_ids),
+            "seed_entities": seed_entities,
+        }
 
 
 index_dir = Path(os.getenv("INDEX_DIR", str(DEFAULT_INDEX_DIR)))
@@ -374,3 +471,37 @@ def api_analysis(query: str = ""):
     if not query:
         return JSONResponse({"error": "missing_query"}, status_code=400)
     return JSONResponse(service.analyze_query(query))
+
+
+@app.post("/api/graph")
+def api_graph(
+    query: str = Form(...),
+    top_k: int = Form(10),
+    mode: str = Form("full"),
+    compare: Optional[str] = Form(None),
+):
+    query = (query or "").strip()
+    top_k = max(1, min(int(top_k or 10), 50))
+    mode = mode if mode in {"vector-only", "vector-graph", "vector-rerank", "full"} else "full"
+    if not query:
+        return JSONResponse({"error": "missing_query"}, status_code=400)
+    if service.state.mode == "not-ready":
+        return JSONResponse({"error": "not_ready", "state": service.state.__dict__}, status_code=503)
+
+    compare_enabled = bool(compare)
+    analysis = service.analyze_query(query)
+    results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
+    payload = service._build_graph_payload(
+        query=query,
+        analysis=analysis,
+        results=results,
+        seed_entities=service.query_proc.get_query_entity_names(analysis) if service.query_proc else [],
+        mode=mode,
+    )
+    payload.update({
+        "elapsed_ms": int(elapsed * 1000),
+        "compare": compare_enabled,
+        "compare_results": service.compare_modes(query, top_k=min(top_k, 5)) if compare_enabled else None,
+        "state": service.state.__dict__,
+    })
+    return JSONResponse(payload)
