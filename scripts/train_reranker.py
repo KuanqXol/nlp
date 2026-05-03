@@ -437,18 +437,29 @@ def build_metrics():
     def compute(eval_pred):
         logits = np.asarray(eval_pred.predictions)
         labels = np.asarray(eval_pred.label_ids).reshape(-1)
+
         if logits.ndim == 1:
-            pos = logits
-            pred = (logits >= 0.5).astype(np.int32)
+            pos = np.asarray(logits, dtype=np.float64)
+            pred = (pos >= 0.5).astype(np.int32)
         else:
-            ex = np.exp(logits - np.max(logits, axis=1, keepdims=True))
-            probs = ex / np.sum(ex, axis=1, keepdims=True)
-            pos = probs[:, -1]
+            # Dùng logits lớp dương trực tiếp thay vì softmax để tránh
+            # phát sinh NaN khi model quá tự tin hoặc logits bị overflow.
+            pos = np.asarray(logits[:, -1], dtype=np.float64)
             pred = np.argmax(logits, axis=1)
+
+        valid_mask = np.isfinite(pos)
+        if not np.all(valid_mask):
+            pos = np.nan_to_num(pos, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        try:
+            roc_auc = float(roc_auc_score(labels, pos)) if len(np.unique(labels)) > 1 else 0.0
+        except ValueError:
+            roc_auc = 0.0
+
         return {
             "accuracy": float(accuracy_score(labels, pred)),
             "f1": float(f1_score(labels, pred, zero_division=0)),
-            "roc_auc": float(roc_auc_score(labels, pos)) if len(np.unique(labels)) > 1 else 0.0,
+            "roc_auc": roc_auc,
         }
 
     return compute
@@ -471,12 +482,39 @@ def _build_weighted_dataset(examples: List[Dict], tokenizer, max_length: int):
     )
 
     def tok(batch):
-        enc = tokenizer(batch["query"], batch["passage"], truncation=True, max_length=max_length)
+        enc = tokenizer(
+            batch["query"],
+            batch["passage"],
+            truncation=True,
+            max_length=max_length,
+        )
         enc["labels"] = batch["labels"]
         enc["difficulty"] = batch["difficulty"]
         return enc
 
     return ds.map(tok, batched=True, remove_columns=ds.column_names)
+
+
+def _sanitize_model_outputs(outputs):
+    import torch
+
+    logits = outputs.logits
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+    return logits
+
+
+class WeightedTrainer:
+    """Compatibility placeholder.
+
+    We intentionally keep the training loss standard and handle curriculum by
+    stage composition / sampling only. This is more stable for reranker training
+    while still matching the Ezpl goal of multi-source curriculum learning.
+    """
+
+    @staticmethod
+    def build(TrainerBase):
+        return TrainerBase
 
 
 def _chunk_examples(examples: List[Dict], batch_size: int) -> List[List[Dict]]:
@@ -496,6 +534,8 @@ def train(args):
         TrainerCallback,
         TrainingArguments,
     )
+
+    WeightedTrainerClass = WeightedTrainer.build(Trainer)
 
     class EarlyStop(TrainerCallback):
         def __init__(self, metric: str = "eval_roc_auc", patience: int = 2, threshold: float = 0.001):
@@ -546,10 +586,12 @@ def train(args):
         num_train_epochs=args.epochs_per_stage,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        warmup_steps=args.warmup_steps,
+        max_grad_norm=args.max_grad_norm,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        evaluation_strategy=args.eval_strategy,
+        eval_strategy=args.eval_strategy,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
@@ -557,7 +599,8 @@ def train(args):
         load_best_model_at_end=args.load_best_model_at_end,
         metric_for_best_model="roc_auc",
         greater_is_better=True,
-        fp16=torch.cuda.is_available(),
+        fp16=False,
+        bf16=False,
         report_to=[],
         remove_unused_columns=False,
         save_total_limit=args.save_total_limit,
@@ -597,20 +640,28 @@ def train(args):
 
         # Higher difficulty means more training focus when sampling/packing isn't available.
         # We pass the raw examples into metadata so future extensions can sample by difficulty.
-        trainer = Trainer(
+        trainer = WeightedTrainerClass(
             model=model,
             args=training_args,
             train_dataset=tokenized_train,
             eval_dataset=raw["validation"],
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
             compute_metrics=build_metrics(),
             callbacks=[EarlyStop(args.early_stopping_patience, args.early_stopping_threshold)] if args.early_stopping_patience > 0 else [],
         )
 
         stage_resume = resume if stage_idx == 1 else None
+        if stage_resume is None:
+            _log(f"[stage {stage_name}] fresh start")
+        else:
+            _log(f"[stage {stage_name}] resume from {stage_resume}")
         train_result = trainer.train(resume_from_checkpoint=stage_resume)
         metrics = trainer.evaluate()
+        metrics = {
+            k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+            for k, v in metrics.items()
+        }
         _log(f"[stage {stage_name}] {json.dumps(metrics, ensure_ascii=False)}")
 
         overall_summary["stages"].append(
@@ -639,6 +690,8 @@ def train(args):
             "max_length": args.max_length,
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
+            "warmup_steps": args.warmup_steps,
+            "max_grad_norm": args.max_grad_norm,
             "eval_strategy": args.eval_strategy,
             "eval_steps": args.eval_steps,
             "save_strategy": args.save_strategy,
@@ -656,6 +709,7 @@ def train(args):
             "max_news_articles": args.max_news_articles,
             "news_val_ratio": args.news_val_ratio,
             "max_pseudo_queries_per_article": args.max_pseudo_queries_per_article,
+            "quick_test": args.quick_test,
             "local_usage": "Giai nen model vao data/reranker_model/ roi chay: python main.py --load-index --reranker-dir data/reranker_model",
         }
     )
@@ -679,6 +733,8 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--epochs-per-stage", type=float, default=1.0)
     p.add_argument("--learning-rate", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--warmup-steps", type=int, default=100)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--max-length", type=int, default=256)
     p.add_argument("--per-device-train-batch-size", type=int, default=8)
     p.add_argument("--per-device-eval-batch-size", type=int, default=16)
@@ -704,11 +760,33 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--allow-cpu", action="store_true")
     p.add_argument("--resume-from-checkpoint", type=str, default="auto")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--quick-test", action="store_true", help="Run a very small end-to-end smoke test")
     return p.parse_args(list(argv) if argv is not None else sys.argv[1:])
 
 
 def main(argv: Optional[Sequence[str]] = None):
     args = parse_args(argv)
+    if args.quick_test:
+        args.allow_cpu = True
+        args.epochs_per_stage = 0.05
+        args.logging_steps = 1
+        args.eval_steps = 2
+        args.save_steps = 2
+        args.save_total_limit = 1
+        args.per_device_train_batch_size = 2
+        args.per_device_eval_batch_size = 2
+        args.gradient_accumulation_steps = 1
+        args.max_news_articles = min(args.max_news_articles, 120)
+        args.news_val_ratio = min(max(args.news_val_ratio, 0.1), 0.2)
+        args.max_pseudo_queries_per_article = 1
+        args.hard_negatives = 1
+        args.viquad_train_max = min(args.viquad_train_max, 200)
+        args.viquad_val_max = min(args.viquad_val_max, 80)
+        args.msmarco_train_max = 0
+        args.msmarco_val_max = 0
+        args.eval_strategy = "steps"
+        args.save_strategy = "steps"
+        _log("[quick-test] Enabled end-to-end smoke test preset")
     train(args)
 
 

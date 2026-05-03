@@ -266,7 +266,8 @@ class WebSearchService:
         modes = ["vector-only", "vector-graph", "vector-rerank", "full"]
         out = {}
         for mode in modes:
-            out[mode], _ = self.search(query, top_k=top_k, mode=mode)
+            results, _, _ = self.search(query, top_k=top_k, mode=mode)
+            out[mode] = results
         return out
 
 
@@ -355,5 +356,21 @@ def health():
             "mode": service.state.mode,
             "docs": service.state.n_docs,
             "chunks": service.state.n_chunks,
+            "reranker_enabled": _env_flag("USE_RERANKER", False),
+            "lite_build_enabled": _env_flag("ALLOW_LITE_BUILD", False),
+            "query_understanding": service.query_proc is not None,
         }
     )
+
+
+@app.get("/api/status")
+def api_status():
+    return health()
+
+
+@app.get("/api/analysis")
+def api_analysis(query: str = ""):
+    query = (query or "").strip()
+    if not query:
+        return JSONResponse({"error": "missing_query"}, status_code=400)
+    return JSONResponse(service.analyze_query(query))

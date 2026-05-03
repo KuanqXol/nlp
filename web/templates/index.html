@@ -10,7 +10,7 @@
     <div class="container">
       <header class="header">
         <div class="title">Vietnamese News Search Demo</div>
-        <div class="subtitle">FAISS · graph boost · rerank · query understanding</div>
+        <div class="subtitle">FAISS · graph · rerank · query understanding</div>
       </header>
 
       <section class="card status">
@@ -19,16 +19,16 @@
           <div class="status-text">{{ state.message }}</div>
         </div>
         <div class="meta">
-          <div><span class="k">index_dir</span> <span class="v">{{ state.index_dir }}</span></div>
-          <div><span class="k">data_path</span> <span class="v">{{ state.data_path }}</span></div>
+          <div><span class="k">index</span> <span class="v">{{ state.index_dir }}</span></div>
+          <div><span class="k">data</span> <span class="v">{{ state.data_path }}</span></div>
           <div><span class="k">docs</span> <span class="v">{{ state.n_docs }}</span></div>
           <div><span class="k">chunks</span> <span class="v">{{ state.n_chunks }}</span></div>
         </div>
 
         {% if state.mode == 'not-ready' %}
         <div class="hint">
-          <div class="hint-title">Cần index để search</div>
-          <div class="hint-body">Build index trước, hoặc bật lite build nếu chỉ cần demo nhanh.</div>
+          <div class="hint-title">Chưa sẵn sàng</div>
+          <div class="hint-body">Build index trước hoặc bật lite build để demo nhanh.</div>
           <pre>python scripts/build_index.py --data data/vnexpress_articles.csv</pre>
           <pre>set ALLOW_LITE_BUILD=1
 set DEMO_MAX_DOCS=2000
@@ -72,12 +72,12 @@ python -m uvicorn web_app:app --reload --port 8000</pre>
           <span class="tag">intent={{ analysis.get('intent', 'news_search') }}</span>
           {% if analysis.get('topic') %}<span class="tag">topic={{ analysis.get('topic') }}</span>{% endif %}
           {% if analysis.get('year_filter') %}<span class="tag">year={{ analysis.get('year_filter') }}</span>{% endif %}
-          {% for kw in analysis.get('keywords', [])[:5] %}<span class="tag">{{ kw }}</span>{% endfor %}
+          {% for kw in analysis.get('keywords', [])[:4] %}<span class="tag">{{ kw }}</span>{% endfor %}
         </div>
         {% if analysis.get('entities') %}
           <div class="muted small">entities</div>
           <div class="chips">
-            {% for e in analysis.get('entities', [])[:5] %}
+            {% for e in analysis.get('entities', [])[:4] %}
               <span class="tag">{{ e.get('canonical', e.get('text', '')) }} · {{ e.get('type', '') }}</span>
             {% endfor %}
           </div>
@@ -92,8 +92,8 @@ python -m uvicorn web_app:app --reload --port 8000</pre>
           <div class="compare-block">
             <div class="compare-title">{{ k }}</div>
             <div class="chips">
-              {% for doc in docs[:3] %}
-                <span class="tag">{{ doc.get('title', '(no title)')[:48] }}</span>
+              {% for doc in docs[:2] %}
+                <span class="tag">{{ doc.get('title', '(no title)')[:42] }}</span>
               {% endfor %}
             </div>
           </div>
@@ -125,10 +125,8 @@ python -m uvicorn web_app:app --reload --port 8000</pre>
               {% if doc.get('category') %}<span class="tag">{{ doc.get('category') }}</span>{% endif %}
               {% if doc.get('graph_boost') is not none %}<span class="tag">graph={{ '%.4f' | format(doc.get('graph_boost', 0.0)) }}</span>{% endif %}
               {% if doc.get('vector_score') is not none %}<span class="tag">vec={{ '%.4f' | format(doc.get('vector_score', 0.0)) }}</span>{% endif %}
-              {% if doc.get('cross_encoder_score') is not none %}<span class="tag">ce={{ '%.4f' | format(doc.get('cross_encoder_score', 0.0)) }}</span>{% endif %}
+              {% if doc.get('cross_encoder_score') is not none %}<span class="tag">rerank={{ '%.4f' | format(doc.get('cross_encoder_score', 0.0)) }}</span>{% endif %}
             </div>
-            {% set snippet = doc.get('chunk_text') or doc.get('content') or '' %}
-            {% if snippet %}<div class="r-snippet">{{ snippet[:200].replace('\n', ' ') }}{% if snippet|length > 200 %}...{% endif %}</div>{% endif %}
           </li>
           {% endfor %}
         </ol>
@@ -136,7 +134,7 @@ python -m uvicorn web_app:app --reload --port 8000</pre>
       {% endif %}
 
       <footer class="footer">
-        <div>Tip: set env <code>INDEX_DIR</code>, <code>DATA_PATH</code>, <code>USE_RERANKER</code>, <code>ALLOW_LITE_BUILD</code>.</div>
+        <div>API: <code>/api/status</code> · <code>/api/analysis?query=...</code></div>
       </footer>
     </div>
   </body>
