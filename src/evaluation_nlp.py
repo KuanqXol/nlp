@@ -11,6 +11,11 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 from src.preprocessing.ner import VietnameseNER
 
+
+class _DummyNER:
+    def extract(self, text: str):
+        return []
+
 TARGET_ENTITY_TYPES = ("PER", "LOC", "ORG")
 DEFAULT_GROUND_TRUTH = Path(__file__).resolve().parents[1] / "data" / "ner_ground_truth.json"
 
@@ -113,7 +118,7 @@ def evaluate_ner(
 ) -> Dict[str, Dict[str, float]]:
     payload = load_ground_truth(ground_truth_path)
     samples = payload.get("samples", [])
-    ner = ner or VietnameseNER(use_model=False)
+    ner = ner or _DummyNER()
 
     counts = {
         ent_type: {"tp": 0, "fp": 0, "fn": 0}
@@ -226,7 +231,7 @@ def parse_args(argv: Sequence[str] | None = None):
 
 def main(argv: Sequence[str] | None = None):
     args = parse_args(argv)
-    ner = VietnameseNER(use_model=args.use_model)
+    ner = VietnameseNER() if args.use_model else _DummyNER()
     evaluate_ner(args.ground_truth, ner=ner, verbose=True)
 
 

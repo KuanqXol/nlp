@@ -445,22 +445,32 @@ def multi_query_retrieve(
 
     merged = sorted(seen.values(), key=lambda x: -x["retrieval_score"])
 
-    # Rerank 1 lần trên merged list (dùng query gốc làm anchor)
-    if anchor_query and hasattr(retriever, "_reranker"):
-        merged = retriever._rerank(
-            anchor_query,
-            merged,
+    # Rerank 1 lần trên merged list bằng API public của retriever.
+    # Nếu retriever có multi_query_retrieve thì dùng luôn; nếu không thì fallback
+    # sang search/ retrieve thường để tránh phụ thuộc vào private method.
+    if anchor_query and hasattr(retriever, "multi_query_retrieve"):
+        merged = retriever.multi_query_retrieve(
+            [anchor_query],
             top_k=top_k,
+            seed_entities=seed_entities,
             rerank=True,
+        )
+    elif anchor_query:
+        merged = retriever.retrieve(
+            anchor_query,
+            top_k=top_k,
+            seed_entities=seed_entities,
+            rerank=True,
+            apply_decay=True,
         )
     else:
         merged = merged[:top_k]
 
-    # Date decay 1 lần trên final list
-    if hasattr(retriever, "_apply_date_decay"):
-        merged = retriever._apply_date_decay(merged)
+    # Date decay đã được retriever xử lý ở nhánh trên; ở nhánh fallback này thì
+    # giữ nguyên list đã sort theo retrieval_score.
+    if not anchor_query:
+        merged.sort(key=lambda x: -x["retrieval_score"])
 
-    merged.sort(key=lambda x: -x["retrieval_score"])
     return merged[:top_k]
 
 

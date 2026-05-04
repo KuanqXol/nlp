@@ -23,9 +23,11 @@ from src.utils.text import split_sentences as _split_sentences
 
 # ── Cấu hình ─────────────────────────────────────────────────────────────────
 
-DEFAULT_MAX_CHUNK_CHARS = 1500  # ~100 tokens SBERT
-DEFAULT_MIN_CHUNK_CHARS = 200
-DEFAULT_OVERLAP_SENTENCES = 2  # Số câu overlap giữa 2 chunk liên tiếp
+# Chunking được chuẩn hóa theo Ezpl: chunk nhỏ để giữ ngữ nghĩa tập trung.
+# Giá trị này được dùng thống nhất bởi CLI, build index và web demo.
+DEFAULT_MAX_CHUNK_CHARS = 400
+DEFAULT_MIN_CHUNK_CHARS = 120
+DEFAULT_OVERLAP_SENTENCES = 1  # Số câu overlap giữa 2 chunk liên tiếp
 
 
 # ── Chunking functions ────────────────────────────────────────────────────────

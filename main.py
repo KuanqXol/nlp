@@ -42,6 +42,15 @@ from src.retrieval import (
     QueryProcessor,
     QueryExpander,
 )
+from src.retrieval.chunking import (
+    DEFAULT_MAX_CHUNK_CHARS,
+    DEFAULT_OVERLAP_SENTENCES,
+)
+from src.retrieval.chunking import (
+    DEFAULT_MAX_CHUNK_CHARS,
+    DEFAULT_OVERLAP_SENTENCES,
+    DEFAULT_MIN_CHUNK_CHARS,
+)
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 
@@ -223,7 +232,11 @@ class NewsSearchSystem:
         # Chunking + embedding
         print("\n📦 Đang chunking và embedding...")
         chunks, doc_to_chunks = chunk_documents(
-            self._documents, strategy="sentence_window", max_chars=1500
+            self._documents,
+            strategy="sentence_window",
+            max_chars=DEFAULT_MAX_CHUNK_CHARS,
+            overlap=DEFAULT_OVERLAP_SENTENCES,
+            prepend_title=True,
         )
         chunk_dicts = [
             {"id": c["chunk_id"], "full_text": c["chunk_text"]} for c in chunks
@@ -400,12 +413,16 @@ class NewsSearchSystem:
         for i, s in enumerate(suggestions, 1):
             print(f"   {i}. {s}")
 
-    def _export_viz(self):
+    def _export_viz(self, focus_scores=None):
         try:
             viz = KnowledgeGraphVisualizer()
             out_path = str(DATA_DIR / "kg_visualization")
             result = viz.visualize(
-                self.kg, output_path=out_path, top_k=50, interactive=True
+                self.kg,
+                output_path=out_path,
+                top_k=50,
+                interactive=True,
+                focus_scores=focus_scores,
             )
             print(f"✅ Đã xuất visualization: {result}")
         except Exception as e:

@@ -118,6 +118,7 @@ class PyvisVisualizer:
         output_path: str = "knowledge_graph.html",
         top_k: int = 60,
         title: str = "Vietnamese News Knowledge Graph",
+        focus_scores: Optional[Dict[str, float]] = None,
     ) -> Optional[str]:
         """
         Tạo file HTML interactive từ KG.
@@ -158,22 +159,27 @@ class PyvisVisualizer:
             notebook=False,
         )
 
-        # Cấu hình physics
+        # Cấu hình physics: đẩy node ra xa nhau hơn để giảm overlap
         net.set_options(
             """
         var options = {
           "physics": {
             "forceAtlas2Based": {
-              "gravitationalConstant": -80,
-              "springLength": 120,
-              "springConstant": 0.05
+              "gravitationalConstant": -120,
+              "centralGravity": 0.02,
+              "springLength": 160,
+              "springConstant": 0.06,
+              "damping": 0.45,
+              "avoidOverlap": 1
             },
             "solver": "forceAtlas2Based",
-            "stabilization": {"iterations": 150}
+            "stabilization": {"iterations": 220, "fit": true}
           },
           "interaction": {
             "hover": true,
-            "tooltipDelay": 100
+            "tooltipDelay": 100,
+            "navigationButtons": true,
+            "keyboard": true
           }
         }
         """
@@ -181,21 +187,41 @@ class PyvisVisualizer:
 
         # Thêm nodes
         pagerank = kg._pagerank
-        max_size, min_size = 40, 10
+        pr_values = [pagerank.get(node, 0.0) for node in subgraph.nodes()]
+        pr_min = min(pr_values) if pr_values else 0.0
+        pr_max = max(pr_values) if pr_values else 1.0
+        max_size, min_size = 52, 16
+        top_k_threshold = 0.80
+
+        def _focus_score(node: str) -> float:
+            base = focus_scores.get(node, 0.0) if focus_scores else 0.0
+            if base > 0:
+                return base
+            return pagerank.get(node, 0.0)
+
+        def _node_size(score: float) -> int:
+            if pr_max <= pr_min:
+                return 26
+            norm = (score - pr_min) / (pr_max - pr_min)
+            norm = min(max(norm, 0.0), 1.0)
+            if norm >= top_k_threshold:
+                return max_size
+            return int(min_size + (max_size - min_size) * (0.25 + 0.70 * norm))
 
         for node, data in subgraph.nodes(data=True):
             etype = data.get("type", "UNK")
             color = ENTITY_COLORS.get(etype, ENTITY_COLORS["UNK"])
             shape = ENTITY_SHAPES.get(etype, "dot")
-            pr = pagerank.get(node, 0.01)
-            size = min_size + (max_size - min_size) * min(pr * 10, 1)
+            score = _focus_score(node)
+            size = _node_size(score)
 
             freq = data.get("frequency", 0)
             doc_ids = data.get("doc_ids", [])
             tooltip = (
                 f"Entity: {node}\n"
                 f"Type: {etype}\n"
-                f"PageRank: {pr:.4f}\n"
+                f"Score: {score:.4f}\n"
+                f"PageRank: {pagerank.get(node, 0.01):.4f}\n"
                 f"Frequency: {freq}\n"
                 f"Bài báo: {len(doc_ids)}"
             )
@@ -207,6 +233,9 @@ class PyvisVisualizer:
                 size=int(size),
                 shape=shape,
                 title=tooltip,
+                margin=10,
+                borderWidth=1,
+                font={"size": 16, "face": "arial", "vadjust": -2},
             )
 
         # Thêm edges
@@ -269,19 +298,29 @@ class MatplotlibVisualizer:
         ax.set_facecolor("#1a1a2e")
         fig.patch.set_facecolor("#1a1a2e")
 
-        # Layout
-        pos = nx.spring_layout(subgraph, k=2.0, seed=42)
+        # Layout: tăng k và iterations để giảm đè chồng chéo
+        pos = nx.spring_layout(subgraph, k=2.5, seed=42, iterations=250)
 
         # Node colors và sizes
         node_colors = []
         node_sizes = []
         pagerank = kg._pagerank
+        pr_values = [pagerank.get(node, 0.0) for node in subgraph.nodes()]
+        pr_min = min(pr_values) if pr_values else 0.0
+        pr_max = max(pr_values) if pr_values else 1.0
+
+        def _node_size(pr: float) -> int:
+            if pr_max <= pr_min:
+                return 650
+            norm = (pr - pr_min) / (pr_max - pr_min)
+            norm = min(max(norm, 0.0), 1.0)
+            return int(450 + 1400 * norm)
 
         for node in subgraph.nodes():
             etype = subgraph.nodes[node].get("type", "UNK")
             node_colors.append(ENTITY_COLORS.get(etype, ENTITY_COLORS["UNK"]))
             pr = pagerank.get(node, 0.01)
-            node_sizes.append(200 + 2000 * min(pr * 5, 1))
+            node_sizes.append(_node_size(pr))
 
         # Draw
         nx.draw_networkx_nodes(
@@ -291,6 +330,8 @@ class MatplotlibVisualizer:
             node_color=node_colors,
             node_size=node_sizes,
             alpha=0.9,
+            linewidths=1.0,
+            edgecolors="#ecf0f1",
         )
         nx.draw_networkx_labels(
             subgraph,
@@ -298,6 +339,7 @@ class MatplotlibVisualizer:
             ax=ax,
             font_size=8,
             font_color="white",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#1a1a2e", alpha=0.7, edgecolor="none"),
         )
 
         # Edge labels (chỉ vẽ non-cooccurrence)
@@ -317,7 +359,9 @@ class MatplotlibVisualizer:
             edge_color="#7f8c8d",
             arrows=True,
             arrowsize=10,
-            alpha=0.6,
+            alpha=0.5,
+            width=1.2,
+            connectionstyle="arc3,rad=0.08",
         )
         nx.draw_networkx_edge_labels(
             subgraph,
