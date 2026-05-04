@@ -414,12 +414,16 @@ class NewsSearchSystem:
         for i, s in enumerate(suggestions, 1):
             print(f"   {i}. {s}")
 
-    def _export_viz(self):
+    def _export_viz(self, focus_scores=None):
         try:
             viz = KnowledgeGraphVisualizer()
             out_path = str(DATA_DIR / "kg_visualization")
             result = viz.visualize(
-                self.kg, output_path=out_path, top_k=50, interactive=True
+                self.kg,
+                output_path=out_path,
+                top_k=50,
+                interactive=True,
+                focus_scores=focus_scores,
             )
             print(f"✅ Đã xuất visualization: {result}")
         except Exception as e:
