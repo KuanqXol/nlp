@@ -374,7 +374,18 @@ class WebSearchService:
         analysis: Dict[str, Any],
         seed_entities: List[str],
     ) -> List[Dict[str, Any]]:
+        """Tạo danh sách entity mở rộng phục vụ graph preview.
+
+        Mỗi item cần đủ metadata để frontend giải thích vì sao entity xuất hiện:
+        - source: query / expanded / fallback / seed
+        - match_type: query / alias / keyword / topic / seed
+        - aliases: các biến thể tên gọi
+        - reason: mô tả ngắn bằng tiếng Việt
+        - evidence: nguồn gốc cụ thể từ query/keyword/topic/seed
+        """
         entities = analysis.get("entities", []) if analysis else []
+        keywords = analysis.get("keywords", []) if analysis else []
+        topic = analysis.get("topic") if analysis else None
         expanded: List[Dict[str, Any]] = []
         seen = set()
 
@@ -387,54 +398,78 @@ class WebSearchService:
 
         for idx, ent in enumerate(entities):
             canonical = ent.get("canonical") or ent.get("text") or f"entity_{idx}"
+            mention = ent.get("text") or canonical
             score = float(ent.get("link_score", 0.5))
+            entity_type = ent.get("type", "MISC")
+            aliases = ent.get("aliases", []) or []
             add({
                 "id": ent.get("entity_id") or f"entity::{canonical}",
-                "label": ent.get("text") or canonical,
+                "label": mention,
                 "canonical": canonical,
-                "type": ent.get("type", "MISC"),
+                "entity_type": entity_type,
                 "score": score,
                 "source": "query",
                 "match_type": ent.get("match_type", "query"),
-                "aliases": ent.get("aliases", []),
+                "aliases": aliases,
+                "reason": f"Entity này xuất hiện trực tiếp trong query và đã được NER nhận dạng là {entity_type}.",
+                "evidence": {
+                    "kind": "query_entity",
+                    "mention": mention,
+                    "canonical": canonical,
+                },
             })
-            for alias in (ent.get("aliases") or [])[:4]:
+            for alias in aliases[:4]:
                 if alias and alias != canonical:
                     add({
                         "id": f"entity::alias::{alias}",
                         "label": alias,
                         "canonical": canonical,
-                        "type": ent.get("type", "MISC"),
+                        "entity_type": entity_type,
                         "score": max(0.35, score * 0.85),
                         "source": "expanded",
                         "match_type": "alias",
                         "aliases": [alias],
+                        "reason": f"Đây là biến thể tên gọi/alias của entity gốc '{canonical}'.",
+                        "evidence": {
+                            "kind": "alias",
+                            "base_entity": canonical,
+                            "alias": alias,
+                        },
                     })
 
         if not expanded:
-            for idx, kw in enumerate((analysis.get("keywords", []) if analysis else [])[:4]):
+            for idx, kw in enumerate(keywords[:4]):
                 add({
                     "id": f"entity::kw::{kw}",
                     "label": kw,
                     "canonical": kw,
-                    "type": "KEYWORD",
+                    "entity_type": "KEYWORD",
                     "score": max(0.25, 0.55 - idx * 0.06),
                     "source": "fallback",
                     "match_type": "keyword",
                     "aliases": [kw],
+                    "reason": "Query không có entity rõ ràng nên hệ thống dùng keyword quan trọng để tạo nút graph ban đầu.",
+                    "evidence": {
+                        "kind": "keyword",
+                        "keyword": kw,
+                    },
                 })
 
-        topic = analysis.get("topic") if analysis else None
         if topic:
             add({
                 "id": f"entity::topic::{topic}",
                 "label": topic,
                 "canonical": topic,
-                "type": "TOPIC",
+                "entity_type": "TOPIC",
                 "score": 0.42,
                 "source": "fallback",
                 "match_type": "topic",
                 "aliases": [topic],
+                "reason": f"Topic '{topic}' được suy ra từ bộ từ khóa của query và dùng để hỗ trợ mở rộng graph.",
+                "evidence": {
+                    "kind": "topic",
+                    "topic": topic,
+                },
             })
 
         for idx, seed in enumerate(seed_entities[:6]):
@@ -442,11 +477,16 @@ class WebSearchService:
                 "id": f"entity::seed::{seed}",
                 "label": seed,
                 "canonical": seed,
-                "type": "SEED",
+                "entity_type": "SEED",
                 "score": max(0.15, 0.5 - idx * 0.03),
                 "source": "seed",
                 "match_type": "seed",
                 "aliases": [seed],
+                "reason": "Entity này được chọn làm seed để truy hồi theo ngữ cảnh query và mở rộng graph.",
+                "evidence": {
+                    "kind": "seed",
+                    "seed_entity": seed,
+                },
             })
 
         return expanded
@@ -480,17 +520,19 @@ class WebSearchService:
             source_label: str,
         ) -> Dict[str, Any]:
             name = source.get("canonical") or source.get("text") or source.get("label") or f"entity_{idx}"
-            entity_id = source.get("entity_id") or f"entity::{name}"
+            entity_id = source.get("entity_id") or source.get("id") or f"entity::{name}"
             return {
                 "id": entity_id,
                 "kind": "entity",
-                "label": name,
+                "label": source.get("label") or source.get("text") or name,
                 "canonical": source.get("canonical") or name,
-                "entity_type": source.get("type", "MISC"),
+                "entity_type": source.get("entity_type") or source.get("type", "MISC"),
                 "score": float(score),
                 "source": source_label,
                 "match_type": source.get("match_type", kind),
                 "aliases": source.get("aliases", []),
+                "reason": source.get("reason", ""),
+                "evidence": source.get("evidence", {}),
             }
 
         add_node("query", "query", query or "query", x=0, y=0, fx=0, fy=0, highlight=True)
@@ -501,22 +543,28 @@ class WebSearchService:
             for idx, ent in enumerate(entities[:10]):
                 node = make_entity_node(ent, kind=ent.get("match_type", "query"), idx=idx, score=ent.get("link_score", 0.5), source_label="query")
                 query_entities.append(node)
-        elif seed_entities:
+
+        if seed_entities:
             for idx, name in enumerate(seed_entities[:6]):
+                if any((qe.get("canonical") == name or qe.get("label") == name) for qe in query_entities):
+                    continue
                 query_entities.append(
                     {
-                        "id": f"entity::{name}",
+                        "id": f"entity::seed::{name}",
                         "kind": "entity",
                         "label": name,
                         "canonical": name,
                         "entity_type": "SEED",
-                        "score": 0.6,
+                        "score": max(0.2, 0.6 - idx * 0.05),
                         "source": "fallback",
-                        "match_type": "fallback",
+                        "match_type": "seed",
                         "aliases": [name],
+                        "reason": "Seed entity được suy ra từ query để kích hoạt graph expansion.",
+                        "evidence": {"kind": "seed", "seed_entity": name},
                     }
                 )
-        elif analysis and analysis.get("keywords"):
+
+        if analysis and analysis.get("keywords") and not query_entities:
             for idx, kw in enumerate(analysis.get("keywords", [])[:4]):
                 query_entities.append(
                     {
@@ -529,10 +577,26 @@ class WebSearchService:
                         "source": "fallback",
                         "match_type": "keyword",
                         "aliases": [kw],
+                        "reason": "Query không có entity rõ ràng nên dùng keyword để dựng graph.",
+                        "evidence": {"kind": "keyword", "keyword": kw},
                     }
                 )
 
         expanded_entities = self._expand_query_entities(query, analysis, query_entities, seed_entities)
+        if not expanded_entities and analysis and analysis.get("keywords"):
+            for idx, kw in enumerate(analysis.get("keywords", [])[:4]):
+                expanded_entities.append({
+                    "id": f"entity::kw::{kw}",
+                    "label": kw,
+                    "canonical": kw,
+                    "entity_type": "KEYWORD",
+                    "score": max(0.25, 0.55 - idx * 0.06),
+                    "source": "fallback",
+                    "match_type": "keyword",
+                    "aliases": [kw],
+                    "reason": "Query không có entity rõ ràng nên hệ thống dùng keyword quan trọng để tạo nút graph ban đầu.",
+                    "evidence": {"kind": "keyword", "keyword": kw},
+                })
         for idx, ent in enumerate(expanded_entities):
             add_node(
                 ent["id"],
@@ -544,6 +608,8 @@ class WebSearchService:
                 source=ent.get("source", "query"),
                 match_type=ent.get("match_type", "expanded"),
                 aliases=ent.get("aliases", []),
+                reason=ent.get("reason", ""),
+                evidence=ent.get("evidence", {}),
                 x=0,
                 y=0,
             )
@@ -577,6 +643,20 @@ class WebSearchService:
             else:
                 edges.append({"source": "query", "target": f"doc::{doc_id}", "strength": float(doc.get("retrieval_score", 0.0)), "kind": "query-document"})
 
+        graph_entity_reason = {
+            ent["id"]: {
+                "reason": ent.get("reason", ""),
+                "source": ent.get("source", "query"),
+                "match_type": ent.get("match_type", ""),
+                "canonical": ent.get("canonical", ent["label"]),
+                "aliases": ent.get("aliases", []),
+                "entity_type": ent.get("entity_type", "MISC"),
+                "score": ent.get("score", 0.5),
+                "evidence": ent.get("evidence", {}),
+            }
+            for ent in expanded_entities
+        }
+
         return {
             "query": query,
             "mode": mode,
@@ -587,6 +667,7 @@ class WebSearchService:
             "top_ids": list(top_ids),
             "seed_entities": seed_entities,
             "ner_expansion": expanded_entities,
+            "graph_entity_reason": graph_entity_reason,
         }
 
 
@@ -646,19 +727,21 @@ def search(
     compare_results = None
     compare_enabled = bool(compare)
     graph_payload = None
-    if query and service.state.mode != "not-ready":
-        if compare_enabled:
-            compare_results = service.compare_modes(query, top_k=min(top_k, 5))
-            results = compare_results.get(mode, [])
-            elapsed_ms = 0
-        else:
-            results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
-            elapsed_ms = int(elapsed * 1000)
+    if query:
+        if service.state.mode != "not-ready":
+            if compare_enabled:
+                compare_results = service.compare_modes(query, top_k=min(top_k, 5))
+                results = compare_results.get(mode, [])
+                elapsed_ms = 0
+            else:
+                results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
+                elapsed_ms = int(elapsed * 1000)
+        seed_entities = service.query_proc.get_query_entity_names(analysis) if service.query_proc and analysis else []
         graph_payload = service._build_graph_payload(
             query=query,
             analysis=analysis or {},
             results=results,
-            seed_entities=service.query_proc.get_query_entity_names(analysis) if service.query_proc else [],
+            seed_entities=seed_entities,
             mode=mode,
         )
         graph_payload["elapsed_ms"] = elapsed_ms

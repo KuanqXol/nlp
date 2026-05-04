@@ -79,6 +79,7 @@
               <span class="tag">Đang chờ query...</span>
             </div>
             <div class="ner-detail" id="ner-detail">Click một chip để xem vì sao entity này xuất hiện.</div>
+            <div class="ner-detail muted small" id="ner-evidence"></div>
           </section>
 
           {% if compare and compare_results %}
@@ -180,6 +181,8 @@
       const nerExpansionCard = document.getElementById('ner-expansion-card');
       const nerExpansionList = document.getElementById('ner-expansion-list');
       const nerDetail = document.getElementById('ner-detail');
+      const nerEvidence = document.getElementById('ner-evidence');
+      let nerReasonMap = {};
       const timers = [];
       function clearTimers() { while (timers.length) clearTimeout(timers.pop()); }
       function clearGraph() { [...svg.querySelectorAll('.node, .edge')].forEach(el => el.remove()); }
@@ -192,6 +195,22 @@
         let h = 0;
         for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
         return (h % 1000) / 1000;
+      }
+
+      const graphTransform = { tx: 0, ty: 0, scale: 1 };
+      let isDragging = false;
+      let dragStart = null;
+      function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+      function applyGraphTransform() {
+        if (!svg) return;
+        svg.style.transformOrigin = '0 0';
+        svg.style.transform = `translate(${graphTransform.tx}px, ${graphTransform.ty}px) scale(${graphTransform.scale})`;
+      }
+      function resetGraphTransform() {
+        graphTransform.tx = 0;
+        graphTransform.ty = 0;
+        graphTransform.scale = 1;
+        applyGraphTransform();
       }
       applyGraphTransform();
 
@@ -321,13 +340,19 @@
           if (n.kind === 'entity' && nerDetail) {
             g.style.cursor = 'pointer';
             g.addEventListener('click', () => {
+              const reason = n.reason || 'Không có mô tả lý do.';
+              const evidence = n.evidence ? JSON.stringify(n.evidence, null, 2) : '';
               nerDetail.innerHTML = `
                 <div><strong>${n.label || n.canonical || n.id || ''}</strong></div>
                 <div class="muted small">canonical: ${n.canonical || ''}</div>
                 <div class="muted small">type: ${n.entity_type || ''} · source: ${n.source || ''}</div>
                 <div class="muted small">match: ${n.match_type || ''} · score: ${Number(n.score || 0).toFixed(2)}</div>
                 ${(n.aliases || []).length ? `<div class="muted small">aliases: ${(n.aliases || []).join(' | ')}</div>` : ''}
+                <div class="ner-reason">${reason}</div>
               `;
+              if (nerEvidence) {
+                nerEvidence.textContent = evidence ? `Evidence: ${evidence}` : '';
+              }
               [...svg.querySelectorAll('.node.is-selected')].forEach(el => el.classList.remove('is-selected'));
               g.classList.add('is-selected');
             });
@@ -375,13 +400,18 @@
           nerExpansionList.addEventListener('click', (ev) => {
             const btn = ev.target.closest('button[data-ner-id]');
             if (!btn || !nerDetail) return;
+            const key = btn.dataset.nerId || '';
+            const reason = nerReasonMap[key]?.reason || 'Không có mô tả lý do.';
+            const evidence = nerReasonMap[key]?.evidence || {};
             nerDetail.innerHTML = `
               <div><strong>${btn.dataset.nerLabel || ''}</strong></div>
               <div class="muted small">canonical: ${btn.dataset.nerCanonical || ''}</div>
               <div class="muted small">type: ${btn.dataset.nerType || ''} · source: ${btn.dataset.nerSource || ''}</div>
               <div class="muted small">match: ${btn.dataset.nerMatchType || ''} · score: ${btn.dataset.nerScore || ''}</div>
               ${btn.dataset.nerAliases ? `<div class="muted small">aliases: ${btn.dataset.nerAliases}</div>` : ''}
+              <div class="ner-reason">${reason}</div>
             `;
+            if (nerEvidence) nerEvidence.textContent = Object.keys(evidence || {}).length ? `Evidence: ${JSON.stringify(evidence, null, 2)}` : '';
           });
         }
         stage.addEventListener('wheel', (ev) => {
@@ -418,14 +448,20 @@
       function renderExpandedNER(payload) {
         if (!nerExpansionList) return;
         const ner = payload.ner_expansion || [];
+        nerReasonMap = payload.graph_entity_reason || {};
         if (!nerExpansionCard) return;
         nerExpansionCard.style.display = ner.length ? '' : 'none';
         nerExpansionList.innerHTML = ner.length ? ner.map((item) => {
           const sourceClass = item.source === 'query' ? 'tag-query' : (item.source === 'expanded' ? 'tag-doc' : 'tag-entity');
-          return `<button type="button" class="tag ${sourceClass}" data-ner-id="${item.id || ''}" data-ner-label="${item.label || item.canonical || ''}" data-ner-source="${item.source || ''}" data-ner-type="${item.type || ''}" data-ner-score="${Number(item.score || 0).toFixed(2)}" data-ner-canonical="${item.canonical || ''}" data-ner-match-type="${item.match_type || ''}" data-ner-aliases="${(item.aliases || []).join(' | ')}">${item.label || item.canonical || item.id}</button>`;
+          const reason = item.reason || nerReasonMap[item.id]?.reason || '';
+          const evidence = item.evidence || nerReasonMap[item.id]?.evidence || {};
+          return `<button type="button" class="tag ${sourceClass}" data-ner-id="${item.id || ''}" data-ner-label="${item.label || item.canonical || ''}" data-ner-source="${item.source || ''}" data-ner-type="${item.entity_type || item.type || ''}" data-ner-score="${Number(item.score || 0).toFixed(2)}" data-ner-canonical="${item.canonical || ''}" data-ner-match-type="${item.match_type || ''}" data-ner-aliases="${(item.aliases || []).join(' | ')}">${item.label || item.canonical || item.id}</button>`;
         }).join(' ') : '<span class="tag">Không có NER mở rộng.</span>';
         if (nerDetail) {
           nerDetail.textContent = ner.length ? 'Click một chip để xem vì sao entity này xuất hiện.' : 'Không có NER mở rộng.';
+        }
+        if (nerEvidence) {
+          nerEvidence.textContent = '';
         }
       }
 
@@ -458,6 +494,12 @@
         renderResults(payload);
         resultMeta.textContent = `${payload.elapsed_ms || 0}ms · ${(payload.results || []).length} docs`;
         if (resultEmpty) resultEmpty.textContent = payload.results && payload.results.length ? 'Top-k đã được highlight trên graph.' : 'Không có kết quả phù hợp.';
+        if (nerDetail && !(payload.ner_expansion || []).length) {
+          nerDetail.textContent = 'Không có NER mở rộng.';
+        }
+        if (nerEvidence) {
+          nerEvidence.textContent = '';
+        }
       }
 
       async function runGraphSearch(ev) {
