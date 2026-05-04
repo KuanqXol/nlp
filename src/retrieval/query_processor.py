@@ -135,6 +135,20 @@ TOPIC_KEYWORDS = {
     ],
 }
 
+# Các cụm thường xuyên bị tách rời nếu chỉ split theo whitespace
+QUERY_PHRASES = [
+    "đầu tư",
+    "việt nam",
+    "thành phố hồ chí minh",
+    "hà nội",
+    "mỹ",
+    "hoa kỳ",
+    "liên minh châu âu",
+    "trí tuệ nhân tạo",
+    "thị trường",
+    "doanh nghiệp",
+]
+
 
 def _normalize(text: str) -> str:
     """NFC normalize + chuẩn hóa khoảng trắng."""
@@ -178,9 +192,45 @@ def _detect_topic(text: str) -> Optional[str]:
     return max(best, key=best.get) if best else None
 
 
+def _merge_common_phrases(tokens: List[str]) -> List[str]:
+    """Ghép các cụm phổ biến bị tách rời do split theo khoảng trắng.
+
+    Mục tiêu là tránh các keyword rác kiểu: "đầu", "tư".
+    Ví dụ: ["samsung", "đầu", "tư", "vào", "việt", "nam"]
+    -> ["samsung", "đầu tư", "việt nam"]
+    """
+    if not tokens:
+        return []
+
+    out: List[str] = []
+    i = 0
+    lower_tokens = [t.lower() for t in tokens]
+
+    while i < len(lower_tokens):
+        matched = False
+        # ưu tiên ghép cụm dài trước
+        for phrase in sorted(QUERY_PHRASES, key=lambda x: len(x.split()), reverse=True):
+            parts = phrase.split()
+            n = len(parts)
+            if i + n <= len(lower_tokens) and lower_tokens[i : i + n] == parts:
+                out.append(phrase)
+                i += n
+                matched = True
+                break
+        if matched:
+            continue
+
+        tok = lower_tokens[i].replace("_", " ").strip()
+        if tok and tok not in VIETNAMESE_STOPWORDS and len(tok.replace(" ", "")) > 1:
+            out.append(tok)
+        i += 1
+
+    return out
+
+
 def _extract_keywords(text: str) -> List[str]:
     tokens = re.sub(r"[^\w\s]", " ", text.lower()).split()
-    return [t for t in tokens if t not in VIETNAMESE_STOPWORDS and len(t) > 1]
+    return _merge_common_phrases(tokens)
 
 
 # ── QueryProcessor ────────────────────────────────────────────────────────────
@@ -238,9 +288,14 @@ class QueryProcessor:
         ]
 
     def build_search_text(self, processed: Dict) -> str:
-        parts = list(
-            set(processed.get("keywords", []) + self.get_query_entity_names(processed))
-        )
+        parts = []
+        seen = set()
+        for item in processed.get("keywords", []) + self.get_query_entity_names(processed):
+            item = item.strip().lower().replace("_", " ")
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            parts.append(item)
         return " ".join(parts)
 
     def format_for_display(self, processed: Dict) -> str:
