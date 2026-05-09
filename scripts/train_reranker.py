@@ -360,6 +360,45 @@ def _stage_name(stage_id: int) -> str:
     return f"stage{stage_id}"
 
 
+def _training_state_path(output_dir: Path) -> Path:
+    return output_dir / "training_state.json"
+
+
+def _load_training_state(output_dir: Path) -> Dict:
+    path = _training_state_path(output_dir)
+    if not path.exists():
+        return {"completed_stage_names": [], "stage_checkpoints": {}, "latest_stage_idx": 0}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        completed = data.get("completed_stage_names", [])
+        if not isinstance(completed, list):
+            completed = []
+        stage_checkpoints = data.get("stage_checkpoints", {})
+        if not isinstance(stage_checkpoints, dict):
+            stage_checkpoints = {}
+        latest_stage_idx = int(data.get("latest_stage_idx", len(completed)))
+        return {
+            "completed_stage_names": [str(x) for x in completed],
+            "stage_checkpoints": {str(k): str(v) for k, v in stage_checkpoints.items()},
+            "latest_stage_idx": max(0, latest_stage_idx),
+        }
+    except Exception:
+        return {"completed_stage_names": [], "stage_checkpoints": {}, "latest_stage_idx": 0}
+
+
+def _save_training_state(output_dir: Path, state: Dict):
+    path = _training_state_path(output_dir)
+    tmp = path.with_suffix(".json.tmp")
+    payload = {
+        "completed_stage_names": list(dict.fromkeys(state.get("completed_stage_names", []))),
+        "stage_checkpoints": dict(state.get("stage_checkpoints", {})),
+        "latest_stage_idx": int(state.get("latest_stage_idx", 0)),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+    }
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
 def build_curriculum_examples(args):
     """Return list of training stages and a validation set.
 
@@ -560,6 +599,22 @@ def train(args):
                     control.should_training_stop = True
             return control
 
+    def _stage_output_dir(stage_name: str) -> Path:
+        return output_dir / "stage_checkpoints" / stage_name
+
+    def _stage_done_marker(stage_name: str) -> Path:
+        return _stage_output_dir(stage_name) / "_DONE"
+
+    def _stage_is_complete(stage_name: str) -> bool:
+        stage_dir = _stage_output_dir(stage_name)
+        return stage_dir.exists() and _stage_done_marker(stage_name).exists() and (stage_dir / "config.json").exists()
+
+    def _latest_checkpoint_in_dir(stage_dir: Path) -> Optional[Path]:
+        if not stage_dir.exists():
+            return None
+        ckpts = sorted([p for p in stage_dir.glob("checkpoint-*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
+        return ckpts[-1] if ckpts else None
+
     _set_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -581,88 +636,116 @@ def train(args):
     cache_dir = output_dir / "_cache" / "tokenized"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    training_args = TrainingArguments(
-        output_dir=str(output_dir),
-        num_train_epochs=args.epochs_per_stage,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        max_grad_norm=args.max_grad_norm,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        eval_strategy=args.eval_strategy,
-        save_strategy=args.save_strategy,
-        save_steps=args.save_steps,
-        eval_steps=args.eval_steps,
-        logging_steps=args.logging_steps,
-        load_best_model_at_end=args.load_best_model_at_end,
-        metric_for_best_model="roc_auc",
-        greater_is_better=True,
-        fp16=False,
-        bf16=False,
-        report_to=[],
-        remove_unused_columns=False,
-        save_total_limit=args.save_total_limit,
-        dataloader_num_workers=args.dataloader_num_workers,
-    )
-
     overall_summary = {
         "base_model": args.model_name,
         "seed": args.seed,
         "stages": [],
         "validation_examples": len(val_examples),
         "output_dir": str(output_dir),
+        "stage_complete": {},
     }
+
+    training_state = _load_training_state(output_dir)
+    completed_stage_names = set(training_state.get("completed_stage_names", []))
+    stage_checkpoints = dict(training_state.get("stage_checkpoints", {}))
+    latest_stage_idx = int(training_state.get("latest_stage_idx", 0))
 
     resume = args.resume_from_checkpoint
     if resume == "auto":
         ckpts = sorted([p for p in output_dir.glob("checkpoint-*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
         resume = str(ckpts[-1]) if ckpts else None
 
-    # Stage-wise curriculum training
+    last_trainer = None
+    last_completed_stage_name = None
+
     for stage_idx, stage in enumerate(stages, start=1):
         stage_name = stage["name"]
         stage_examples = stage["examples"]
         if not stage_examples:
             continue
 
+        stage_dir = _stage_output_dir(stage_name)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        if _stage_is_complete(stage_name) or stage_name in completed_stage_names:
+            _log(f"\n[stage {stage_idx}] {stage_name} already complete, skip")
+            overall_summary["stage_complete"][stage_name] = True
+            last_completed_stage_name = stage_name
+            continue
+
         _log(f"\n[stage {stage_idx}] {stage_name} | {len(stage_examples)} examples")
         stage_cache = cache_dir / _stage_name(stage_idx)
         if stage_cache.exists():
-            from datasets import load_from_disk
-
             tokenized_train = load_from_disk(str(stage_cache))
         else:
-            train_ds = _build_weighted_dataset(stage_examples, tokenizer, args.max_length)
-            tokenized_train = train_ds
+            tokenized_train = _build_weighted_dataset(stage_examples, tokenizer, args.max_length)
             tokenized_train.save_to_disk(str(stage_cache))
 
-        # Higher difficulty means more training focus when sampling/packing isn't available.
-        # We pass the raw examples into metadata so future extensions can sample by difficulty.
-        trainer = WeightedTrainerClass(
-            model=model,
-            args=training_args,
-            train_dataset=tokenized_train,
-            eval_dataset=raw["validation"],
-            processing_class=tokenizer,
-            data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
-            compute_metrics=build_metrics(),
-            callbacks=[EarlyStop(args.early_stopping_patience, args.early_stopping_threshold)] if args.early_stopping_patience > 0 else [],
+        stage_training_args = TrainingArguments(
+            output_dir=str(stage_dir),
+            num_train_epochs=args.epochs_per_stage,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
+            max_grad_norm=args.max_grad_norm,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            per_device_eval_batch_size=args.per_device_eval_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            eval_strategy=args.eval_strategy,
+            save_strategy=args.save_strategy,
+            save_steps=args.save_steps,
+            eval_steps=args.eval_steps,
+            logging_steps=args.logging_steps,
+            load_best_model_at_end=args.load_best_model_at_end and args.eval_strategy != "no",
+            metric_for_best_model="eval_roc_auc",
+            greater_is_better=True,
+            fp16=False,
+            bf16=False,
+            report_to=[],
+            remove_unused_columns=False,
+            save_total_limit=args.save_total_limit,
+            dataloader_num_workers=args.dataloader_num_workers,
         )
 
-        stage_resume = resume if stage_idx == 1 else None
+        callbacks = [EarlyStop(args.early_stopping_patience, args.early_stopping_threshold)] if args.early_stopping_patience > 0 else []
+        trainer = WeightedTrainerClass(
+            model=model,
+            args=stage_training_args,
+            train_dataset=tokenized_train,
+            eval_dataset=raw["validation"],
+            data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+            compute_metrics=build_metrics(),
+            callbacks=callbacks,
+        )
+        last_trainer = trainer
+
+        stage_resume = _latest_checkpoint_in_dir(stage_dir)
+        if stage_resume is None and stage_idx == 1 and resume:
+            stage_resume = Path(resume)
         if stage_resume is None:
             _log(f"[stage {stage_name}] fresh start")
         else:
             _log(f"[stage {stage_name}] resume from {stage_resume}")
-        train_result = trainer.train(resume_from_checkpoint=stage_resume)
+
+        train_result = trainer.train(resume_from_checkpoint=str(stage_resume) if stage_resume else None)
         metrics = trainer.evaluate()
-        metrics = {
-            k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
-            for k, v in metrics.items()
-        }
+        metrics = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in metrics.items()}
         _log(f"[stage {stage_name}] {json.dumps(metrics, ensure_ascii=False)}")
+
+        trainer.save_model(str(stage_dir))
+        tokenizer.save_pretrained(str(stage_dir))
+        _stage_done_marker(stage_name).write_text("done\n", encoding="utf-8")
+
+        completed_stage_names.add(stage_name)
+        latest_stage_idx = stage_idx
+        stage_checkpoints[stage_name] = str(stage_dir)
+        _save_training_state(output_dir, {
+            "completed_stage_names": sorted(completed_stage_names, key=lambda n: [s["name"] for s in stages].index(n) if n in [s["name"] for s in stages] else 10**9),
+            "stage_checkpoints": stage_checkpoints,
+            "latest_stage_idx": latest_stage_idx,
+        })
+        overall_summary["stage_complete"][stage_name] = True
+        last_completed_stage_name = stage_name
 
         overall_summary["stages"].append(
             {
@@ -671,11 +754,24 @@ def train(args):
                 "examples": len(stage_examples),
                 "train_loss": float(getattr(train_result, "training_loss", 0.0) or 0.0),
                 "eval": metrics,
+                "checkpoint_dir": str(stage_dir),
             }
         )
 
-    trainer.save_model(str(output_dir))
-    tokenizer.save_pretrained(str(output_dir))
+    if last_completed_stage_name:
+        final_source = _stage_output_dir(last_completed_stage_name)
+        model = AutoModelForSequenceClassification.from_pretrained(str(final_source), num_labels=2)
+        model.save_pretrained(str(output_dir))
+        tokenizer.save_pretrained(str(output_dir))
+    elif last_trainer is not None:
+        last_trainer.save_model(str(output_dir))
+        tokenizer.save_pretrained(str(output_dir))
+
+    _save_training_state(output_dir, {
+        "completed_stage_names": sorted(completed_stage_names, key=lambda n: [s["name"] for s in stages].index(n) if n in [s["name"] for s in stages] else 10**9),
+        "stage_checkpoints": stage_checkpoints,
+        "latest_stage_idx": latest_stage_idx,
+    })
 
     archive = shutil.make_archive(
         str(output_dir.parent / output_dir.name),
@@ -686,6 +782,7 @@ def train(args):
     overall_summary.update(
         {
             "archive_path": archive,
+            "training_state_path": str(_training_state_path(output_dir)),
             "epochs_per_stage": args.epochs_per_stage,
             "max_length": args.max_length,
             "learning_rate": args.learning_rate,

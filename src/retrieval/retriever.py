@@ -135,6 +135,36 @@ class _CrossEncoderReranker:
             pass
         print("[Reranker] Sẵn sàng.")
 
+    @staticmethod
+    def _to_scalar_score(score) -> float:
+        """Normalize CrossEncoder outputs into a plain float.
+
+        CrossEncoder.predict() can return:
+        - a Python float / numpy scalar
+        - a 1D numpy array of shape (1,)
+        - a nested array/list for some transformer versions
+        This helper safely extracts the first scalar value and clamps
+        invalid outputs to 0.0 so reranking never crashes the web app.
+        """
+        try:
+            import numpy as np
+
+            arr = np.asarray(score)
+            if arr.size == 0:
+                return 0.0
+            value = float(arr.reshape(-1)[0])
+            if np.isnan(value) or np.isinf(value):
+                return 0.0
+            return value
+        except Exception:
+            try:
+                value = float(score)
+                if value != value or value in (float("inf"), float("-inf")):
+                    return 0.0
+                return value
+            except Exception:
+                return 0.0
+
     def rerank(
         self,
         query: str,
@@ -148,9 +178,25 @@ class _CrossEncoderReranker:
         pairs = [(query, c.get(text_field, c.get("full_text", ""))) for c in candidates]
         scores = self._model.predict(pairs, batch_size=self._batch_size)
 
-        for cand, score in zip(candidates, scores):
-            cand["cross_encoder_score"] = round(float(score), 4)
-            cand["retrieval_score"] = round(float(score), 4)
+        if isinstance(scores, (list, tuple)):
+            score_values = [self._to_scalar_score(s) for s in scores]
+        else:
+            try:
+                import numpy as np
+
+                score_values = [self._to_scalar_score(s) for s in np.asarray(scores).reshape(-1)]
+            except Exception:
+                score_values = [self._to_scalar_score(scores)] * len(candidates)
+
+        if len(score_values) != len(candidates):
+            if len(score_values) < len(candidates):
+                score_values.extend([0.0] * (len(candidates) - len(score_values)))
+            else:
+                score_values = score_values[: len(candidates)]
+
+        for cand, score in zip(candidates, score_values):
+            cand["cross_encoder_score"] = round(score, 4)
+            cand["retrieval_score"] = round(score, 4)
 
         candidates.sort(key=lambda x: -x["retrieval_score"])
         return candidates[:top_k] if top_k else candidates
