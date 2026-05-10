@@ -20,6 +20,8 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -243,7 +245,15 @@ class EntityLinker:
     ) -> str:
         norm, _ = _normalized_forms(canonical)
         if norm in self._exact_index:
-            return self._exact_index[norm]
+            entity_id = self._exact_index[norm]
+            info = self._entities.get(entity_id)
+            if info is not None:
+                if info.get("type", "MISC") == "MISC" and entity_type != "MISC":
+                    info["type"] = entity_type
+                if alias:
+                    info["aliases"].add(alias)
+                    self._register_exact(alias, entity_id)
+            return entity_id
 
         entity_id = _make_entity_id(canonical)
         if entity_id in self._entities:
@@ -265,6 +275,134 @@ class EntityLinker:
         if alias:
             self._register_exact(alias, entity_id)
         return entity_id
+
+    @staticmethod
+    def _norm_compact(text: str) -> str:
+        return _remove_diacritics(_normalize_text(text)).replace(" ", "")
+
+    @staticmethod
+    def _token_set(text: str) -> set:
+        return {tok for tok in _normalize_text(text).split() if tok}
+
+    @classmethod
+    def _is_safe_observed_alias(
+        cls,
+        alias: str,
+        canonical: str,
+        match_type: str,
+        score: float,
+    ) -> bool:
+        alias = (alias or "").strip()
+        canonical = (canonical or "").strip()
+        if not alias or not canonical:
+            return False
+        if _normalize_text(alias) == _normalize_text(canonical):
+            return False
+        if match_type not in {"exact", "embedding"}:
+            return False
+        if match_type == "embedding" and score < 0.9:
+            return False
+        if len(alias) < 4 or len(canonical) < 4:
+            return False
+
+        alias_norm = cls._norm_compact(alias)
+        canonical_norm = cls._norm_compact(canonical)
+        if not alias_norm or not canonical_norm:
+            return False
+
+        if alias_norm == canonical_norm:
+            return True
+        if alias_norm in canonical_norm or canonical_norm in alias_norm:
+            return True
+
+        ratio = SequenceMatcher(None, alias_norm, canonical_norm).ratio()
+        alias_tokens = cls._token_set(alias)
+        canonical_tokens = cls._token_set(canonical)
+        token_overlap = 0.0
+        if alias_tokens and canonical_tokens:
+            token_overlap = len(alias_tokens & canonical_tokens) / max(
+                min(len(alias_tokens), len(canonical_tokens)), 1
+            )
+
+        return token_overlap > 0.0 and ratio >= 0.85
+
+    def hydrate_from_knowledge_graph(self, kg) -> int:
+        """Nạp inventory canonical entities từ KG để query-time linker biết toàn bộ thực thể."""
+        added = 0
+        if kg is None or not getattr(kg, "graph", None):
+            return added
+        for canonical, data in kg.graph.nodes(data=True):
+            if not canonical:
+                continue
+            before = len(self._entities)
+            entity_id = self._register_entity(
+                canonical,
+                entity_type=data.get("type", "MISC"),
+            )
+            info = self._entities.get(entity_id)
+            if info is not None:
+                info["frequency"] = max(
+                    int(info.get("frequency", 0)),
+                    int(data.get("frequency", 0) or 0),
+                )
+            if len(self._entities) > before:
+                added += 1
+        self._link_cache.clear()
+        return added
+
+    def hydrate_safe_aliases_from_documents(
+        self,
+        documents: List[Dict],
+        min_count: int = 2,
+        min_majority_ratio: float = 0.85,
+    ) -> int:
+        """Nạp alias quan sát từ corpus với filter bảo thủ để tránh học mapping sai.
+
+        Chỉ nhận alias có tín hiệu đủ nhất quán và đủ giống canonical theo
+        orthographic/token overlap; bỏ toàn bộ Levenshtein noise.
+        """
+        alias_votes: Dict[str, Counter] = defaultdict(Counter)
+        alias_type_votes: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+
+        for doc in documents or []:
+            for ent in doc.get("linked_entities", []):
+                alias = (
+                    ent.get("surface_form")
+                    or ent.get("text")
+                    or ent.get("entity_text")
+                    or ""
+                ).strip()
+                canonical = (ent.get("canonical") or "").strip()
+                match_type = (ent.get("match_type") or "").strip()
+                score = float(ent.get("link_score", 0.0) or 0.0)
+                ent_type = ent.get("type", "MISC")
+
+                if not self._is_safe_observed_alias(alias, canonical, match_type, score):
+                    continue
+
+                alias_votes[alias][canonical] += 1
+                alias_type_votes[(alias, canonical)][ent_type] += 1
+
+        added = 0
+        for alias, votes in alias_votes.items():
+            canonical, count = votes.most_common(1)[0]
+            total = sum(votes.values())
+            if count < min_count:
+                continue
+            if total <= 0 or (count / total) < min_majority_ratio:
+                continue
+
+            type_votes = alias_type_votes.get((alias, canonical), Counter())
+            ent_type = type_votes.most_common(1)[0][0] if type_votes else "MISC"
+            entity_id = self._register_entity(canonical, entity_type=ent_type, alias=alias)
+            info = self._entities.get(entity_id)
+            if info is not None and alias not in info["aliases"]:
+                info["aliases"].add(alias)
+            self._register_exact(alias, entity_id)
+            added += 1
+
+        self._link_cache.clear()
+        return added
 
     def _cache_key(self, surface: str, entity_type: str) -> str:
         base = f"{surface}|{entity_type}"
@@ -322,6 +460,29 @@ class EntityLinker:
         if norm_no in self._exact_no_diacritics:
             return self._exact_no_diacritics[norm_no]
         return None
+
+    def lookup_alias(
+        self, surface_form: str, entity_type: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Non-mutating exact alias lookup.
+
+        Dùng cho query-time recovery: phát hiện mention đã biết trong query
+        mà không tạo thêm entity mới nếu NER bỏ sót.
+        """
+        entity_type = entity_type or "MISC"
+        matched_id = self._exact_lookup(surface_form)
+        if not matched_id:
+            return None
+        info = self._entities.get(matched_id, {})
+        return {
+            "entity_id": matched_id,
+            "surface_form": surface_form,
+            "canonical": info.get("canonical", surface_form),
+            "type": info.get("type", entity_type),
+            "similarity": 1.0,
+            "match_type": "exact",
+            "aliases": list(info.get("aliases", [])),
+        }
 
     def _levenshtein_lookup(self, surface_form: str) -> Tuple[Optional[str], float]:
         _, norm_no = _normalized_forms(surface_form)
@@ -506,21 +667,31 @@ class EntityLinker:
                 continue
 
             link = self.link_mention(surface, entity_type=ent_type)
+            info = self._entities.get(link["entity_id"], {})
+            known_aliases = []
+            for alias in [display_text, link["canonical"], *sorted(info.get("aliases", []))]:
+                alias = (alias or "").strip()
+                if alias and alias not in known_aliases:
+                    known_aliases.append(alias)
             key = (link["entity_id"], ent_type)
             if key not in merged:
                 merged[key] = {
                     "text": display_text,
+                    "surface_form": display_text,
                     "canonical": link["canonical"],
                     "entity_id": link["entity_id"],
                     "type": ent_type,
                     "link_score": float(link["similarity"]),
                     "match_type": link["match_type"],
-                    "aliases": [display_text],
+                    "aliases": known_aliases[:8],
                 }
             else:
                 item = merged[key]
                 if display_text not in item["aliases"]:
                     item["aliases"].append(display_text)
+                for alias in known_aliases:
+                    if alias not in item["aliases"]:
+                        item["aliases"].append(alias)
                 item["link_score"] = max(
                     float(item.get("link_score", 0.0)), float(link["similarity"])
                 )

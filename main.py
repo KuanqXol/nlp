@@ -290,6 +290,10 @@ class NewsSearchSystem:
 
         self._documents = state["documents"]
         self.em = EmbeddingManager.from_state(state["embedding"])
+        self.linker = EntityLinker(shared_encoder=self.em._enc)
+        self.linker.hydrate_from_knowledge_graph(self.kg)
+        self.linker.hydrate_safe_aliases_from_documents(self._documents)
+        self.query_proc = QueryProcessor(self.ner, self.linker)
 
         self.ranker.compute_pagerank(self.kg)
         importance_scores = self.ranker.compute_importance_scores(self.kg)

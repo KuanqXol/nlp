@@ -137,6 +137,12 @@ TOPIC_KEYWORDS = {
 
 # Các cụm thường xuyên bị tách rời nếu chỉ split theo whitespace
 QUERY_PHRASES = [
+    "tổng thống",
+    "phó tổng thống",
+    "thủ tướng",
+    "chủ tịch nước",
+    "bộ trưởng",
+    "ngoại trưởng",
     "đầu tư",
     "việt nam",
     "thành phố hồ chí minh",
@@ -148,6 +154,15 @@ QUERY_PHRASES = [
     "thị trường",
     "doanh nghiệp",
 ]
+
+QUERY_ROLE_GUARDS = {
+    "tổng thống",
+    "phó tổng thống",
+    "thủ tướng",
+    "chủ tịch nước",
+    "bộ trưởng",
+    "ngoại trưởng",
+}
 
 
 def _normalize(text: str) -> str:
@@ -249,14 +264,121 @@ class QueryProcessor:
         self.ner = ner_engine
         self.linker = entity_linker
 
+    @staticmethod
+    def _is_role_guard(text: str) -> bool:
+        return _normalize(text).lower() in QUERY_ROLE_GUARDS
+
+    @staticmethod
+    def _is_noisy_single_token_link(ent: Dict) -> bool:
+        mention = _normalize(
+            ent.get("text")
+            or ent.get("surface_form")
+            or ent.get("mention_text")
+            or ""
+        )
+        canonical = _normalize(ent.get("canonical") or "")
+        if not mention or not canonical:
+            return False
+        if len(mention.split()) != 1:
+            return False
+        if ent.get("match_type") != "exact":
+            return False
+        if mention.lower() == canonical.lower():
+            return False
+        return True
+
+    def _segment_query_tokens(self, text: str) -> List[str]:
+        segmented = ""
+        if hasattr(self.ner, "segment_text"):
+            try:
+                segmented = self.ner.segment_text(text)
+            except Exception:
+                segmented = ""
+        if segmented:
+            tokens = [
+                tok.replace("_", " ").strip()
+                for tok in segmented.split()
+                if tok.strip()
+            ]
+            if tokens:
+                return tokens
+        return [tok for tok in re.sub(r"[^\w\s]", " ", text).split() if tok]
+
+    def _extract_keywords_for_query(self, text: str) -> List[str]:
+        tokens = [tok.lower() for tok in self._segment_query_tokens(text)]
+        return _merge_common_phrases(tokens)
+
+    def _recover_query_entities(
+        self, text: str, raw_entities: List[Dict]
+    ) -> List[Dict]:
+        existing_mentions = {
+            _normalize((ent.get("text") or ent.get("entity_text") or "")).lower()
+            for ent in raw_entities
+            if (ent.get("text") or ent.get("entity_text"))
+        }
+        recovered: List[Dict] = []
+        tokens = self._segment_query_tokens(text)
+        if not tokens:
+            return recovered
+
+        max_ngram = min(5, len(tokens))
+        i = 0
+        while i < len(tokens):
+            matched = None
+            matched_span = 1
+            for n in range(max_ngram, 0, -1):
+                if i + n > len(tokens):
+                    continue
+                phrase = " ".join(tokens[i : i + n]).strip()
+                norm_phrase = _normalize(phrase).lower()
+                if (
+                    not phrase
+                    or norm_phrase in existing_mentions
+                    or self._is_role_guard(phrase)
+                ):
+                    continue
+                alias_hit = self.linker.lookup_alias(phrase)
+                if alias_hit:
+                    matched = {
+                        "text": phrase,
+                        "entity_text": phrase,
+                        "mention_text": phrase,
+                        "resolved_text": phrase,
+                        "type": alias_hit.get("type", "MISC"),
+                        "entity_type": alias_hit.get("type", "MISC"),
+                        "score": float(alias_hit.get("similarity", 1.0)),
+                    }
+                    matched_span = n
+                    existing_mentions.add(norm_phrase)
+                    break
+            if matched:
+                recovered.append(matched)
+                i += matched_span
+            else:
+                i += 1
+        return recovered
+
     def process(self, query: str) -> Dict:
         if not query or not query.strip():
             return self._empty(query)
 
         normalized = _normalize(query)
         raw_entities = self.ner.extract(normalized)
-        linked = self.linker.link_entities(raw_entities)
-        keywords = _extract_keywords(normalized)
+        recovered_entities = self._recover_query_entities(normalized, raw_entities)
+        all_entities = [
+            ent
+            for ent in (raw_entities + recovered_entities)
+            if not self._is_role_guard(
+                ent.get("text") or ent.get("entity_text") or ent.get("mention_text") or ""
+            )
+        ]
+        linked = [
+            ent
+            for ent in self.linker.link_entities(all_entities)
+            if not self._is_role_guard(ent.get("text") or ent.get("canonical") or "")
+            and not self._is_noisy_single_token_link(ent)
+        ]
+        keywords = self._extract_keywords_for_query(normalized)
         topic = _detect_topic(normalized)
         year = _extract_year(normalized)
         intent = _detect_intent(normalized, year)

@@ -65,7 +65,7 @@
               <div class="muted small">direct entities</div>
               <div class="chips">
                 {% for e in analysis.get('entities', [])[:4] %}
-                  <span class="tag">{{ e.get('canonical', e.get('text', '')) }} · {{ e.get('type', '') }}</span>
+                  <span class="tag">{{ e.get('text', '') }}{% if e.get('canonical') and e.get('canonical') != e.get('text') %} -> {{ e.get('canonical') }}{% endif %} · {{ e.get('type', '') }}</span>
                 {% endfor %}
               </div>
             {% endif %}
@@ -308,6 +308,7 @@
           if (n.kind === 'entity') {
             g.dataset.nerLabel = n.label || '';
             g.dataset.nerCanonical = n.canonical || n.label || '';
+            g.dataset.nerMention = n.mention || '';
             g.dataset.nerType = n.entity_type || '';
             g.dataset.nerSource = n.source || '';
             g.dataset.nerScore = String(n.score ?? '');
@@ -344,6 +345,7 @@
               const evidence = n.evidence ? JSON.stringify(n.evidence, null, 2) : '';
               nerDetail.innerHTML = `
                 <div><strong>${n.label || n.canonical || n.id || ''}</strong></div>
+                ${n.mention ? `<div class="muted small">mention: ${n.mention}</div>` : ''}
                 <div class="muted small">canonical: ${n.canonical || ''}</div>
                 <div class="muted small">type: ${n.entity_type || ''} · source: ${n.source || ''}</div>
                 <div class="muted small">match: ${n.match_type || ''} · score: ${Number(n.score || 0).toFixed(2)}</div>
@@ -405,6 +407,7 @@
             const evidence = nerReasonMap[key]?.evidence || {};
             nerDetail.innerHTML = `
               <div><strong>${btn.dataset.nerLabel || ''}</strong></div>
+              ${btn.dataset.nerMention ? `<div class="muted small">mention: ${btn.dataset.nerMention}</div>` : ''}
               <div class="muted small">canonical: ${btn.dataset.nerCanonical || ''}</div>
               <div class="muted small">type: ${btn.dataset.nerType || ''} · source: ${btn.dataset.nerSource || ''}</div>
               <div class="muted small">match: ${btn.dataset.nerMatchType || ''} · score: ${btn.dataset.nerScore || ''}</div>
@@ -455,7 +458,7 @@
           const sourceClass = item.source === 'query' ? 'tag-query' : (item.source === 'expanded' ? 'tag-doc' : 'tag-entity');
           const reason = item.reason || nerReasonMap[item.id]?.reason || '';
           const evidence = item.evidence || nerReasonMap[item.id]?.evidence || {};
-          return `<button type="button" class="tag ${sourceClass}" data-ner-id="${item.id || ''}" data-ner-label="${item.label || item.canonical || ''}" data-ner-source="${item.source || ''}" data-ner-type="${item.entity_type || item.type || ''}" data-ner-score="${Number(item.score || 0).toFixed(2)}" data-ner-canonical="${item.canonical || ''}" data-ner-match-type="${item.match_type || ''}" data-ner-aliases="${(item.aliases || []).join(' | ')}">${item.label || item.canonical || item.id}</button>`;
+          return `<button type="button" class="tag ${sourceClass}" data-ner-id="${item.id || ''}" data-ner-label="${item.label || item.canonical || ''}" data-ner-mention="${item.mention || ''}" data-ner-source="${item.source || ''}" data-ner-type="${item.entity_type || item.type || ''}" data-ner-score="${Number(item.score || 0).toFixed(2)}" data-ner-canonical="${item.canonical || ''}" data-ner-match-type="${item.match_type || ''}" data-ner-aliases="${(item.aliases || []).join(' | ')}">${item.label || item.canonical || item.id}</button>`;
         }).join(' ') : '<span class="tag">Không có NER mở rộng.</span>';
         if (nerDetail) {
           nerDetail.textContent = ner.length ? 'Click một chip để xem vì sao entity này xuất hiện.' : 'Không có NER mở rộng.';

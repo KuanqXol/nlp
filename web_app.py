@@ -78,13 +78,24 @@ class WebSearchService:
             data_path=str(data_path),
         )
 
+    def _build_query_linker(self) -> Optional[EntityLinker]:
+        if self.em is None:
+            return None
+        linker = EntityLinker(shared_encoder=self.em._enc)
+        kg_added = linker.hydrate_from_knowledge_graph(self._kg)
+        alias_added = linker.hydrate_safe_aliases_from_documents(self.documents)
+        print(
+            f"[WebUI] Query linker hydrated: canonical_entities={kg_added}, safe_aliases={alias_added}"
+        )
+        return linker
+
     def _ensure_query_proc(self):
         if self.query_proc is not None or self.em is None:
             return
         try:
             print("[WebUI] Initializing query processor...")
             self._ner = self._ner or VietnameseNER()
-            self._linker = self._linker or EntityLinker(shared_encoder=self.em._enc)
+            self._linker = self._linker or self._build_query_linker()
             self.query_proc = QueryProcessor(self._ner, self._linker)
             print("[WebUI] Query processor ready.")
         except Exception as e:
@@ -161,6 +172,8 @@ class WebSearchService:
             chunk_mode=True,
         )
         self.retriever.load_artifacts(str(self.index_dir))
+        self._linker = self._build_query_linker()
+        self.query_proc = None
         self._ensure_query_proc()
 
         self.state = ServiceState(
@@ -285,6 +298,14 @@ class WebSearchService:
             out[mode] = results
         return out
 
+    @staticmethod
+    def _format_entity_label(mention: Optional[str], canonical: Optional[str]) -> str:
+        mention = (mention or "").strip()
+        canonical = (canonical or "").strip()
+        if mention and canonical and mention.lower() != canonical.lower():
+            return f"{mention} -> {canonical}"
+        return canonical or mention or "entity"
+
     def _expand_query_entities(
         self,
         query: str,
@@ -304,10 +325,20 @@ class WebSearchService:
 
         for idx, ent in enumerate(query_entities):
             score = float(ent.get("score", ent.get("link_score", 0.5)))
+            mention = (
+                ent.get("mention")
+                or ent.get("surface_form")
+                or ent.get("text")
+                or ent.get("label")
+                or ent.get("canonical")
+                or f"entity_{idx}"
+            )
+            canonical = ent.get("canonical") or mention
             add_entity({
                 "id": ent.get("id", f"entity::{ent.get('label', idx)}"),
-                "label": ent.get("label", ent.get("canonical", f"entity_{idx}")),
-                "canonical": ent.get("canonical", ent.get("label", f"entity_{idx}")),
+                "label": self._format_entity_label(mention, canonical),
+                "mention": mention,
+                "canonical": canonical,
                 "entity_type": ent.get("entity_type", ent.get("type", "MISC")),
                 "score": score,
                 "source": "query",
@@ -315,12 +346,12 @@ class WebSearchService:
                 "aliases": ent.get("aliases", []),
             })
 
-            canonical = ent.get("canonical") or ent.get("label") or f"entity_{idx}"
             for alias in (ent.get("aliases") or [])[:3]:
                 if alias and alias != canonical:
                     add_entity({
                         "id": f"entity::{alias}",
-                        "label": alias,
+                        "label": self._format_entity_label(alias, canonical),
+                        "mention": alias,
                         "canonical": canonical,
                         "entity_type": ent.get("entity_type", ent.get("type", "MISC")),
                         "score": max(0.35, score * 0.85),
@@ -336,6 +367,7 @@ class WebSearchService:
                 add_entity({
                     "id": f"entity::kw::{kw}",
                     "label": kw,
+                    "mention": kw,
                     "canonical": kw,
                     "entity_type": "KEYWORD",
                     "score": max(0.25, 0.55 - idx * 0.06),
@@ -347,6 +379,7 @@ class WebSearchService:
             add_entity({
                 "id": f"entity::topic::{topic}",
                 "label": topic,
+                "mention": topic,
                 "canonical": topic,
                 "entity_type": "TOPIC",
                 "score": 0.42,
@@ -359,6 +392,7 @@ class WebSearchService:
             add_entity({
                 "id": f"entity::seed::{seed}",
                 "label": seed,
+                "mention": seed,
                 "canonical": seed,
                 "entity_type": "SEED",
                 "score": 0.5 - idx * 0.03,
@@ -404,14 +438,18 @@ class WebSearchService:
             aliases = ent.get("aliases", []) or []
             add({
                 "id": ent.get("entity_id") or f"entity::{canonical}",
-                "label": mention,
+                "label": self._format_entity_label(mention, canonical),
+                "mention": mention,
                 "canonical": canonical,
                 "entity_type": entity_type,
                 "score": score,
                 "source": "query",
                 "match_type": ent.get("match_type", "query"),
                 "aliases": aliases,
-                "reason": f"Entity này xuất hiện trực tiếp trong query và đã được NER nhận dạng là {entity_type}.",
+                "reason": (
+                    f"Entity này xuất hiện trực tiếp trong query. Mention '{mention}' "
+                    f"được link về canonical '{canonical}'."
+                ),
                 "evidence": {
                     "kind": "query_entity",
                     "mention": mention,
@@ -422,7 +460,8 @@ class WebSearchService:
                 if alias and alias != canonical:
                     add({
                         "id": f"entity::alias::{alias}",
-                        "label": alias,
+                        "label": self._format_entity_label(alias, canonical),
+                        "mention": alias,
                         "canonical": canonical,
                         "entity_type": entity_type,
                         "score": max(0.35, score * 0.85),
@@ -442,6 +481,7 @@ class WebSearchService:
                 add({
                     "id": f"entity::kw::{kw}",
                     "label": kw,
+                    "mention": kw,
                     "canonical": kw,
                     "entity_type": "KEYWORD",
                     "score": max(0.25, 0.55 - idx * 0.06),
@@ -459,6 +499,7 @@ class WebSearchService:
             add({
                 "id": f"entity::topic::{topic}",
                 "label": topic,
+                "mention": topic,
                 "canonical": topic,
                 "entity_type": "TOPIC",
                 "score": 0.42,
@@ -476,6 +517,7 @@ class WebSearchService:
             add({
                 "id": f"entity::seed::{seed}",
                 "label": seed,
+                "mention": seed,
                 "canonical": seed,
                 "entity_type": "SEED",
                 "score": max(0.15, 0.5 - idx * 0.03),
@@ -520,12 +562,21 @@ class WebSearchService:
             source_label: str,
         ) -> Dict[str, Any]:
             name = source.get("canonical") or source.get("text") or source.get("label") or f"entity_{idx}"
+            mention = (
+                source.get("mention")
+                or source.get("surface_form")
+                or source.get("text")
+                or source.get("label")
+                or name
+            )
+            canonical = source.get("canonical") or name
             entity_id = source.get("entity_id") or source.get("id") or f"entity::{name}"
             return {
                 "id": entity_id,
                 "kind": "entity",
-                "label": source.get("label") or source.get("text") or name,
-                "canonical": source.get("canonical") or name,
+                "label": source.get("label") or self._format_entity_label(mention, canonical),
+                "mention": mention,
+                "canonical": canonical,
                 "entity_type": source.get("entity_type") or source.get("type", "MISC"),
                 "score": float(score),
                 "source": source_label,
@@ -553,6 +604,7 @@ class WebSearchService:
                         "id": f"entity::seed::{name}",
                         "kind": "entity",
                         "label": name,
+                        "mention": name,
                         "canonical": name,
                         "entity_type": "SEED",
                         "score": max(0.2, 0.6 - idx * 0.05),
@@ -571,6 +623,7 @@ class WebSearchService:
                         "id": f"entity::kw::{kw}",
                         "kind": "entity",
                         "label": kw,
+                        "mention": kw,
                         "canonical": kw,
                         "entity_type": "KEYWORD",
                         "score": max(0.25, 0.55 - idx * 0.06),
@@ -588,6 +641,7 @@ class WebSearchService:
                 expanded_entities.append({
                     "id": f"entity::kw::{kw}",
                     "label": kw,
+                    "mention": kw,
                     "canonical": kw,
                     "entity_type": "KEYWORD",
                     "score": max(0.25, 0.55 - idx * 0.06),
@@ -602,6 +656,7 @@ class WebSearchService:
                 ent["id"],
                 "entity",
                 ent["label"],
+                mention=ent.get("mention", ent["label"]),
                 canonical=ent.get("canonical", ent["label"]),
                 entity_type=ent.get("entity_type", "MISC"),
                 score=ent.get("score", 0.5),
@@ -648,6 +703,7 @@ class WebSearchService:
                 "reason": ent.get("reason", ""),
                 "source": ent.get("source", "query"),
                 "match_type": ent.get("match_type", ""),
+                "mention": ent.get("mention", ent["label"]),
                 "canonical": ent.get("canonical", ent["label"]),
                 "aliases": ent.get("aliases", []),
                 "entity_type": ent.get("entity_type", "MISC"),
