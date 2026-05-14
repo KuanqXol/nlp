@@ -102,8 +102,10 @@ def _safe_load_dataset(name: str, split: str):
     from datasets import load_dataset
 
     try:
+        _log(f"[data] Loading dataset {name} ({split})...")
         return load_dataset(name, split=split)
-    except Exception:
+    except Exception as e:
+        _log(f"[data] Skip dataset {name} ({split}): {type(e).__name__}: {e}")
         return None
 
 
@@ -172,6 +174,9 @@ class Example:
 
 
 def load_viquad_examples(train_max: int, val_max: int) -> Tuple[List[Dict], List[Dict]]:
+    if train_max <= 0 and val_max <= 0:
+        _log("[data] ViQuAD disabled (train/val max = 0)")
+        return [], []
     datasets = ["taidng/UIT-ViQuAD2.0", "uitnlp/vi_quad"]
     ds_train = ds_val = None
     for name in datasets:
@@ -193,7 +198,10 @@ def load_viquad_examples(train_max: int, val_max: int) -> Tuple[List[Dict], List
                 break
         return out
 
-    return convert(ds_train, train_max), convert(ds_val, val_max)
+    train = convert(ds_train, train_max)
+    val = convert(ds_val, val_max)
+    _log(f"[data] ViQuAD examples: train={len(train):,}, val={len(val):,}")
+    return train, val
 
 
 def load_msmarco_like_examples(train_max: int, val_max: int) -> Tuple[List[Dict], List[Dict]]:
@@ -202,6 +210,9 @@ def load_msmarco_like_examples(train_max: int, val_max: int) -> Tuple[List[Dict]
     We try a couple of public datasets that behave similarly to MSMARCO-style
     retrieval examples. If unavailable, return empty lists so local training still works.
     """
+    if train_max <= 0 and val_max <= 0:
+        _log("[data] MSMARCO-like disabled (train/val max = 0)")
+        return [], []
     candidates = [
         ("msmarco", "triples.train.small"),
         ("sentence-transformers/msmarco-corpus", "train"),
@@ -224,9 +235,16 @@ def load_msmarco_like_examples(train_max: int, val_max: int) -> Tuple[List[Dict]
                 rng = random.Random(42)
                 rng.shuffle(items)
                 split_idx = min(max(1, val_max), max(0, len(items) // 10))
-                return items[split_idx:], items[:split_idx]
+                train = items[split_idx:]
+                val = items[:split_idx]
+                _log(
+                    f"[data] MSMARCO-like examples from {ds_name}: "
+                    f"train={len(train):,}, val={len(val):,}"
+                )
+                return train, val
         except Exception:
             continue
+    _log("[data] MSMARCO-like examples: train=0, val=0")
     return [], []
 
 
@@ -235,6 +253,10 @@ def load_news_articles(csv_path: str, max_articles: int = 30000) -> List[Dict]:
     if not path.exists():
         _log(f"[data] Khong tim thay CSV: {path}")
         return []
+    if max_articles <= 0:
+        _log("[data] News disabled (max_news_articles <= 0)")
+        return []
+    _log(f"[data] Loading up to {max_articles:,} news articles from {path}...")
     seen = set()
     docs = []
     with open(path, encoding="utf-8-sig", errors="replace") as f:
@@ -259,6 +281,9 @@ def load_news_articles(csv_path: str, max_articles: int = 30000) -> List[Dict]:
                     "category": (row.get("category") or "").strip(),
                 }
             )
+            if len(docs) % 1000 == 0:
+                _log(f"[data] Loaded news articles: {len(docs):,}/{max_articles:,}")
+    _log(f"[data] News articles loaded: {len(docs):,}")
     return docs
 
 
@@ -300,30 +325,38 @@ def build_news_examples(
 ) -> List[Dict]:
     if not articles:
         return []
+    _log(
+        f"[data] Building news examples: articles={len(articles):,}, "
+        f"hard_negatives={hard_negatives}, max_pseudo={max_pseudo}"
+    )
     rng = random.Random(seed)
     bm25 = SimpleBM25()
+    _log("[data] Building BM25 for news hard negatives...")
     bm25.build([a["text"] for a in articles], [a["id"] for a in articles])
     docs_by_id = {a["id"]: a for a in articles}
     examples = []
-    for article in articles:
+    for idx, article in enumerate(articles, start=1):
         for q in pseudo_queries(article)[:max_pseudo]:
             pos = article["text"][:512]
             examples.append(Example(q, pos, 1, "news", difficulty=0.9).__dict__)
             negs = []
-            for doc_id, _ in bm25.search(q, k=max(20, hard_negatives * 8)):
-                if doc_id == article["id"]:
-                    continue
-                neg_text = docs_by_id[str(doc_id)]["text"][:512]
-                if _normalize(neg_text) != _normalize(pos):
-                    negs.append(neg_text)
-                if len(negs) >= hard_negatives:
-                    break
+            if hard_negatives > 0:
+                for doc_id, _ in bm25.search(q, k=max(20, hard_negatives * 8)):
+                    if doc_id == article["id"]:
+                        continue
+                    neg_text = docs_by_id[str(doc_id)]["text"][:512]
+                    if _normalize(neg_text) != _normalize(pos):
+                        negs.append(neg_text)
+                    if len(negs) >= hard_negatives:
+                        break
             if not negs:
                 cand = rng.choice(articles)["text"][:512]
                 if _normalize(cand) != _normalize(pos):
                     negs = [cand]
             for neg in negs:
                 examples.append(Example(q, neg, 0, "news", difficulty=0.95).__dict__)
+        if idx % 1000 == 0 or idx == len(articles):
+            _log(f"[data] News examples progress: {idx:,}/{len(articles):,} articles")
     # dedupe
     seen, out = set(), []
     for e in examples:
@@ -332,6 +365,7 @@ def build_news_examples(
             continue
         seen.add(key)
         out.append(e)
+    _log(f"[data] News examples built: {len(out):,}")
     return out
 
 
@@ -411,10 +445,17 @@ def build_curriculum_examples(args):
     train_marker = marker / "train.json"
     val_marker = marker / "val.json"
     if train_marker.exists() and val_marker.exists():
+        _log(f"[data] Loading cached curriculum: {marker}")
         payload = json.loads(train_marker.read_text(encoding="utf-8"))
         val_payload = json.loads(val_marker.read_text(encoding="utf-8"))
+        _log(
+            "[data] Cached stage sizes: "
+            + ", ".join(f"{s['name']}={len(s['examples']):,}" for s in payload["stages"])
+            + f" | val={len(val_payload['examples']):,}"
+        )
         return payload["stages"], val_payload["examples"]
 
+    _log("[data] Building curriculum examples...")
     msmarco_train, msmarco_val = load_msmarco_like_examples(args.msmarco_train_max, args.msmarco_val_max)
     viquad_train, viquad_val = load_viquad_examples(args.viquad_train_max, args.viquad_val_max)
     news = load_news_articles(args.data_csv, args.max_news_articles)
@@ -449,6 +490,11 @@ def build_curriculum_examples(args):
         )
 
     val_examples = msmarco_val + viquad_val + val_news
+    _log(
+        "[data] Curriculum stage sizes: "
+        + ", ".join(f"{stage['name']}={len(stage['examples']):,}" for stage in stages)
+        + f" | val={len(val_examples):,}"
+    )
     marker.mkdir(parents=True, exist_ok=True)
     train_marker.write_text(
         json.dumps(
@@ -615,6 +661,27 @@ def train(args):
         ckpts = sorted([p for p in stage_dir.glob("checkpoint-*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
         return ckpts[-1] if ckpts else None
 
+    def _force_float32_model(model):
+        # Fsoft-AIC/videberta-base can carry dtype=float16 in config. Training a
+        # sequence classifier from that state may silently save NaN weights, so
+        # keep the reranker in fp32 unless mixed precision is explicitly added.
+        model = model.float()
+        for attr in ("torch_dtype", "dtype"):
+            if hasattr(model.config, attr):
+                try:
+                    setattr(model.config, attr, "float32")
+                except Exception:
+                    pass
+        return model
+
+    def _assert_finite_model(model, context: str):
+        for name, param in model.named_parameters():
+            if not torch.isfinite(param).all():
+                raise RuntimeError(
+                    f"Non-finite reranker weights detected {context}: {name}. "
+                    "Discard this checkpoint and rerun training from a clean output dir."
+                )
+
     _set_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -622,9 +689,31 @@ def train(args):
     if not torch.cuda.is_available() and not args.allow_cpu:
         raise RuntimeError("No CUDA detected. Use --allow-cpu only for debugging.")
 
+    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    gpu_mem = (
+        round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2)
+        if torch.cuda.is_available()
+        else 0
+    )
+    _log(
+        "[config] "
+        f"device={device_name}, gpu_mem_gb={gpu_mem}, "
+        f"max_length={args.max_length}, train_batch={args.per_device_train_batch_size}, "
+        f"eval_batch={args.per_device_eval_batch_size}, grad_accum={args.gradient_accumulation_steps}, "
+        f"effective_batch={args.per_device_train_batch_size * args.gradient_accumulation_steps}, "
+        f"news={args.max_news_articles}, viquad={args.viquad_train_max}/{args.viquad_val_max}, "
+        f"msmarco={args.msmarco_train_max}/{args.msmarco_val_max}, hard_neg={args.hard_negatives}"
+    )
+
     _log(f"[model] Loading {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name,
+        num_labels=2,
+        torch_dtype=torch.float32,
+    )
+    model = _force_float32_model(model)
+    _assert_finite_model(model, "after base model load")
 
     stages, val_examples = build_curriculum_examples(args)
     if not stages or not val_examples:
@@ -732,6 +821,8 @@ def train(args):
         metrics = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in metrics.items()}
         _log(f"[stage {stage_name}] {json.dumps(metrics, ensure_ascii=False)}")
 
+        _force_float32_model(trainer.model)
+        _assert_finite_model(trainer.model, f"after stage {stage_name}")
         trainer.save_model(str(stage_dir))
         tokenizer.save_pretrained(str(stage_dir))
         _stage_done_marker(stage_name).write_text("done\n", encoding="utf-8")
@@ -760,10 +851,18 @@ def train(args):
 
     if last_completed_stage_name:
         final_source = _stage_output_dir(last_completed_stage_name)
-        model = AutoModelForSequenceClassification.from_pretrained(str(final_source), num_labels=2)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            str(final_source),
+            num_labels=2,
+            torch_dtype=torch.float32,
+        )
+        model = _force_float32_model(model)
+        _assert_finite_model(model, f"before final export from {final_source}")
         model.save_pretrained(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
     elif last_trainer is not None:
+        _force_float32_model(last_trainer.model)
+        _assert_finite_model(last_trainer.model, "before final export")
         last_trainer.save_model(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
 
@@ -827,33 +926,35 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--model-name", default="Fsoft-AIC/videberta-base")
     p.add_argument("--data-csv", default=str(ROOT_DIR / "data" / "vnexpress_articles.csv"))
     p.add_argument("--output-dir", default=_default_output_dir())
+    # Defaults target a personal laptop with RTX 3050 Ti 4GB + 16GB RAM.
+    # They favor unattended stability over maximum throughput.
     p.add_argument("--epochs-per-stage", type=float, default=1.0)
-    p.add_argument("--learning-rate", type=float, default=2e-5)
+    p.add_argument("--learning-rate", type=float, default=1e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
-    p.add_argument("--max-length", type=int, default=256)
-    p.add_argument("--per-device-train-batch-size", type=int, default=8)
-    p.add_argument("--per-device-eval-batch-size", type=int, default=16)
-    p.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    p.add_argument("--max-length", type=int, default=192)
+    p.add_argument("--per-device-train-batch-size", type=int, default=1)
+    p.add_argument("--per-device-eval-batch-size", type=int, default=2)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     p.add_argument("--dataloader-num-workers", type=int, default=0)
-    p.add_argument("--logging-steps", type=int, default=50)
-    p.add_argument("--save-total-limit", type=int, default=3)
+    p.add_argument("--logging-steps", type=int, default=20)
+    p.add_argument("--save-total-limit", type=int, default=2)
     p.add_argument("--save-strategy", choices=("steps", "epoch"), default="steps")
-    p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--eval-strategy", choices=("steps", "epoch", "no"), default="steps")
-    p.add_argument("--eval-steps", type=int, default=2000)
+    p.add_argument("--eval-steps", type=int, default=500)
     p.add_argument("--load-best-model-at-end", action="store_true")
     p.add_argument("--early-stopping-patience", type=int, default=2)
     p.add_argument("--early-stopping-threshold", type=float, default=0.001)
-    p.add_argument("--hard-negatives", type=int, default=2)
-    p.add_argument("--max-news-articles", type=int, default=30000)
+    p.add_argument("--hard-negatives", type=int, default=1)
+    p.add_argument("--max-news-articles", type=int, default=6000)
     p.add_argument("--news-val-ratio", type=float, default=0.05)
-    p.add_argument("--max-pseudo-queries-per-article", type=int, default=2)
-    p.add_argument("--viquad-train-max", type=int, default=12000)
-    p.add_argument("--viquad-val-max", type=int, default=4000)
-    p.add_argument("--msmarco-train-max", type=int, default=8000)
-    p.add_argument("--msmarco-val-max", type=int, default=1000)
+    p.add_argument("--max-pseudo-queries-per-article", type=int, default=1)
+    p.add_argument("--viquad-train-max", type=int, default=3000)
+    p.add_argument("--viquad-val-max", type=int, default=500)
+    p.add_argument("--msmarco-train-max", type=int, default=0)
+    p.add_argument("--msmarco-val-max", type=int, default=0)
     p.add_argument("--allow-cpu", action="store_true")
     p.add_argument("--resume-from-checkpoint", type=str, default="auto")
     p.add_argument("--seed", type=int, default=42)

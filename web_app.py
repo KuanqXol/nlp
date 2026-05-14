@@ -47,6 +47,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_path(name: str) -> Optional[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    value = raw.strip().strip('"')
+    return value or None
+
+
 @dataclass
 class ServiceState:
     mode: str  # "index" | "retrieval-only" | "not-ready"
@@ -155,7 +163,11 @@ class WebSearchService:
                 self.importance_scores = {}
 
         use_reranker = _env_flag("USE_RERANKER", False)
-        self.retriever = Retriever(use_faiss=True, use_cross_encoder=use_reranker)
+        self.retriever = Retriever(
+            use_faiss=True,
+            use_cross_encoder=use_reranker,
+            reranker_model_dir=_env_path("RERANKER_DIR"),
+        )
 
         chunks_dict = state.get("chunks", {})
         doc_to_chunks = state.get("doc_to_chunks", {})
@@ -221,7 +233,11 @@ class WebSearchService:
 
             self.em = EmbeddingManager()
             self.em.build_document_index(chunk_dicts)
-            self.retriever = Retriever(use_faiss=True, use_cross_encoder=_env_flag("USE_RERANKER", False))
+            self.retriever = Retriever(
+                use_faiss=True,
+                use_cross_encoder=_env_flag("USE_RERANKER", False),
+                reranker_model_dir=_env_path("RERANKER_DIR"),
+            )
             self.retriever.build(
                 chunks=chunks,
                 embedding_manager=self.em,
@@ -834,6 +850,10 @@ def health():
             "docs": service.state.n_docs,
             "chunks": service.state.n_chunks,
             "reranker_enabled": _env_flag("USE_RERANKER", False),
+            "reranker_loaded": bool(
+                service.retriever and getattr(service.retriever, "_reranker", None)
+            ),
+            "reranker_dir": _env_path("RERANKER_DIR"),
             "lite_build_enabled": _env_flag("ALLOW_LITE_BUILD", False),
             "query_understanding": service.query_proc is not None,
         }

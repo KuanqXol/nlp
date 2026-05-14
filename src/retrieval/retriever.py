@@ -13,6 +13,7 @@ Yêu cầu: faiss-cpu, sentence-transformers
 """
 
 import math
+import os
 import pickle
 from collections import defaultdict
 
@@ -118,41 +119,102 @@ class _CrossEncoderReranker:
             except ImportError:
                 device = "cpu"
         self._device = device
-        # Batch size tối ưu: GPU 128, CPU 32
-        self._batch_size = 128 if device.startswith("cuda") else 32
+        default_batch = 8 if device.startswith("cuda") else 16
+        self._batch_size = int(os.getenv("RERANKER_BATCH_SIZE", str(default_batch)))
+        self._max_length = int(os.getenv("RERANKER_MAX_LENGTH", "192"))
         print(f"[Reranker] Đang load: {model_dir} (device={device})")
-        self._model = CrossEncoder(model_dir, device=device)
+        model_kwargs = {}
+        try:
+            import torch
+
+            # Some Vietnamese checkpoints are saved with dtype=float16 in config.
+            # CPU fp16 inference can produce NaN logits, so force fp32 at load time.
+            model_kwargs["torch_dtype"] = torch.float32
+        except Exception:
+            model_kwargs = {}
+        try:
+            self._model = CrossEncoder(
+                model_dir,
+                device=device,
+                model_kwargs=model_kwargs or None,
+                max_length=self._max_length,
+            )
+        except TypeError:
+            self._model = CrossEncoder(model_dir, device=device, max_length=self._max_length)
+        self._validate_model()
         print("[Reranker] Sẵn sàng.")
 
     @staticmethod
-    def _to_scalar_score(score) -> float:
-        """Normalize CrossEncoder outputs into a plain float.
+    def _sigmoid(values: np.ndarray) -> np.ndarray:
+        clipped = np.clip(values, -80.0, 80.0)
+        return 1.0 / (1.0 + np.exp(-clipped))
 
-        CrossEncoder.predict() can return:
-        - a Python float / numpy scalar
-        - a 1D numpy array of shape (1,)
-        - a nested array/list for some transformer versions
-        This helper safely extracts the first scalar value and clamps
-        invalid outputs to 0.0 so reranking never crashes the web app.
+    @classmethod
+    def _single_output_to_relevance(cls, values: np.ndarray) -> Optional[np.ndarray]:
+        if values.size == 0 or not np.isfinite(values).any():
+            return None
+        values = np.nan_to_num(values.astype(np.float64), nan=0.0, posinf=80.0, neginf=-80.0)
+        if np.nanmin(values) < 0.0 or np.nanmax(values) > 1.0:
+            values = cls._sigmoid(values)
+        return values.astype(np.float64)
+
+    @classmethod
+    def _scores_to_relevance(cls, scores, expected: int) -> Optional[np.ndarray]:
+        """Convert CrossEncoder outputs to one finite relevance score per pair.
+
+        SentenceTransformers returns shape (N,) for regression/single-label models
+        and shape (N, 2) for binary classifiers. The local ViDeBERTa reranker is a
+        2-label classifier, so the correct score is the positive-class softmax,
+        not the first flattened logit.
         """
         try:
-            import numpy as np
-
-            arr = np.asarray(score)
-            if arr.size == 0:
-                return 0.0
-            value = float(arr.reshape(-1)[0])
-            if np.isnan(value) or np.isinf(value):
-                return 0.0
-            return value
+            arr = np.asarray(scores, dtype=np.float64)
         except Exception:
-            try:
-                value = float(score)
-                if value != value or value in (float("inf"), float("-inf")):
-                    return 0.0
-                return value
-            except Exception:
-                return 0.0
+            return None
+
+        if arr.size == 0 or expected <= 0 or not np.isfinite(arr).any():
+            return None
+
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+
+        if arr.ndim == 1:
+            flat = arr.reshape(-1)
+            if flat.size == expected * 2:
+                arr = flat.reshape(expected, 2)
+            elif flat.size == expected:
+                return cls._single_output_to_relevance(flat)
+            else:
+                return None
+
+        if arr.ndim >= 2:
+            arr = arr.reshape(arr.shape[0], -1)
+            if arr.shape[0] != expected:
+                if arr.size % expected != 0:
+                    return None
+                arr = arr.reshape(expected, -1)
+
+            if arr.shape[1] == 1:
+                return cls._single_output_to_relevance(arr[:, 0])
+
+            arr = np.nan_to_num(arr, nan=0.0, posinf=80.0, neginf=-80.0)
+            shifted = arr - np.max(arr, axis=1, keepdims=True)
+            exp = np.exp(np.clip(shifted, -80.0, 80.0))
+            denom = np.sum(exp, axis=1)
+            denom = np.where(denom == 0.0, 1e-12, denom)
+            return (exp[:, -1] / denom).astype(np.float64)
+
+        return None
+
+    def _validate_model(self):
+        scores = self._model.predict(
+            [("kiem tra reranker", "kiem tra reranker")],
+            batch_size=1,
+            show_progress_bar=False,
+        )
+        values = self._scores_to_relevance(scores, expected=1)
+        if values is None or not np.isfinite(values).all():
+            raise RuntimeError("reranker returned non-finite scores during smoke test")
 
     def rerank(
         self,
@@ -165,23 +227,21 @@ class _CrossEncoderReranker:
             return candidates
 
         pairs = [(query, c.get(text_field, c.get("full_text", ""))) for c in candidates]
-        scores = self._model.predict(pairs, batch_size=self._batch_size)
+        try:
+            scores = self._model.predict(
+                pairs,
+                batch_size=self._batch_size,
+                show_progress_bar=False,
+            )
+            score_values = self._scores_to_relevance(scores, expected=len(candidates))
+        except Exception as e:
+            print(f"[Reranker] WARNING: rerank failed ({e}); using vector scores.")
+            score_values = None
 
-        if isinstance(scores, (list, tuple)):
-            score_values = [self._to_scalar_score(s) for s in scores]
-        else:
-            try:
-                import numpy as np
-
-                score_values = [self._to_scalar_score(s) for s in np.asarray(scores).reshape(-1)]
-            except Exception:
-                score_values = [self._to_scalar_score(scores)] * len(candidates)
-
-        if len(score_values) != len(candidates):
-            if len(score_values) < len(candidates):
-                score_values.extend([0.0] * (len(candidates) - len(score_values)))
-            else:
-                score_values = score_values[: len(candidates)]
+        if score_values is None or len(score_values) != len(candidates):
+            print("[Reranker] WARNING: invalid scores; keeping pre-rerank ordering.")
+            candidates.sort(key=lambda x: -x["retrieval_score"])
+            return candidates[:top_k] if top_k else candidates
 
         for cand, score in zip(candidates, score_values):
             cand["cross_encoder_score"] = round(score, 4)
