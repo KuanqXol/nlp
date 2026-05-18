@@ -48,8 +48,16 @@ DATE_DECAY_ENABLED = True
 DATE_DECAY_WEIGHT = 0.08  # Contribution của date decay vào final score (0→tắt, 1→full)
 MAX_CHUNKS_PER_DOC = 2  # Tối đa giữ N chunk/doc khi dedupe
 
-# Cross-encoder: dùng model fine-tuned nếu có, fallback ms-marco
-DEFAULT_CROSS_ENCODER = "cross-encoder/ms-marco-MiniLM-L6-v2"
+# Cross-encoder: dùng model fine-tuned local nếu có, fallback public multilingual reranker.
+DEFAULT_CROSS_ENCODER = "BAAI/bge-reranker-v2-m3"
+
+
+def _has_local_cross_encoder_model(path: Path) -> bool:
+    return (
+        path.exists()
+        and (path / "config.json").exists()
+        and ((path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists())
+    )
 
 
 # ── FAISS Backend ─────────────────────────────────────────────────────────────
@@ -122,6 +130,12 @@ class _CrossEncoderReranker:
         default_batch = 8 if device.startswith("cuda") else 16
         self._batch_size = int(os.getenv("RERANKER_BATCH_SIZE", str(default_batch)))
         self._max_length = int(os.getenv("RERANKER_MAX_LENGTH", "192"))
+        self._trust_remote_code = os.getenv("RERANKER_TRUST_REMOTE_CODE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         print(f"[Reranker] Đang load: {model_dir} (device={device})")
         model_kwargs = {}
         try:
@@ -133,11 +147,16 @@ class _CrossEncoderReranker:
         except Exception:
             model_kwargs = {}
         try:
+            cross_encoder_kwargs = {
+                "device": device,
+                "model_kwargs": model_kwargs or None,
+                "max_length": self._max_length,
+            }
+            if self._trust_remote_code:
+                cross_encoder_kwargs["trust_remote_code"] = True
             self._model = CrossEncoder(
                 model_dir,
-                device=device,
-                model_kwargs=model_kwargs or None,
-                max_length=self._max_length,
+                **cross_encoder_kwargs,
             )
         except TypeError:
             self._model = CrossEncoder(model_dir, device=device, max_length=self._max_length)
@@ -294,7 +313,7 @@ class Retriever:
                 )
                 model_path = (
                     str(default)
-                    if (default / "config.json").exists()
+                    if _has_local_cross_encoder_model(default)
                     else DEFAULT_CROSS_ENCODER
                 )
             try:

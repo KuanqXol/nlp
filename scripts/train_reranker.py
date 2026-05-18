@@ -10,7 +10,7 @@ Ezpl-aligned goals:
 Default usage:
   python scripts/train_reranker.py \
     --data-csv data/vnexpress_articles.csv \
-    --output-dir data/reranker_model_videberta
+    --output-dir data/reranker_model
 
 Notes:
   - If internet / dataset access is unavailable, the trainer gracefully falls back to
@@ -55,7 +55,7 @@ def _default_output_dir() -> str:
     kaggle = Path("/kaggle/working")
     if kaggle.exists():
         return str(kaggle / "videberta_reranker")
-    return str(ROOT_DIR / "data" / "reranker_model_videberta")
+    return str(ROOT_DIR / "data" / "reranker_model")
 
 
 def _log(msg: str):
@@ -73,6 +73,35 @@ def _set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     except Exception:
         pass
+
+
+def _cuda_device_names() -> List[str]:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return []
+        return [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    except Exception:
+        return []
+
+
+def _is_t4x2() -> bool:
+    names = _cuda_device_names()
+    return len(names) >= 2 and all("T4" in name.upper() for name in names[:2])
+
+
+def _provided_cli_options(argv: Sequence[str]) -> set:
+    out = set()
+    for item in argv:
+        if item.startswith("--"):
+            out.add(item.split("=", 1)[0])
+    return out
+
+
+def _set_if_not_provided(args, provided: set, attr: str, option: str, value):
+    if option not in provided:
+        setattr(args, attr, value)
 
 
 def _normalize(text: str) -> str:
@@ -390,8 +419,13 @@ def _cache_signature(args) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
-def _stage_name(stage_id: int) -> str:
-    return f"stage{stage_id}"
+def _tokenized_cache_signature(args) -> str:
+    payload = {
+        "curriculum": _cache_signature(args),
+        "model_name": args.model_name,
+        "max_length": args.max_length,
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
 def _training_state_path(output_dir: Path) -> Path:
@@ -431,6 +465,20 @@ def _save_training_state(output_dir: Path, state: Dict):
     }
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _checkpoint_epoch(checkpoint_dir: Optional[Path]) -> Optional[float]:
+    if checkpoint_dir is None:
+        return None
+    state_path = checkpoint_dir / "trainer_state.json"
+    if not state_path.exists():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        epoch = data.get("epoch")
+        return float(epoch) if epoch is not None else None
+    except Exception:
+        return None
 
 
 def build_curriculum_examples(args):
@@ -574,10 +622,15 @@ def _build_weighted_dataset(examples: List[Dict], tokenizer, max_length: int):
             max_length=max_length,
         )
         enc["labels"] = batch["labels"]
-        enc["difficulty"] = batch["difficulty"]
         return enc
 
     return ds.map(tok, batched=True, remove_columns=ds.column_names)
+
+
+def _strip_unused_training_columns(ds):
+    keep = {"input_ids", "attention_mask", "token_type_ids", "labels"}
+    drop = [name for name in ds.column_names if name not in keep]
+    return ds.remove_columns(drop) if drop else ds
 
 
 def _sanitize_model_outputs(outputs):
@@ -653,13 +706,62 @@ def train(args):
 
     def _stage_is_complete(stage_name: str) -> bool:
         stage_dir = _stage_output_dir(stage_name)
-        return stage_dir.exists() and _stage_done_marker(stage_name).exists() and (stage_dir / "config.json").exists()
+        has_weights = (stage_dir / "model.safetensors").exists() or (stage_dir / "pytorch_model.bin").exists()
+        return (
+            stage_dir.exists()
+            and _stage_done_marker(stage_name).exists()
+            and (stage_dir / "config.json").exists()
+            and has_weights
+        )
 
     def _latest_checkpoint_in_dir(stage_dir: Path) -> Optional[Path]:
         if not stage_dir.exists():
             return None
-        ckpts = sorted([p for p in stage_dir.glob("checkpoint-*") if p.is_dir()], key=lambda p: p.stat().st_mtime)
+        def checkpoint_key(path: Path):
+            match = re.match(r"checkpoint-(\d+)$", path.name)
+            step = int(match.group(1)) if match else -1
+            return (step, path.stat().st_mtime)
+
+        ckpts = sorted([p for p in stage_dir.glob("checkpoint-*") if p.is_dir()], key=checkpoint_key)
         return ckpts[-1] if ckpts else None
+
+    def _output_dir_has_usable_training_artifact(path: Path) -> bool:
+        if (path / "training_state.json").exists():
+            return True
+        if (path / "config.json").exists() and (
+            (path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists()
+        ):
+            return True
+        stage_root = path / "stage_checkpoints"
+        if not stage_root.exists():
+            return False
+        for stage_dir in stage_root.iterdir():
+            if not stage_dir.is_dir():
+                continue
+            if _stage_done_marker(stage_dir.name).exists() and (
+                (stage_dir / "model.safetensors").exists() or (stage_dir / "pytorch_model.bin").exists()
+            ):
+                return True
+            if _latest_checkpoint_in_dir(stage_dir) is not None:
+                return True
+        return False
+
+    def _validate_output_dir_safety(path: Path):
+        if not path.exists() or not any(path.iterdir()):
+            return
+        if _output_dir_has_usable_training_artifact(path):
+            return
+        if args.allow_partial_output_dir:
+            _log(
+                f"[safety] Continuing with partial output dir without usable checkpoints: {path}"
+            )
+            return
+        raise RuntimeError(
+            f"Output dir exists but has no usable reranker checkpoint/model: {path}\n"
+            "This usually means an earlier run was interrupted after creating cache/stage folders. "
+            "To avoid silently overwriting training state, choose a new --output-dir, remove this partial "
+            "folder intentionally, or pass --allow-partial-output-dir if you really want to continue here."
+        )
 
     def _force_float32_model(model):
         # Fsoft-AIC/videberta-base can carry dtype=float16 in config. Training a
@@ -682,27 +784,78 @@ def train(args):
                     "Discard this checkpoint and rerun training from a clean output dir."
                 )
 
+    def _load_completed_stage_model(stage_name: str):
+        stage_dir = _stage_output_dir(stage_name)
+        _log(f"[stage {stage_name}] loading completed stage model from {stage_dir}")
+        loaded = AutoModelForSequenceClassification.from_pretrained(
+            str(stage_dir),
+            num_labels=2,
+            torch_dtype=torch.float32,
+        )
+        loaded = _force_float32_model(loaded)
+        _assert_finite_model(loaded, f"after loading completed stage {stage_name}")
+        return loaded
+
+    def _resolve_fp16() -> bool:
+        if args.no_fp16 or args.mixed_precision == "fp32":
+            return False
+        if args.fp16 or args.mixed_precision == "fp16":
+            return torch.cuda.is_available()
+        if args.mixed_precision == "auto":
+            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+            # T4 benefits heavily from AMP tensor cores. The model is still
+            # loaded in fp32, so AMP avoids the old half-config NaN issue.
+            return torch.cuda.is_available() and any("T4" in name.upper() for name in names)
+        return False
+
+    def _configure_cuda_runtime():
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+        if hasattr(torch, "set_float32_matmul_precision"):
+            try:
+                torch.set_float32_matmul_precision(args.float32_matmul_precision)
+            except Exception:
+                pass
+
     _set_seed(args.seed)
     output_dir = Path(args.output_dir)
+    _validate_output_dir_safety(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = Path(args.export_dir) if args.export_dir else output_dir
 
     if not torch.cuda.is_available() and not args.allow_cpu:
         raise RuntimeError("No CUDA detected. Use --allow-cpu only for debugging.")
 
+    _configure_cuda_runtime()
+    fp16_enabled = _resolve_fp16()
+    bf16_enabled = False
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    device_names = [torch.cuda.get_device_name(i) for i in range(n_gpu)] if n_gpu else ["CPU"]
     gpu_mem = (
         round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2)
         if torch.cuda.is_available()
         else 0
     )
+    effective_batch = args.per_device_train_batch_size * max(1, n_gpu) * args.gradient_accumulation_steps
     _log(
         "[config] "
-        f"device={device_name}, gpu_mem_gb={gpu_mem}, "
+        f"device={device_name}, visible_gpus={n_gpu}, gpu_names={device_names}, gpu_mem_gb={gpu_mem}, "
+        f"epochs_per_stage={args.epochs_per_stage}, "
+        f"output_dir={output_dir}, export_dir={export_dir}, "
         f"max_length={args.max_length}, train_batch={args.per_device_train_batch_size}, "
         f"eval_batch={args.per_device_eval_batch_size}, grad_accum={args.gradient_accumulation_steps}, "
-        f"effective_batch={args.per_device_train_batch_size * args.gradient_accumulation_steps}, "
+        f"effective_global_batch={effective_batch}, "
         f"news={args.max_news_articles}, viquad={args.viquad_train_max}/{args.viquad_val_max}, "
-        f"msmarco={args.msmarco_train_max}/{args.msmarco_val_max}, hard_neg={args.hard_negatives}"
+        f"msmarco={args.msmarco_train_max}/{args.msmarco_val_max}, hard_neg={args.hard_negatives}, "
+        f"precision={'fp16_amp' if fp16_enabled else 'fp32'}, "
+        f"gradient_checkpointing={args.gradient_checkpointing}, "
+        f"t4x2_preset={getattr(args, '_t4x2_preset_active', False)}, "
+        f"early_stopping_patience={args.early_stopping_patience}"
     )
 
     _log(f"[model] Loading {args.model_name}")
@@ -713,6 +866,8 @@ def train(args):
         torch_dtype=torch.float32,
     )
     model = _force_float32_model(model)
+    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
     _assert_finite_model(model, "after base model load")
 
     stages, val_examples = build_curriculum_examples(args)
@@ -722,7 +877,7 @@ def train(args):
     val_ds = _build_weighted_dataset(val_examples, tokenizer, args.max_length)
     raw = DatasetDict({"validation": val_ds})
 
-    cache_dir = output_dir / "_cache" / "tokenized"
+    cache_dir = output_dir / "_cache" / "tokenized" / _tokenized_cache_signature(args)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     overall_summary = {
@@ -731,6 +886,12 @@ def train(args):
         "stages": [],
         "validation_examples": len(val_examples),
         "output_dir": str(output_dir),
+        "export_dir": str(export_dir),
+        "visible_gpus": n_gpu,
+        "gpu_names": device_names,
+        "fp16_amp": fp16_enabled,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "t4x2_preset": getattr(args, "_t4x2_preset_active", False),
         "stage_complete": {},
     }
 
@@ -756,19 +917,73 @@ def train(args):
         stage_dir = _stage_output_dir(stage_name)
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        if _stage_is_complete(stage_name) or stage_name in completed_stage_names:
+        stage_files_complete = _stage_is_complete(stage_name)
+        stage_resume = _latest_checkpoint_in_dir(stage_dir)
+        stage_resume_epoch = _checkpoint_epoch(stage_resume)
+        stage_state_complete = stage_name in completed_stage_names
+        if stage_state_complete and not stage_files_complete:
+            _log(f"\n[stage {stage_idx}] {stage_name} is listed complete but checkpoint files are missing; retraining")
+        stage_marked_complete = stage_files_complete
+        stage_needs_more_epochs = (
+            stage_marked_complete
+            and stage_resume is not None
+            and stage_resume_epoch is not None
+            and stage_resume_epoch + 1e-6 < args.epochs_per_stage
+        )
+        retrain_completed_stage = False
+        if stage_needs_more_epochs and not args.retrain_completed_stages:
+            _log(
+                f"\n[stage {stage_idx}] {stage_name} was marked complete at epoch "
+                f"{stage_resume_epoch:.4g}; resuming to target epoch {args.epochs_per_stage}"
+            )
+            done_marker = _stage_done_marker(stage_name)
+            if done_marker.exists():
+                done_marker.unlink()
+            completed_stage_names.discard(stage_name)
+            stage_marked_complete = False
+        if stage_marked_complete and not args.retrain_completed_stages:
             _log(f"\n[stage {stage_idx}] {stage_name} already complete, skip")
+            model = _load_completed_stage_model(stage_name)
             overall_summary["stage_complete"][stage_name] = True
             last_completed_stage_name = stage_name
             continue
+        if stage_marked_complete and args.retrain_completed_stages:
+            _log(f"\n[stage {stage_idx}] {stage_name} marked complete; retraining because --retrain-completed-stages is set")
+            done_marker = _stage_done_marker(stage_name)
+            if done_marker.exists():
+                done_marker.unlink()
+            completed_stage_names.discard(stage_name)
+            retrain_completed_stage = True
 
         _log(f"\n[stage {stage_idx}] {stage_name} | {len(stage_examples)} examples")
-        stage_cache = cache_dir / _stage_name(stage_idx)
+        stage_cache = cache_dir / stage_name
         if stage_cache.exists():
-            tokenized_train = load_from_disk(str(stage_cache))
+            tokenized_train = _strip_unused_training_columns(load_from_disk(str(stage_cache)))
         else:
-            tokenized_train = _build_weighted_dataset(stage_examples, tokenizer, args.max_length)
+            tokenized_train = _strip_unused_training_columns(
+                _build_weighted_dataset(stage_examples, tokenizer, args.max_length)
+            )
             tokenized_train.save_to_disk(str(stage_cache))
+
+        stage_save_steps = args.save_steps
+        if stage_idx == 2 and args.stage2_save_steps > 0:
+            stage_save_steps = args.stage2_save_steps
+
+        stage_eval_steps = args.eval_steps
+        if (
+            args.load_best_model_at_end
+            and args.eval_strategy == "steps"
+            and args.save_strategy == "steps"
+            and stage_eval_steps > 0
+            and stage_save_steps % stage_eval_steps != 0
+        ):
+            stage_eval_steps = stage_save_steps
+            _log(
+                f"[stage {stage_name}] eval_steps adjusted to {stage_eval_steps} "
+                "so load_best_model_at_end can use the stage checkpoint cadence"
+            )
+
+        _log(f"[stage {stage_name}] save_steps={stage_save_steps}, eval_steps={stage_eval_steps}")
 
         stage_training_args = TrainingArguments(
             output_dir=str(stage_dir),
@@ -782,21 +997,33 @@ def train(args):
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             eval_strategy=args.eval_strategy,
             save_strategy=args.save_strategy,
-            save_steps=args.save_steps,
-            eval_steps=args.eval_steps,
+            save_steps=stage_save_steps,
+            eval_steps=stage_eval_steps,
             logging_steps=args.logging_steps,
             load_best_model_at_end=args.load_best_model_at_end and args.eval_strategy != "no",
             metric_for_best_model="eval_roc_auc",
             greater_is_better=True,
-            fp16=False,
-            bf16=False,
+            fp16=fp16_enabled,
+            bf16=bf16_enabled,
             report_to=[],
-            remove_unused_columns=False,
-            save_total_limit=args.save_total_limit,
+            remove_unused_columns=True,
+            save_total_limit=None if args.save_total_limit <= 0 else args.save_total_limit,
             dataloader_num_workers=args.dataloader_num_workers,
+            dataloader_pin_memory=True,
+            gradient_checkpointing=args.gradient_checkpointing,
         )
 
-        callbacks = [EarlyStop(args.early_stopping_patience, args.early_stopping_threshold)] if args.early_stopping_patience > 0 else []
+        callbacks = []
+        if args.early_stopping_patience > 0:
+            if args.eval_strategy == "no":
+                _log("[early-stop] Disabled because eval_strategy=no")
+            else:
+                callbacks.append(
+                    EarlyStop(
+                        patience=args.early_stopping_patience,
+                        threshold=args.early_stopping_threshold,
+                    )
+                )
         trainer = WeightedTrainerClass(
             model=model,
             args=stage_training_args,
@@ -808,8 +1035,8 @@ def train(args):
         )
         last_trainer = trainer
 
-        stage_resume = _latest_checkpoint_in_dir(stage_dir)
-        if stage_resume is None and stage_idx == 1 and resume:
+        stage_resume = None if retrain_completed_stage else stage_resume
+        if stage_resume is None and not retrain_completed_stage and stage_idx == 1 and resume:
             stage_resume = Path(resume)
         if stage_resume is None:
             _log(f"[stage {stage_name}] fresh start")
@@ -846,6 +1073,8 @@ def train(args):
                 "train_loss": float(getattr(train_result, "training_loss", 0.0) or 0.0),
                 "eval": metrics,
                 "checkpoint_dir": str(stage_dir),
+                "save_steps": stage_save_steps,
+                "eval_steps": stage_eval_steps,
             }
         )
 
@@ -858,13 +1087,15 @@ def train(args):
         )
         model = _force_float32_model(model)
         _assert_finite_model(model, f"before final export from {final_source}")
-        model.save_pretrained(str(output_dir))
-        tokenizer.save_pretrained(str(output_dir))
+        export_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(export_dir))
+        tokenizer.save_pretrained(str(export_dir))
     elif last_trainer is not None:
         _force_float32_model(last_trainer.model)
         _assert_finite_model(last_trainer.model, "before final export")
-        last_trainer.save_model(str(output_dir))
-        tokenizer.save_pretrained(str(output_dir))
+        export_dir.mkdir(parents=True, exist_ok=True)
+        last_trainer.save_model(str(export_dir))
+        tokenizer.save_pretrained(str(export_dir))
 
     _save_training_state(output_dir, {
         "completed_stage_names": sorted(completed_stage_names, key=lambda n: [s["name"] for s in stages].index(n) if n in [s["name"] for s in stages] else 10**9),
@@ -882,6 +1113,7 @@ def train(args):
         {
             "archive_path": archive,
             "training_state_path": str(_training_state_path(output_dir)),
+            "export_dir": str(export_dir),
             "epochs_per_stage": args.epochs_per_stage,
             "max_length": args.max_length,
             "learning_rate": args.learning_rate,
@@ -892,9 +1124,19 @@ def train(args):
             "eval_steps": args.eval_steps,
             "save_strategy": args.save_strategy,
             "save_steps": args.save_steps,
+            "stage2_save_steps": args.stage2_save_steps,
+            "save_total_limit": args.save_total_limit,
             "per_device_train_batch_size": args.per_device_train_batch_size,
+            "per_device_eval_batch_size": args.per_device_eval_batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "effective_global_batch": effective_batch,
             "dataloader_num_workers": args.dataloader_num_workers,
+            "fp16_amp": fp16_enabled,
+            "mixed_precision": args.mixed_precision,
+            "gradient_checkpointing": args.gradient_checkpointing,
+            "visible_gpus": n_gpu,
+            "gpu_names": device_names,
+            "t4x2_preset": getattr(args, "_t4x2_preset_active", False),
             "early_stopping_patience": args.early_stopping_patience,
             "early_stopping_threshold": args.early_stopping_threshold,
             "hard_negatives": args.hard_negatives,
@@ -906,6 +1148,8 @@ def train(args):
             "news_val_ratio": args.news_val_ratio,
             "max_pseudo_queries_per_article": args.max_pseudo_queries_per_article,
             "quick_test": args.quick_test,
+            "retrain_completed_stages": args.retrain_completed_stages,
+            "resume_from_checkpoint": args.resume_from_checkpoint,
             "local_usage": "Giai nen model vao data/reranker_model/ roi chay: python main.py --load-index --reranker-dir data/reranker_model",
         }
     )
@@ -926,26 +1170,56 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--model-name", default="Fsoft-AIC/videberta-base")
     p.add_argument("--data-csv", default=str(ROOT_DIR / "data" / "vnexpress_articles.csv"))
     p.add_argument("--output-dir", default=_default_output_dir())
+    p.add_argument(
+        "--export-dir",
+        default=None,
+        help="Optional final runtime model directory; defaults to --output-dir",
+    )
     # Defaults target a personal laptop with RTX 3050 Ti 4GB + 16GB RAM.
     # They favor unattended stability over maximum throughput.
-    p.add_argument("--epochs-per-stage", type=float, default=1.0)
+    p.add_argument("--epochs-per-stage", type=float, default=5.0)
     p.add_argument("--learning-rate", type=float, default=1e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--max-length", type=int, default=192)
+    p.add_argument(
+        "--mixed-precision",
+        choices=("auto", "fp16", "fp32"),
+        default="auto",
+        help="auto enables fp16 AMP on CUDA T4; fp32 disables mixed precision",
+    )
+    p.add_argument("--fp16", action="store_true", help="Alias for --mixed-precision fp16")
+    p.add_argument("--no-fp16", action="store_true", help="Alias for --mixed-precision fp32")
+    p.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Reduce memory use at the cost of speed; useful if larger batches OOM",
+    )
+    p.add_argument(
+        "--float32-matmul-precision",
+        choices=("highest", "high", "medium"),
+        default="high",
+        help="PyTorch matmul precision hint; mainly affects newer GPUs, harmless on T4",
+    )
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--per-device-eval-batch-size", type=int, default=2)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     p.add_argument("--dataloader-num-workers", type=int, default=0)
     p.add_argument("--logging-steps", type=int, default=20)
-    p.add_argument("--save-total-limit", type=int, default=2)
+    p.add_argument("--save-total-limit", type=int, default=5, help="Max checkpoints kept per stage; <=0 keeps all")
     p.add_argument("--save-strategy", choices=("steps", "epoch"), default="steps")
     p.add_argument("--save-steps", type=int, default=500)
+    p.add_argument(
+        "--stage2-save-steps",
+        type=int,
+        default=20,
+        help="Checkpoint interval for stage 2 when save_strategy=steps; <=0 uses --save-steps",
+    )
     p.add_argument("--eval-strategy", choices=("steps", "epoch", "no"), default="steps")
     p.add_argument("--eval-steps", type=int, default=500)
     p.add_argument("--load-best-model-at-end", action="store_true")
-    p.add_argument("--early-stopping-patience", type=int, default=2)
+    p.add_argument("--early-stopping-patience", type=int, default=0, help="0 disables early stopping")
     p.add_argument("--early-stopping-threshold", type=float, default=0.001)
     p.add_argument("--hard-negatives", type=int, default=1)
     p.add_argument("--max-news-articles", type=int, default=6000)
@@ -956,10 +1230,62 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--msmarco-train-max", type=int, default=0)
     p.add_argument("--msmarco-val-max", type=int, default=0)
     p.add_argument("--allow-cpu", action="store_true")
+    p.add_argument(
+        "--allow-partial-output-dir",
+        action="store_true",
+        help="Allow training in an existing output dir that has cache folders but no usable checkpoint/model",
+    )
     p.add_argument("--resume-from-checkpoint", type=str, default="auto")
+    p.add_argument(
+        "--retrain-completed-stages",
+        action="store_true",
+        help="Train stages even if _DONE markers exist; completed stages start again from the current model",
+    )
+    p.add_argument(
+        "--t4x2-preset",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Auto-tune conservative throughput defaults when Kaggle exposes 2 Tesla T4 GPUs",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--quick-test", action="store_true", help="Run a very small end-to-end smoke test")
-    return p.parse_args(list(argv) if argv is not None else sys.argv[1:])
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = p.parse_args(raw_argv)
+    args._provided_options = _provided_cli_options(raw_argv)
+    return args
+
+
+def _apply_t4x2_preset(args):
+    provided = getattr(args, "_provided_options", set())
+    active = args.t4x2_preset == "on" or (args.t4x2_preset == "auto" and _is_t4x2())
+    args._t4x2_preset_active = bool(active)
+    if not active:
+        return
+
+    # Conservative T4 x2 defaults: enough work to keep both GPUs busy while
+    # staying below 16GB/GPU for ViDeBERTa at max_length=192.
+    _set_if_not_provided(args, provided, "per_device_train_batch_size", "--per-device-train-batch-size", 4)
+    _set_if_not_provided(args, provided, "per_device_eval_batch_size", "--per-device-eval-batch-size", 8)
+    _set_if_not_provided(args, provided, "gradient_accumulation_steps", "--gradient-accumulation-steps", 4)
+    _set_if_not_provided(args, provided, "dataloader_num_workers", "--dataloader-num-workers", 2)
+    _set_if_not_provided(args, provided, "save_total_limit", "--save-total-limit", 2)
+    _set_if_not_provided(args, provided, "stage2_save_steps", "--stage2-save-steps", args.save_steps)
+    _set_if_not_provided(args, provided, "max_news_articles", "--max-news-articles", 10000)
+    _set_if_not_provided(args, provided, "viquad_train_max", "--viquad-train-max", 5000)
+    _set_if_not_provided(args, provided, "viquad_val_max", "--viquad-val-max", 800)
+
+    if "--mixed-precision" not in provided and "--fp16" not in provided and "--no-fp16" not in provided:
+        args.mixed_precision = "auto"
+
+    _log(
+        "[preset] T4 x2 preset active: "
+        f"train_batch={args.per_device_train_batch_size}, "
+        f"eval_batch={args.per_device_eval_batch_size}, "
+        f"grad_accum={args.gradient_accumulation_steps}, "
+        f"workers={args.dataloader_num_workers}, "
+        f"max_news={args.max_news_articles}, "
+        f"mixed_precision={args.mixed_precision}"
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None):
@@ -970,6 +1296,7 @@ def main(argv: Optional[Sequence[str]] = None):
         args.logging_steps = 1
         args.eval_steps = 2
         args.save_steps = 2
+        args.stage2_save_steps = min(args.stage2_save_steps, args.save_steps)
         args.save_total_limit = 1
         args.per_device_train_batch_size = 2
         args.per_device_eval_batch_size = 2
@@ -985,6 +1312,8 @@ def main(argv: Optional[Sequence[str]] = None):
         args.eval_strategy = "steps"
         args.save_strategy = "steps"
         _log("[quick-test] Enabled end-to-end smoke test preset")
+    else:
+        _apply_t4x2_preset(args)
     train(args)
 
 

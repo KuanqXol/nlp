@@ -455,7 +455,7 @@ def parse_args():
         "--reranker-dir",
         type=str,
         default=None,
-        help="Thư mục cross-encoder checkpoint",
+        help="Thư mục checkpoint hoặc Hugging Face model id của cross-encoder reranker",
     )
     p.add_argument(
         "--viz", action="store_true", help="Xuất KG visualization sau khi build"

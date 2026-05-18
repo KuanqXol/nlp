@@ -43,6 +43,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data_loader import NewsDataLoader, create_document
 from src.retrieval import EmbeddingManager, Retriever, chunk_documents
+from src.retrieval.retriever import DEFAULT_CROSS_ENCODER
 
 
 try:
@@ -714,7 +715,15 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR), help="Directory where report files are saved")
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed for sampling")
     parser.add_argument("--no-current-pipeline", action="store_true", help="Skip the current KG+FAISS pipeline and benchmark only traditional methods")
-    parser.add_argument("--reranker-dir", type=str, default=str(PROJECT_ROOT / "data" / "reranker_model"), help="Path to the cross-encoder reranker model")
+    parser.add_argument(
+        "--reranker-dir",
+        type=str,
+        default=None,
+        help=(
+            "Path hoặc Hugging Face model id của cross-encoder reranker. "
+            f"Mặc định: local data/reranker_model nếu hợp lệ, ngược lại {DEFAULT_CROSS_ENCODER}"
+        ),
+    )
     parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME, help="Tên hoặc path của sentence-transformer bi-encoder")
     parser.add_argument("--query-file", type=str, default=None, help="Optional JSONL/JSON/CSV file with query_text and relevant_doc_id")
     parser.add_argument("--no-reranker", action="store_true", help="Do not evaluate the reranker method")

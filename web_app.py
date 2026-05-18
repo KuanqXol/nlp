@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +34,8 @@ from src.preprocessing.ner import VietnameseNER
 from src.retrieval import EmbeddingManager, Retriever, chunk_documents, QueryProcessor
 
 ROOT_DIR = Path(__file__).resolve().parent
+load_dotenv(ROOT_DIR / ".env")
+
 DATA_DIR = ROOT_DIR / "data"
 DEFAULT_DATA_PATH = DATA_DIR / "vnexpress_articles.csv"
 DEFAULT_INDEX_DIR = DATA_DIR / "index"

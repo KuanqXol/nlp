@@ -35,7 +35,7 @@ def parse_args():
         "--reranker-dir",
         type=str,
         default=None,
-        help="Thư mục cross-encoder checkpoint (mặc định: data/reranker_model)",
+        help="Thư mục checkpoint hoặc Hugging Face model id của cross-encoder reranker",
     )
     return p.parse_args()
 
