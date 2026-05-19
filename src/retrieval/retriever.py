@@ -12,9 +12,11 @@ Pipeline:
 Yêu cầu: faiss-cpu, sentence-transformers
 """
 
+import json
 import math
 import os
 import pickle
+import re
 from collections import defaultdict
 
 from datetime import date, datetime
@@ -48,8 +50,11 @@ DATE_DECAY_ENABLED = True
 DATE_DECAY_WEIGHT = 0.08  # Contribution của date decay vào final score (0→tắt, 1→full)
 MAX_CHUNKS_PER_DOC = 2  # Tối đa giữ N chunk/doc khi dedupe
 
-# Cross-encoder: dùng model fine-tuned local nếu có, fallback public multilingual reranker.
+# Cross-encoder: prefer the local BGE v2 M3 reranker, fallback to the public
+# Hugging Face model id. External training output is used only when explicitly
+# passed via RERANKER_DIR / --reranker-dir.
 DEFAULT_CROSS_ENCODER = "BAAI/bge-reranker-v2-m3"
+DEFAULT_LOCAL_CROSS_ENCODER_DIR = "reranker_bge_v2_m3"
 
 
 def _has_local_cross_encoder_model(path: Path) -> bool:
@@ -58,6 +63,107 @@ def _has_local_cross_encoder_model(path: Path) -> bool:
         and (path / "config.json").exists()
         and ((path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists())
     )
+
+
+def _checkpoint_step(path: Path) -> int:
+    match = re.match(r"checkpoint-(\d+)$", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _completed_stage_names(path: Path) -> List[str]:
+    state_path = path / "training_state.json"
+    if not state_path.exists():
+        return []
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    names = data.get("completed_stage_names", [])
+    return [str(name) for name in names] if isinstance(names, list) else []
+
+
+def _find_local_cross_encoder_model(path: Path) -> Optional[Path]:
+    """Find a loadable model inside a trainer output directory.
+
+    The training script should export the final model to the output root, but
+    external runs sometimes contain only stage checkpoints. Prefer the latest
+    completed stage, then its exported model directory, then its latest
+    checkpoint.
+    """
+    if _has_local_cross_encoder_model(path):
+        return path
+    if not path.exists() or not path.is_dir():
+        return None
+
+    candidates: List[Tuple[int, int, int, float, Path]] = []
+    seen = set()
+
+    def add_candidate(candidate: Path, stage_rank: int = 0, final_stage_model: bool = False):
+        key = str(candidate.resolve())
+        if key in seen or not _has_local_cross_encoder_model(candidate):
+            return
+        seen.add(key)
+        candidates.append(
+            (
+                stage_rank,
+                1 if final_stage_model else 0,
+                _checkpoint_step(candidate),
+                candidate.stat().st_mtime,
+                candidate,
+            )
+        )
+
+    for checkpoint_dir in path.glob("checkpoint-*"):
+        if checkpoint_dir.is_dir():
+            add_candidate(checkpoint_dir)
+
+    stage_root = path / "stage_checkpoints"
+    if stage_root.exists() and stage_root.is_dir():
+        completed_names = _completed_stage_names(path)
+        rank_by_name = {name: idx + 1 for idx, name in enumerate(completed_names)}
+        stage_dirs = [p for p in stage_root.iterdir() if p.is_dir()]
+        fallback_rank_start = len(rank_by_name) + 1
+        fallback_names = sorted(
+            (p.name for p in stage_dirs if p.name not in rank_by_name),
+            key=lambda name: (stage_root / name).stat().st_mtime,
+        )
+        rank_by_name.update(
+            {name: fallback_rank_start + idx for idx, name in enumerate(fallback_names)}
+        )
+
+        for stage_dir in stage_dirs:
+            stage_rank = rank_by_name.get(stage_dir.name, 0)
+            add_candidate(stage_dir, stage_rank=stage_rank, final_stage_model=True)
+            for checkpoint_dir in stage_dir.glob("checkpoint-*"):
+                if checkpoint_dir.is_dir():
+                    add_candidate(checkpoint_dir, stage_rank=stage_rank)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: item[:4])[4]
+
+
+def _resolve_cross_encoder_model(model_dir: Optional[str]) -> str:
+    if model_dir:
+        path = Path(model_dir).expanduser()
+        if path.exists():
+            local_model = _find_local_cross_encoder_model(path)
+            if local_model is not None:
+                if local_model != path:
+                    print(f"[Reranker] Dùng checkpoint local: {path} -> {local_model}")
+                return str(local_model)
+        return model_dir
+
+    data_dir = Path(__file__).resolve().parents[2] / "data"
+    default = data_dir / DEFAULT_LOCAL_CROSS_ENCODER_DIR
+    local_model = _find_local_cross_encoder_model(default)
+    if local_model is not None:
+        if local_model != default:
+            print(f"[Reranker] Dùng checkpoint local: {default} -> {local_model}")
+        return str(local_model)
+    return DEFAULT_CROSS_ENCODER
 
 
 # ── FAISS Backend ─────────────────────────────────────────────────────────────
@@ -137,6 +243,7 @@ class _CrossEncoderReranker:
             "on",
         }
         print(f"[Reranker] Đang load: {model_dir} (device={device})")
+        self.model_dir = model_dir
         model_kwargs = {}
         try:
             import torch
@@ -288,6 +395,7 @@ class Retriever:
         use_faiss: bool = True,
         reranker_model_dir: Optional[str] = None,
         use_cross_encoder: bool = True,
+        load_cross_encoder: bool = True,
         **kwargs,  # backward-compat
     ):
         if not _FAISS_AVAILABLE:
@@ -303,25 +411,10 @@ class Retriever:
 
         self._backend = _FaissBackend()
 
-        # Cross-encoder: ưu tiên fine-tuned model nếu có
-        self._reranker: Optional[_CrossEncoderReranker] = None
-        if use_cross_encoder and _CROSS_ENCODER_AVAILABLE:
-            model_path = reranker_model_dir
-            if model_path is None:
-                default = (
-                    Path(__file__).resolve().parents[2] / "data" / "reranker_model"
-                )
-                model_path = (
-                    str(default)
-                    if _has_local_cross_encoder_model(default)
-                    else DEFAULT_CROSS_ENCODER
-                )
-            try:
-                self._reranker = _CrossEncoderReranker(model_path, device=self._device)
-            except Exception as e:
-                print(f"[Reranker] Không load được ({e}), tắt rerank.")
-
         # State
+        self._reranker: Optional[_CrossEncoderReranker] = None
+        self._reranker_model_dir = reranker_model_dir
+        self._use_cross_encoder = bool(use_cross_encoder)
         self._em = None
         self._documents: Dict[str, Dict] = {}
         self._chunks: Dict[str, Dict] = {}
@@ -330,6 +423,28 @@ class Retriever:
         self._kg = None
         self._global_scores: Dict[str, float] = {}
         self._chunk_mode = False
+
+        if load_cross_encoder:
+            self.load_reranker()
+
+    def load_reranker(self) -> bool:
+        """Load the cross-encoder after heavier retrieval artifacts when needed."""
+        if self._reranker is not None:
+            return True
+        if not self._use_cross_encoder:
+            return False
+        if not _CROSS_ENCODER_AVAILABLE:
+            print("[Reranker] sentence-transformers chưa được cài, tắt rerank.")
+            return False
+
+        model_path = _resolve_cross_encoder_model(self._reranker_model_dir)
+        try:
+            self._reranker = _CrossEncoderReranker(model_path, device=self._device)
+            return True
+        except Exception as e:
+            print(f"[Reranker] Không load được ({type(e).__name__}: {e}), tắt rerank.")
+            self._reranker = None
+            return False
 
     # ── Build ─────────────────────────────────────────────────────────────
 

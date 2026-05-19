@@ -34,7 +34,7 @@ from src.preprocessing.ner import VietnameseNER
 from src.retrieval import EmbeddingManager, Retriever, chunk_documents, QueryProcessor
 
 ROOT_DIR = Path(__file__).resolve().parent
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=True)
 
 DATA_DIR = ROOT_DIR / "data"
 DEFAULT_DATA_PATH = DATA_DIR / "vnexpress_articles.csv"
@@ -170,6 +170,7 @@ class WebSearchService:
             use_faiss=True,
             use_cross_encoder=use_reranker,
             reranker_model_dir=_env_path("RERANKER_DIR"),
+            load_cross_encoder=False,
         )
 
         chunks_dict = state.get("chunks", {})
@@ -186,7 +187,15 @@ class WebSearchService:
             importance_scores=state.get("global_scores", self.importance_scores),
             chunk_mode=True,
         )
-        self.retriever.load_artifacts(str(self.index_dir))
+        try:
+            self.retriever.load_artifacts(str(self.index_dir))
+        except MemoryError as e:
+            return False, (
+                "Không đủ RAM để load FAISS index. Hãy đóng bớt process/model "
+                f"đang chạy rồi thử lại. Chi tiết: {e}"
+            )
+        if use_reranker:
+            self.retriever.load_reranker()
         self._linker = self._build_query_linker()
         self.query_proc = None
         self._ensure_query_proc()
@@ -240,6 +249,7 @@ class WebSearchService:
                 use_faiss=True,
                 use_cross_encoder=_env_flag("USE_RERANKER", False),
                 reranker_model_dir=_env_path("RERANKER_DIR"),
+                load_cross_encoder=False,
             )
             self.retriever.build(
                 chunks=chunks,
@@ -250,6 +260,8 @@ class WebSearchService:
                 kg=None,
                 importance_scores={},
             )
+            if _env_flag("USE_RERANKER", False):
+                self.retriever.load_reranker()
 
             self.documents = docs
             self.ranker = None
@@ -857,6 +869,11 @@ def health():
                 service.retriever and getattr(service.retriever, "_reranker", None)
             ),
             "reranker_dir": _env_path("RERANKER_DIR"),
+            "reranker_model": getattr(
+                getattr(service.retriever, "_reranker", None), "model_dir", None
+            )
+            if service.retriever
+            else None,
             "lite_build_enabled": _env_flag("ALLOW_LITE_BUILD", False),
             "query_understanding": service.query_proc is not None,
         }
