@@ -12,11 +12,9 @@ Pipeline:
 Yêu cầu: faiss-cpu, sentence-transformers
 """
 
-import json
 import math
 import os
 import pickle
-import re
 from collections import defaultdict
 
 from datetime import date, datetime
@@ -50,9 +48,8 @@ DATE_DECAY_ENABLED = True
 DATE_DECAY_WEIGHT = 0.08  # Contribution của date decay vào final score (0→tắt, 1→full)
 MAX_CHUNKS_PER_DOC = 2  # Tối đa giữ N chunk/doc khi dedupe
 
-# Cross-encoder: prefer the local BGE v2 M3 reranker, fallback to the public
-# Hugging Face model id. External training output is used only when explicitly
-# passed via RERANKER_DIR / --reranker-dir.
+# Cross-encoder: prefer the local BGE v2 M3 reranker, otherwise use the public
+# Hugging Face model id.
 DEFAULT_CROSS_ENCODER = "BAAI/bge-reranker-v2-m3"
 DEFAULT_LOCAL_CROSS_ENCODER_DIR = "reranker_bge_v2_m3"
 
@@ -65,84 +62,9 @@ def _has_local_cross_encoder_model(path: Path) -> bool:
     )
 
 
-def _checkpoint_step(path: Path) -> int:
-    match = re.match(r"checkpoint-(\d+)$", path.name)
-    return int(match.group(1)) if match else -1
-
-
-def _completed_stage_names(path: Path) -> List[str]:
-    state_path = path / "training_state.json"
-    if not state_path.exists():
-        return []
-    try:
-        with open(state_path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return []
-    names = data.get("completed_stage_names", [])
-    return [str(name) for name in names] if isinstance(names, list) else []
-
-
 def _find_local_cross_encoder_model(path: Path) -> Optional[Path]:
-    """Find a loadable model inside a trainer output directory.
-
-    The training script should export the final model to the output root, but
-    external runs sometimes contain only stage checkpoints. Prefer the latest
-    completed stage, then its exported model directory, then its latest
-    checkpoint.
-    """
-    if _has_local_cross_encoder_model(path):
-        return path
-    if not path.exists() or not path.is_dir():
-        return None
-
-    candidates: List[Tuple[int, int, int, float, Path]] = []
-    seen = set()
-
-    def add_candidate(candidate: Path, stage_rank: int = 0, final_stage_model: bool = False):
-        key = str(candidate.resolve())
-        if key in seen or not _has_local_cross_encoder_model(candidate):
-            return
-        seen.add(key)
-        candidates.append(
-            (
-                stage_rank,
-                1 if final_stage_model else 0,
-                _checkpoint_step(candidate),
-                candidate.stat().st_mtime,
-                candidate,
-            )
-        )
-
-    for checkpoint_dir in path.glob("checkpoint-*"):
-        if checkpoint_dir.is_dir():
-            add_candidate(checkpoint_dir)
-
-    stage_root = path / "stage_checkpoints"
-    if stage_root.exists() and stage_root.is_dir():
-        completed_names = _completed_stage_names(path)
-        rank_by_name = {name: idx + 1 for idx, name in enumerate(completed_names)}
-        stage_dirs = [p for p in stage_root.iterdir() if p.is_dir()]
-        fallback_rank_start = len(rank_by_name) + 1
-        fallback_names = sorted(
-            (p.name for p in stage_dirs if p.name not in rank_by_name),
-            key=lambda name: (stage_root / name).stat().st_mtime,
-        )
-        rank_by_name.update(
-            {name: fallback_rank_start + idx for idx, name in enumerate(fallback_names)}
-        )
-
-        for stage_dir in stage_dirs:
-            stage_rank = rank_by_name.get(stage_dir.name, 0)
-            add_candidate(stage_dir, stage_rank=stage_rank, final_stage_model=True)
-            for checkpoint_dir in stage_dir.glob("checkpoint-*"):
-                if checkpoint_dir.is_dir():
-                    add_candidate(checkpoint_dir, stage_rank=stage_rank)
-
-    if not candidates:
-        return None
-
-    return max(candidates, key=lambda item: item[:4])[4]
+    """Return a loadable local cross-encoder directory, if present."""
+    return path if _has_local_cross_encoder_model(path) else None
 
 
 def _resolve_cross_encoder_model(model_dir: Optional[str]) -> str:
@@ -151,8 +73,6 @@ def _resolve_cross_encoder_model(model_dir: Optional[str]) -> str:
         if path.exists():
             local_model = _find_local_cross_encoder_model(path)
             if local_model is not None:
-                if local_model != path:
-                    print(f"[Reranker] Dùng checkpoint local: {path} -> {local_model}")
                 return str(local_model)
         return model_dir
 
@@ -160,8 +80,6 @@ def _resolve_cross_encoder_model(model_dir: Optional[str]) -> str:
     default = data_dir / DEFAULT_LOCAL_CROSS_ENCODER_DIR
     local_model = _find_local_cross_encoder_model(default)
     if local_model is not None:
-        if local_model != default:
-            print(f"[Reranker] Dùng checkpoint local: {default} -> {local_model}")
         return str(local_model)
     return DEFAULT_CROSS_ENCODER
 
@@ -289,9 +207,8 @@ class _CrossEncoderReranker:
         """Convert CrossEncoder outputs to one finite relevance score per pair.
 
         SentenceTransformers returns shape (N,) for regression/single-label models
-        and shape (N, 2) for binary classifiers. The local ViDeBERTa reranker is a
-        2-label classifier, so the correct score is the positive-class softmax,
-        not the first flattened logit.
+        and shape (N, 2) for binary classifiers. For 2-label classifiers, the
+        correct relevance score is the positive-class softmax.
         """
         try:
             arr = np.asarray(scores, dtype=np.float64)

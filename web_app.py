@@ -32,6 +32,7 @@ from src.graph.ranking import GraphRanker
 from src.preprocessing.entity_linking import EntityLinker
 from src.preprocessing.ner import VietnameseNER
 from src.retrieval import EmbeddingManager, Retriever, chunk_documents, QueryProcessor
+from src.reader import QAReader
 
 ROOT_DIR = Path(__file__).resolve().parent
 load_dotenv(ROOT_DIR / ".env", override=True)
@@ -79,6 +80,7 @@ class WebSearchService:
         self.ranker: Optional[GraphRanker] = None
         self.importance_scores: Dict[str, float] = {}
         self.query_proc: Optional[QueryProcessor] = None
+        self.reader = QAReader()
         self._ner: Optional[VietnameseNER] = None
         self._linker: Optional[EntityLinker] = None
         self._kg = None
@@ -328,6 +330,21 @@ class WebSearchService:
             results, _, _ = self.search(query, top_k=top_k, mode=mode)
             out[mode] = results
         return out
+
+    def answer(
+        self,
+        query: str,
+        top_k: int = 10,
+        mode: str = "full",
+        max_context_docs: int = 5,
+    ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any], Dict[str, Any]]:
+        results, elapsed, analysis = self.search(query, top_k=top_k, mode=mode)
+        answer_payload = self.reader.answer(
+            query,
+            results,
+            max_context_docs=max_context_docs,
+        )
+        return results, elapsed, analysis, answer_payload
 
     @staticmethod
     def _format_entity_label(mention: Optional[str], canonical: Optional[str]) -> str:
@@ -793,6 +810,7 @@ def home(request: Request):
             "compare_results": None,
             "ner_expansion": ner_expansion,
             "graph_payload": None,
+            "answer_payload": None,
         },
     )
 
@@ -814,14 +832,18 @@ def search(
     compare_results = None
     compare_enabled = bool(compare)
     graph_payload = None
+    answer_payload = None
     if query:
         if service.state.mode != "not-ready":
             if compare_enabled:
                 compare_results = service.compare_modes(query, top_k=min(top_k, 5))
                 results = compare_results.get(mode, [])
                 elapsed_ms = 0
+                answer_payload = service.reader.answer(query, results)
             else:
-                results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
+                results, elapsed, analysis, answer_payload = service.answer(
+                    query, top_k=top_k, mode=mode
+                )
                 elapsed_ms = int(elapsed * 1000)
         seed_entities = service.query_proc.get_query_entity_names(analysis) if service.query_proc and analysis else []
         graph_payload = service._build_graph_payload(
@@ -835,6 +857,7 @@ def search(
         graph_payload["compare"] = compare_enabled
         graph_payload["compare_results"] = compare_results
         graph_payload["state"] = service.state.__dict__
+        graph_payload["answer"] = answer_payload
 
     ner_expansion = service._build_expanded_ner(analysis, service.query_proc.get_query_entity_names(analysis) if service.query_proc else []) if query else []
     return templates.TemplateResponse(
@@ -852,6 +875,7 @@ def search(
             "compare_results": compare_results,
             "ner_expansion": ner_expansion,
             "graph_payload": graph_payload,
+            "answer_payload": answer_payload,
         },
     )
 
@@ -924,5 +948,53 @@ def api_graph(
         "compare": compare_enabled,
         "compare_results": service.compare_modes(query, top_k=min(top_k, 5)) if compare_enabled else None,
         "state": service.state.__dict__,
+    })
+    return JSONResponse(payload)
+
+
+@app.post("/api/ask")
+def api_ask(
+    query: str = Form(...),
+    top_k: int = Form(10),
+    mode: str = Form("full"),
+    compare: Optional[str] = Form(None),
+):
+    query = (query or "").strip()
+    top_k = max(1, min(int(top_k or 10), 50))
+    mode = mode if mode in {"vector-only", "vector-graph", "vector-rerank", "full"} else "full"
+    if not query:
+        return JSONResponse({"error": "missing_query"}, status_code=400)
+    if service.state.mode == "not-ready":
+        return JSONResponse({"error": "not_ready", "state": service.state.__dict__}, status_code=503)
+
+    compare_enabled = bool(compare)
+    if compare_enabled:
+        compare_results = service.compare_modes(query, top_k=min(top_k, 5))
+        results = compare_results.get(mode, [])
+        elapsed = 0.0
+        analysis = service.analyze_query(query)
+        answer_payload = service.reader.answer(query, results)
+    else:
+        results, elapsed, analysis, answer_payload = service.answer(
+            query,
+            top_k=top_k,
+            mode=mode,
+        )
+        compare_results = None
+
+    seed_entities = service.query_proc.get_query_entity_names(analysis) if service.query_proc else []
+    payload = service._build_graph_payload(
+        query=query,
+        analysis=analysis,
+        results=results,
+        seed_entities=seed_entities,
+        mode=mode,
+    )
+    payload.update({
+        "elapsed_ms": int(elapsed * 1000),
+        "compare": compare_enabled,
+        "compare_results": compare_results,
+        "state": service.state.__dict__,
+        "answer": answer_payload,
     })
     return JSONResponse(payload)

@@ -1,141 +1,149 @@
 # Vietnamese KG-Enhanced News Search
 
-Hệ thống tìm kiếm tin tức tiếng Việt kết hợp Knowledge Graph, FAISS vector search và cross-encoder reranking. Dữ liệu: 150k bài báo VnExpress (CSV).
+Hệ thống tìm kiếm tin tức tiếng Việt trên tập VnExpress, kết hợp Knowledge Graph, FAISS dense retrieval, query expansion, cross-encoder reranking và Reader QA để trả lời ngắn gọn có dẫn nguồn.
 
-## Kiến trúc
+Điểm cập nhật quan trọng: reranker dùng **model train sẵn** `BAAI/bge-reranker-v2-m3`; Reader QA dùng **Gemini** qua `GEMINI_API_KEY`.
 
-```
+## Tổng Quan Pipeline
+
+```text
 CSV / JSON
-    ↓
-DataLoader          parse ngày, dedup URL, lọc ngôn ngữ
-    ↓
-VietnameseNER       PhoBERT fine-tuned → PER / LOC / ORG
-    ↓
-EntityLinker        exact match → Levenshtein → embedding
-                    (dùng chung vietnamese-bi-encoder với FAISS)
-    ↓
-KnowledgeGraph      co-occurrence + relation edges, temporal, confidence filter
-SimilarityGraphBuilder  thêm edge dựa trên embedding similarity
-GraphRanker         Global PageRank (offline) + PPR query-time
-    ↓
-Chunking            sentence_window, ~400 ký tự, 1 câu overlap
-EmbeddingManager    vietnamese-bi-encoder (bkai-foundation-models)
-FAISS index         FlatIP ≤50k chunks | IVFFlat >50k chunks
-    ↓
-QueryProcessor      normalize → NER → entity link → intent detection
-QueryExpander       PPR-guided, 2-hop, relation-weighted, multi-query
-    ↓
-Retriever           FAISS top-50 → graph boost → cross-encoder rerank → date decay
-    ↓
-Kết quả: title + URL + snippet + score
+  -> NewsDataLoader
+     parse ngày VnExpress, chuẩn hóa text, cắt byline, dedup URL, lọc tiếng Việt
+
+  -> VietnameseNER
+     ưu tiên PhoBERT NER trong data/ner_model/
+     dùng underthesea nếu chưa có checkpoint
+
+  -> EntityLinker
+     alias/exact -> embedding similarity -> Levenshtein -> tạo entity mới
+     dùng chung encoder với EmbeddingManager để cùng vector space
+
+  -> KnowledgeGraph
+     node = entity canonical
+     edge = triples nếu document có field triples, co_occurrence nếu không có relation rõ
+     thêm temporal metadata, majority vote type, confidence filter
+
+  -> SimilarityGraphBuilder + GraphRanker
+     thêm edge similar_to bằng embedding similarity
+     tính global PageRank / importance score
+     query-time Personalized PageRank nếu có seed entity
+
+  -> Chunking + Embedding + FAISS
+     sentence window ~400 ký tự, overlap 1 câu, prepend title
+     embedding bằng bkai-foundation-models/vietnamese-bi-encoder
+     FAISS FlatIP hoặc IVFFlat tùy số chunk
+
+  -> QueryProcessor + QueryExpander
+     normalize query, NER/link entity, keyword/topic/year/intent
+     mở rộng multi-query qua KG/PPR khi có seed entity
+
+  -> Retriever
+     FAISS top chunk -> doc dedupe -> graph boost -> BGE rerank -> date decay
+
+  -> QAReader
+     đọc top chunks/bài báo, sinh câu trả lời tiếng Việt ngắn + citation
+
+  -> Kết quả
+     answer + citations + title, URL, snippet chunk, score
 ```
 
-## Cấu trúc thư mục
+## Cấu Trúc Thư Mục
 
-```
+```text
 nlp/
-├── main.py                         entry point, NewsSearchSystem
+├── main.py                         CLI và class NewsSearchSystem
+├── web_app.py                      FastAPI web demo
+├── newsurl.py                      crawl URL VnExpress
+├── news.py                         crawl nội dung bài báo từ URL
 ├── requirements.txt
-├── data/
-│   ├── vnexpress_articles.csv      dữ liệu 150k bài (bạn cung cấp)
-│   ├── ner_model/                  PhoBERT NER sau khi fine-tune
-│   ├── reranker_model/             ViDeBERTa cross-encoder sau khi fine-tune
-│   └── index/                      index build xong (tự tạo khi chạy)
-│       ├── state.pkl
-│       ├── knowledge_graph.pkl
-│       ├── vector.index            FAISS
-│       ├── ner_checkpoint.json     resume nếu bị ngắt
-│       └── ner_cache.json
+├── Ezpl.md                         giải thích pipeline bằng lời
+├── rerank.md                       ghi chú riêng về luồng rerank
+├── web/
+│   ├── templates/index.html
+│   └── static/app.css
+├── data/                           không commit, dữ liệu/model/index local
+│   ├── vnexpress_articles.csv
+│   ├── index/
+│   │   ├── state.pkl
+│   │   ├── knowledge_graph.pkl
+│   │   ├── vector.index
+│   │   ├── ner_checkpoint.json
+│   │   ├── ner_cache.json
+│   │   └── ner_results.jsonl
+│   ├── ner_model/                  PhoBERT NER đã fine-tune, tùy chọn
+│   ├── bi_encoder_model/           cache local cho bi-encoder, tùy chọn
+│   ├── reranker_bge_v2_m3/         BGE reranker train sẵn, ưu tiên nếu có
+│   ├── benchmarks/
+│   └── vncorenlp/
 ├── scripts/
-│   ├── build_index.py              build index offline
-│   ├── train_ner.py                fine-tune PhoBERT NER
-│   ├── train_reranker.py           fine-tune ViDeBERTa cross-encoder
-│   └── evaluate_system.py          đánh giá toàn pipeline
+│   ├── build_index.py
+│   ├── train_ner.py
+│   ├── evaluate_test_model.py
+│   ├── evaluate_test_bm25.py
+│   ├── build_retrieval_eval_set.py
+│   └── benchmark_retrieval.py
 └── src/
     ├── data_loader.py
     ├── evaluation_nlp.py
-    ├── utils/
-    │   └── text.py                 split_sentences dùng chung NER + chunking
+    ├── utils/text.py
     ├── preprocessing/
-    │   ├── ner.py                  PhoBERT NER + cache + checkpoint
-    │   └── entity_linking.py       3-stage linker, shared encoder
+    │   ├── ner.py
+    │   └── entity_linking.py
     ├── graph/
-    │   ├── knowledge_graph.py      MultiDiGraph, temporal, confidence filter
-    │   ├── ranking.py              PageRank + PPR
-    │   ├── similarity.py           embedding-based edges
-    │   └── visualization.py        Pyvis export
+    │   ├── knowledge_graph.py
+    │   ├── ranking.py
+    │   ├── similarity.py
+    │   └── visualization.py
+    ├── reader/
+    │   └── qa_reader.py
     └── retrieval/
-        ├── chunking.py             sentence_window
-        ├── embedding.py            VietnameseBiEncoder, EmbeddingManager
-        ├── query_processor.py      normalize, NER, intent detection
-        ├── query_expansion.py      multi-query, PPR-guided, relation-weighted
-        └── retriever.py            FAISS + graph boost + rerank + date decay
+        ├── chunking.py
+        ├── embedding.py
+        ├── query_processor.py
+        ├── query_expansion.py
+        └── retriever.py
 ```
 
-## Cài đặt
+## Cài Đặt
 
-```bash
-python -m venv venv
-source venv/bin/activate        # Linux/Mac
-# venv\Scripts\activate         # Windows
+Windows PowerShell:
 
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+$env:PYTHONIOENCODING="utf-8"
 pip install -r requirements.txt
 ```
 
-Yêu cầu Python 3.10+. GPU không bắt buộc để search (chỉ cần cho training).
-
-## Thứ tự chạy lần đầu
-
-### Bước 1 — Fine-tune NER (Kaggle GPU, ~45 phút)
-
-Upload `kaggle_train_ner.ipynb` lên Kaggle, thêm CSV, chạy. Download `ner_model.zip`, giải nén vào `data/ner_model/`.
-
-Nếu muốn bỏ qua bước này: hệ thống dùng `underthesea` làm fallback NER, chất lượng thấp hơn nhưng chạy được ngay.
-
-### Bước 2 — Fine-tune cross-encoder (Kaggle GPU, ~2-3 giờ)
-
-Upload `kaggle_train_reranker.ipynb` lên Kaggle, thêm CSV, chạy. Download `reranker_model.zip`, giải nén vào `data/reranker_model/`.
-
-Nếu muốn bỏ qua: hệ thống dùng `cross-encoder/ms-marco-MiniLM-L6-v2` (tiếng Anh) làm fallback.
-
-### Bước 3 — Build index (chạy 1 lần, ~1-8 giờ tùy phần cứng)
+Linux/macOS:
 
 ```bash
-python scripts/build_index.py --data data/vnexpress_articles.csv
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-NER chạy qua 150k bài với checkpoint tự động — nếu bị ngắt thì chạy lại lệnh trên, hệ thống resume từ điểm dừng.
+Yêu cầu thực tế: Python 3.10+, RAM đủ lớn để load index, GPU nếu muốn build/train nhanh hơn. Search có thể chạy CPU nhưng reranker BGE v2 M3 khá nặng.
 
-### Bước 4 — Chạy demo
+## Chạy Lần Đầu
 
-```bash
-# Interactive
-python main.py --load-index
+### 1. Chuẩn bị dữ liệu
 
-# One-shot query
-python main.py --load-index --query "Samsung đầu tư Việt Nam"
+Đặt CSV tại:
 
-# Chỉ định NER và reranker model
-python main.py --load-index \
-    --ner-model-dir data/ner_model \
-    --reranker-dir data/reranker_model
+```text
+data/vnexpress_articles.csv
 ```
 
-## Định dạng dữ liệu đầu vào
-
-### CSV (VnExpress)
-
-```
-url,date,category,title,text
-```
+Schema CSV:
 
 ```csv
+url,date,category,title,text
 https://vnexpress.net/bai-bao.html,"Thứ hai, 15/1/2024, 08:00 (GMT+7)",kinh-te,Tiêu đề,"Nội dung..."
 ```
 
-DataLoader tự parse ngày, dedup URL, lọc bài không phải tiếng Việt.
-
-### JSON
+Hệ thống cũng hỗ trợ JSON array với các field:
 
 ```json
 [
@@ -150,90 +158,322 @@ DataLoader tự parse ngày, dedup URL, lọc bài không phải tiếng Việt.
 ]
 ```
 
-## CLI
+### 2. NER model
 
-```bash
+Nếu có checkpoint PhoBERT NER, đặt vào:
+
+```text
+data/ner_model/
+```
+
+Nếu chưa có, hệ thống dùng `underthesea`. Cách này chạy được ngay nhưng chất lượng entity thấp hơn.
+
+Train NER tùy chọn:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\train_ner.py `
+  --data-csv data\vnexpress_articles.csv `
+  --output-dir data\ner_model
+```
+
+### 3. Reranker
+
+Runtime dùng BGE reranker train sẵn:
+
+1. Local BGE tại `data/reranker_bge_v2_m3/`, nếu có.
+2. Hugging Face model id `BAAI/bge-reranker-v2-m3`, nếu chưa có local.
+
+Nếu muốn ép dùng model train sẵn trên Hugging Face:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --load-index --reranker-dir BAAI/bge-reranker-v2-m3
+```
+
+Nếu muốn dùng thư mục local:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --load-index --reranker-dir data\reranker_bge_v2_m3
+```
+
+### 4. Build index
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_index.py --data data\vnexpress_articles.csv
+```
+
+Build index sẽ tạo `data/index/`. NER có checkpoint nên nếu bị ngắt có thể chạy lại lệnh build, pipeline tiếp tục từ `ner_checkpoint.json` và `ner_results.jsonl`.
+
+### 5. Chạy CLI
+
+Interactive:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --load-index
+```
+
+One-shot query:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --load-index --query "Samsung đầu tư Việt Nam"
+```
+
+Sinh câu trả lời QA có nguồn:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --load-index --query "Samsung đầu tư Việt Nam" --answer
+```
+
+Chỉ định model:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --load-index `
+  --ner-model-dir data\ner_model `
+  --reranker-dir data\reranker_bge_v2_m3
+```
+
+## Chạy Web Demo
+
+Web app mặc định load index tại `data/index/`. Reranker trên web chỉ được load khi bật `USE_RERANKER=1`.
+
+```powershell
+$env:USE_RERANKER="1"
+$env:RERANKER_DIR="D:\1.HOC\nlp\data\reranker_bge_v2_m3"
+
+.\.venv\Scripts\python.exe -m uvicorn web_app:app --reload --port 8005
+```
+
+Mở:
+
+```text
+http://127.0.0.1:8005
+```
+
+Các mode trong web:
+
+| Mode | Vector | Graph boost | Rerank | Date decay |
+|---|---:|---:|---:|---:|
+| `vector-only` | Có | Không | Không | Không |
+| `vector-graph` | Có | Có | Không | Không |
+| `vector-rerank` | Có | Không | Có, nếu reranker đã load | Không |
+| `full` | Có | Có | Có, nếu reranker đã load | Có |
+
+Env hữu ích:
+
+| Env | Mặc định | Ý nghĩa |
+|---|---|---|
+| `INDEX_DIR` | `data/index` | Thư mục index |
+| `DATA_PATH` | `data/vnexpress_articles.csv` | File dữ liệu cho lite build |
+| `USE_RERANKER` | `0` | Bật load cross-encoder cho web |
+| `RERANKER_DIR` | None | Path hoặc Hugging Face model id |
+| `ALLOW_LITE_BUILD` | `0` | Nếu không có index, build demo nhỏ không KG/NER |
+| `DEMO_MAX_DOCS` | `2000` | Số bài cho lite build |
+| `RERANKER_BATCH_SIZE` | CUDA: 8, CPU: 16 | Batch size khi rerank |
+| `RERANKER_MAX_LENGTH` | `192` | Max length cho cross-encoder |
+| `GEMINI_API_KEY` | None | API key Gemini để bật LLM reader qua Google AI Studio |
+| `GEMINI_MODEL` | `gemini-3.5-flash` | Model Gemini cho reader |
+| `READER_MAX_TOKENS` | `320` | Giới hạn output reader |
+| `READER_TEMPERATURE` | `0` | Temperature reader |
+
+API web:
+
+```text
+GET  /health
+GET  /api/status
+GET  /api/analysis?query=...
+POST /api/graph
+POST /api/ask
+```
+
+## CLI Options
+
+```powershell
 python main.py [options]
 ```
 
-| Flag              | Mặc định                      | Mô tả                  |
-| ----------------- | ----------------------------- | ---------------------- |
-| `--query`, `-q`   | None                          | Chạy 1 query rồi thoát |
-| `--data`, `-d`    | `data/vnexpress_articles.csv` | Đường dẫn CSV/JSON     |
-| `--top-k`, `-k`   | 10                            | Số bài trả về          |
-| `--load-index`    | False                         | Load index từ disk     |
-| `--index-dir`     | `data/index`                  | Thư mục index          |
-| `--ner-model-dir` | `data/ner_model`              | Thư mục PhoBERT NER    |
-| `--reranker-dir`  | `data/reranker_model`         | Thư mục cross-encoder  |
-| `--viz`           | False                         | Xuất KG visualization  |
+| Flag | Mặc định | Mô tả |
+|---|---|---|
+| `--query`, `-q` | None | Chạy một query rồi thoát |
+| `--data`, `-d` | `data/vnexpress_articles.csv` | Đường dẫn CSV/JSON |
+| `--top-k`, `-k` | `10` | Số kết quả trả về |
+| `--answer` | False | Sinh câu trả lời QA từ top kết quả |
+| `--reader-context-docs` | `5` | Số kết quả dùng làm context reader |
+| `--load-index` | False | Load index từ disk thay vì build lại |
+| `--index-dir` | `data/index` | Thư mục index |
+| `--ner-model-dir` | None | Thư mục PhoBERT NER; None nghĩa là `data/ner_model` |
+| `--reranker-dir` | None | Path hoặc Hugging Face model id; None nghĩa là auto BGE |
+| `--viz` | False | Xuất KG visualization sau build/load |
 
-## Lệnh trong interactive mode
+Lệnh trong interactive mode:
 
-| Lệnh       | Chức năng                |
-| ---------- | ------------------------ |
-| `<query>`  | Tìm kiếm tin tức         |
-| `:kg`      | Thống kê Knowledge Graph |
-| `:top`     | Top entity theo PageRank |
-| `:suggest` | Gợi ý query từ KG        |
-| `:viz`     | Xuất KG ra file HTML     |
-| `:help`    | Hiển thị trợ giúp        |
-| `:quit`    | Thoát                    |
+| Lệnh | Chức năng |
+|---|---|
+| `<query>` | Tìm kiếm tin tức |
+| `:kg` | Thống kê Knowledge Graph |
+| `:top` | Top entity theo PageRank |
+| `:suggest` | Gợi ý query từ KG |
+| `:viz` | Xuất KG HTML |
+| `:help` | Hiển thị trợ giúp |
+| `:quit`, `:exit`, `:q` | Thoát |
 
 ## Models
 
-| Model                                          | Vai trò                          | Nguồn                                          |
-| ---------------------------------------------- | -------------------------------- | ---------------------------------------------- |
-| `vinai/phobert-base-v2`                        | NER backbone                     | VinAI, fine-tune trên VLSP2016 + silver data   |
-| `bkai-foundation-models/vietnamese-bi-encoder` | Embedding FAISS + entity linking | BKAI, dùng sẵn không cần train                 |
-| `Fsoft-AIC/videberta-base`                     | Cross-encoder reranker backbone  | Fsoft, fine-tune trên MMARCO-Vi + ViQuAD + báo |
+| Model | Vai trò | Ghi chú |
+|---|---|---|
+| `vinai/phobert-base-v2` | Backbone NER | Dùng khi đã fine-tune và đặt ở `data/ner_model/` |
+| `underthesea` | Fallback NER | Tự dùng khi chưa có PhoBERT NER |
+| `bkai-foundation-models/vietnamese-bi-encoder` | Dense embedding | Dùng cho FAISS, query embedding, entity linking, similarity graph |
+| `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker mặc định | Model train sẵn, ưu tiên local `data/reranker_bge_v2_m3/` nếu có |
+| `gemini-3.5-flash` | Reader QA | Dùng qua Gemini nếu có `GEMINI_API_KEY` |
 
-## Training data
+## Đánh Giá Và Benchmark
 
-| Dataset                     | Dùng cho                | Link                                      |
-| --------------------------- | ----------------------- | ----------------------------------------- |
-| VLSP2016 NER                | Fine-tune PhoBERT NER   | `datnth1709/VLSP2016-NER-data`            |
-| 150k bài VnExpress (silver) | Mix vào NER training    | File CSV của bạn                          |
-| MMARCO-Vi                   | Fine-tune cross-encoder | `unicamp-dl/mmarco` (config `vietnamese`) |
-| UIT-ViQuAD 2.0              | Fine-tune cross-encoder | `taidng/UIT-ViQuAD2.0`                    |
-| 150k bài VnExpress (pseudo) | Fine-tune cross-encoder | File CSV của bạn                          |
+NER trên ground truth nhỏ:
 
-## Đánh giá
-
-```bash
-# Đánh giá toàn pipeline
-python scripts/evaluate_system.py --load-index
-
-# Chỉ đánh giá NER
-python scripts/evaluate_system.py --load-index --tasks ner
-
-# Đánh giá retrieval với qrels file
-python scripts/evaluate_system.py --load-index --tasks retrieval \
-    --retrieval-qrels data/qrels.json
-
-# Lưu kết quả
-python scripts/evaluate_system.py --load-index --output data/eval_results.json
+```powershell
+.\.venv\Scripts\python.exe src\evaluation_nlp.py --use-model
 ```
 
-Metrics: Precision/Recall/F1 cho NER, Recall@K / MRR@K / NDCG@K cho retrieval.
+Dense self-retrieval:
 
-## Xử lý sự cố
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_test_model.py `
+  --data data\vnexpress_articles.csv `
+  --max-docs 1000 `
+  --top-k 10
+```
 
-**NER crash hoặc bị ngắt giữa chừng**
+BM25 self-retrieval:
 
-Chạy lại lệnh build y hệt, hệ thống tự resume từ `data/index/ner_checkpoint.json`.
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_test_bm25.py `
+  --data data\vnexpress_articles.csv `
+  --max-docs 1000 `
+  --top-k 10
+```
 
-**Không có FAISS**
+Tạo bộ eval weak-labeled khó hơn title self-retrieval:
 
-Tự fallback về NumPy. Cài lại: `pip install faiss-cpu`.
+```powershell
+.\.venv\Scripts\python.exe scripts\build_retrieval_eval_set.py `
+  --source data\vnexpress_articles.csv `
+  --corpus-size 2000 `
+  --query-count 200
+```
+
+Benchmark nhiều phương pháp, có thể dùng query file:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_retrieval.py `
+  --data data\benchmarks\retrieval_eval_200_corpus.csv `
+  --query-file data\benchmarks\retrieval_eval_200_queries.jsonl `
+  --reranker-dir data\reranker_bge_v2_m3 `
+  --top-k 10
+```
+
+Các report được ghi vào `data/benchmarks/`.
+
+## Crawler Dữ Liệu
+
+Thu URL:
+
+```powershell
+.\.venv\Scripts\python.exe newsurl.py
+```
+
+Crawl nội dung bài báo từ URL:
+
+```powershell
+.\.venv\Scripts\python.exe news.py
+```
+
+Hai script này ghi ra `vnexpress_urls.txt` và `vnexpress_articles.csv` theo config hard-code trong file. Khi dùng cho pipeline chính, chuyển CSV vào `data/vnexpress_articles.csv`.
+
+## Chi Tiết Retrieval Runtime
+
+Mỗi query đi qua các bước chính:
+
+1. `QueryProcessor.process()` normalize query, chạy NER, link entity, lấy keyword/topic/year/intent.
+2. `QueryExpander.expand()` tạo multi-query từ KG nếu có seed entity.
+3. `EmbeddingManager.encode_query()` encode query bằng bi-encoder, có cache SHA1.
+4. FAISS lấy tối đa `FAISS_FETCH_K = 50` chunk gần nhất.
+5. Retriever gom chunk về document, giữ tối đa `MAX_CHUNKS_PER_DOC = 2` metadata mỗi doc.
+6. Graph boost dùng PPR hoặc global importance, hệ số `GRAPH_BOOST_ALPHA = 0.15`.
+7. Cross-encoder BGE rerank candidate bằng cặp `(query, chunk_text)`.
+8. Date decay chạy sau rerank, trọng số `DATE_DECAY_WEIGHT = 0.08`.
+9. Nếu bật `--answer` hoặc gọi `/api/ask`, `QAReader` dùng top contexts để sinh answer + citations.
+
+Các field nên nhìn khi debug kết quả:
+
+| Field | Ý nghĩa |
+|---|---|
+| `retrieval_score` | Score dùng để sort cuối cùng |
+| `vector_score` | Điểm FAISS của chunk tốt nhất |
+| `graph_boost` | Boost từ KG/PPR |
+| `cross_encoder_score` | Điểm reranker, chỉ có khi rerank chạy thành công |
+| `date_decay_weight` | Hệ số thời gian |
+| `chunk_text` | Text thực tế đưa vào reranker |
+| `chunk_id` | Chunk tốt nhất |
+| `matched_chunk_ids` | Các chunk cùng doc được giữ để debug |
+
+Reader QA trả thêm:
+
+| Field | Ý nghĩa |
+|---|---|
+| `answer` | Câu trả lời ngắn bằng tiếng Việt |
+| `citations` | Danh sách nguồn `[S1]`, `[S2]` đã dùng |
+| `used_contexts` | Context thực tế đưa vào reader |
+| `confidence` | Mức tự tin thô: `medium` hoặc `low` |
+| `is_answerable` | Context có đủ bằng chứng để trả lời hay không |
+
+## Lưu Ý Kỹ Thuật
+
+- `data/` rất lớn và đang được ignore. Các model, index và CSV là local artifact.
+- `setup.py` là helper cũ, có nhiều giả định cấu hình không còn khớp hoàn toàn với pipeline hiện tại. Nên ưu tiên cài bằng `requirements.txt` và chạy trực tiếp các script.
+- Knowledge Graph sẽ có relation semantic nếu document có field `triples`; pipeline hiện tại không chạy relation extraction trong build chính, nên với CSV thường KG chủ yếu dựa trên entity co-occurrence và similarity edge.
+- `SimilarityGraphBuilder` tính similarity toàn cặp entity, có thể tốn thời gian nếu số entity lớn.
+- Web chỉ load reranker khi `USE_RERANKER=1`; nếu không bật env này thì mode `vector-rerank` và `full` sẽ không có rerank.
+- Reader chỉ dùng các bài/chunk đã được Retriever trả về; nó không tự tìm thêm nguồn mới.
+- Reranker chỉ sắp xếp lại candidate đã được FAISS lấy ra. Nếu bài đúng không vào top chunk ban đầu, reranker không tự tìm thêm bài mới.
+- README này phản ánh trạng thái runtime hiện tại: BGE reranker train sẵn và Gemini Reader QA.
+
+## Xử Lý Sự Cố
+
+**Không có `data/index/` hoặc thiếu `vector.index`**
+
+Chạy lại:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_index.py --data data\vnexpress_articles.csv
+```
+
+**NER build bị ngắt**
+
+Chạy lại đúng lệnh build. Pipeline resume từ `data/index/ner_checkpoint.json`.
 
 **Không có `data/ner_model/`**
 
-Hệ thống dùng `underthesea` fallback. Train model: chạy `kaggle_train_ner.ipynb` trên Kaggle GPU.
+Hệ thống dùng `underthesea`. Nếu muốn chất lượng tốt hơn, train hoặc đặt PhoBERT NER checkpoint vào `data/ner_model/`.
 
-**Không có `data/reranker_model/`**
+**Reranker BGE quá nặng hoặc load chậm**
 
-Hệ thống dùng `cross-encoder/ms-marco-MiniLM-L6-v2` fallback. Train model: chạy `kaggle_train_reranker.ipynb`.
+Tắt rerank trên web bằng cách không set `USE_RERANKER=1`, hoặc giảm `RERANKER_BATCH_SIZE`. CLI mặc định sẽ cố load BGE reranker; có thể truyền BGE local/Hugging Face id qua `--reranker-dir`.
 
-**Build index lần đầu rất chậm**
+**Không có API key cho Reader**
 
-NER trên CPU mất 5-8 giờ cho 150k bài. Dùng GPU hoặc chạy trên Kaggle. Sau khi build xong dùng `--load-index` thì gần như instantaneous.
+Reader cần Gemini API key để sinh câu trả lời QA:
+
+```powershell
+$env:GEMINI_API_KEY="..."
+```
+
+**FAISS không import được**
+
+```powershell
+pip install faiss-cpu
+```
+
+**Output tiếng Việt bị lỗi encoding trên Windows**
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+```

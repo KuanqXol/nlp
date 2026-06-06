@@ -98,6 +98,31 @@
           </section>
           {% endif %}
 
+          <section class="card answer-card" id="answer-card" {% if not answer_payload %}style="display:none"{% endif %}>
+            <div class="result-header">
+              <div class="result-title">Câu trả lời</div>
+              <div class="result-meta" id="answer-meta">
+                {% if answer_payload %}
+                  {{ answer_payload.get('provider', '') }} · {{ answer_payload.get('confidence', '') }}
+                {% else %}
+                  reader
+                {% endif %}
+              </div>
+            </div>
+            <div class="answer-text" id="answer-text">
+              {% if answer_payload %}{{ answer_payload.get('answer', '') }}{% endif %}
+            </div>
+            <div class="answer-sources" id="answer-sources">
+              {% if answer_payload and answer_payload.get('citations') %}
+                {% for cite in answer_payload.get('citations', []) %}
+                  <a class="answer-source" href="{{ cite.get('url', '#') }}" target="_blank" rel="noreferrer">
+                    {{ cite.get('source_id', 'S?') }} · {{ cite.get('title', '(không có tiêu đề)') }}
+                  </a>
+                {% endfor %}
+              {% endif %}
+            </div>
+          </section>
+
           <section class="card">
             <div class="result-header">
               <div class="result-title">Kết quả</div>
@@ -178,6 +203,10 @@
       const resultMeta = document.getElementById('result-meta');
       const resultList = document.getElementById('result-list');
       const resultEmpty = document.getElementById('result-empty');
+      const answerCard = document.getElementById('answer-card');
+      const answerText = document.getElementById('answer-text');
+      const answerSources = document.getElementById('answer-sources');
+      const answerMeta = document.getElementById('answer-meta');
       const nerExpansionCard = document.getElementById('ner-expansion-card');
       const nerExpansionList = document.getElementById('ner-expansion-list');
       const nerDetail = document.getElementById('ner-detail');
@@ -386,9 +415,15 @@
         }, 1150));
       }
 
+      function htmlEscape(value) {
+        return String(value || '').replace(/[&<>"']/g, (ch) => ({
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+      }
+
       async function fetchGraph() {
         const fd = new FormData(form);
-        const res = await fetch('/api/graph', { method: 'POST', body: fd });
+        const res = await fetch('/api/ask', { method: 'POST', body: fd });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'graph_error');
         return data;
@@ -491,9 +526,34 @@
         `).join('') : '<div class="empty">Không có kết quả.</div>';
       }
 
+      function renderAnswer(payload) {
+        if (!answerCard || !answerText || !answerSources) return;
+        const answer = payload.answer || null;
+        if (!answer) {
+          answerCard.style.display = 'none';
+          return;
+        }
+        answerCard.style.display = '';
+        answerText.textContent = answer.answer || 'Không có câu trả lời.';
+        const meta = [];
+        if (answer.provider) meta.push(`reader=${answer.provider}`);
+        if (answer.confidence) meta.push(`confidence=${answer.confidence}`);
+        if (answer.error) meta.push(`error=${answer.error}`);
+        if (answerMeta) answerMeta.textContent = meta.join(' · ') || 'reader';
+        const citations = answer.citations || [];
+        answerSources.innerHTML = citations.length ? citations.map((cite) => {
+          const label = htmlEscape(cite.source_id || 'S?');
+          const title = htmlEscape(cite.title || '(không có tiêu đề)');
+          const url = htmlEscape(cite.url || '#');
+          const date = cite.date ? ` · ${htmlEscape(cite.date)}` : '';
+          return `<a class="answer-source" href="${url}" target="_blank" rel="noreferrer">${label} · ${title}${date}</a>`;
+        }).join('') : '<span class="muted small">Không có nguồn trích dẫn.</span>';
+      }
+
       function syncSearchState(payload) {
         drawGraphShell(payload);
         renderExpandedNER(payload);
+        renderAnswer(payload);
         renderResults(payload);
         resultMeta.textContent = `${payload.elapsed_ms || 0}ms · ${(payload.results || []).length} docs`;
         if (resultEmpty) resultEmpty.textContent = payload.results && payload.results.length ? 'Top-k đã được highlight trên graph.' : 'Không có kết quả phù hợp.';
