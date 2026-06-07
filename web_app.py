@@ -16,6 +16,7 @@ Run:
 from __future__ import annotations
 
 import os
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +85,8 @@ class WebSearchService:
         self._ner: Optional[VietnameseNER] = None
         self._linker: Optional[EntityLinker] = None
         self._kg = None
+        self._search_cache: Dict[str, Dict[str, Any]] = {}
+        self._search_cache_ttl_seconds = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "120"))
         self.state = ServiceState(
             mode="not-ready",
             message="Service is starting...",
@@ -185,7 +188,7 @@ class WebSearchService:
             chunks=chunks_list,
             doc_to_chunks=doc_to_chunks,
             graph_ranker=self.ranker,
-            kg=None,
+            kg=self._kg,
             importance_scores=state.get("global_scores", self.importance_scores),
             chunk_mode=True,
         )
@@ -345,6 +348,79 @@ class WebSearchService:
             max_context_docs=max_context_docs,
         )
         return results, elapsed, analysis, answer_payload
+
+    def _make_search_id(
+        self,
+        query: str,
+        top_k: int,
+        mode: str,
+        compare_enabled: bool,
+    ) -> str:
+        normalized = " ".join((query or "").strip().split()).lower()
+        raw = f"{normalized}\0{int(top_k)}\0{mode}\0{int(compare_enabled)}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+    def _prune_search_cache(self):
+        now = time.time()
+        expired = [
+            key
+            for key, entry in self._search_cache.items()
+            if now - float(entry.get("created_at", 0.0)) > self._search_cache_ttl_seconds
+        ]
+        for key in expired:
+            self._search_cache.pop(key, None)
+
+    def cache_search(
+        self,
+        query: str,
+        top_k: int,
+        mode: str,
+        compare_enabled: bool,
+        results: List[Dict[str, Any]],
+        elapsed: float,
+        analysis: Dict[str, Any],
+        compare_results: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        self._prune_search_cache()
+        search_id = self._make_search_id(query, top_k, mode, compare_enabled)
+        self._search_cache[search_id] = {
+            "created_at": time.time(),
+            "query": query,
+            "top_k": int(top_k),
+            "mode": mode,
+            "compare": bool(compare_enabled),
+            "results": results,
+            "elapsed": float(elapsed),
+            "analysis": analysis,
+            "compare_results": compare_results,
+        }
+        return search_id
+
+    def get_cached_search(
+        self,
+        search_id: Optional[str],
+        query: str,
+        top_k: int,
+        mode: str,
+        compare_enabled: bool,
+    ) -> Optional[Dict[str, Any]]:
+        if not search_id:
+            return None
+        self._prune_search_cache()
+        expected_id = self._make_search_id(query, top_k, mode, compare_enabled)
+        if search_id != expected_id:
+            return None
+        entry = self._search_cache.get(search_id)
+        if not entry:
+            return None
+        if (
+            entry.get("query") != query
+            or int(entry.get("top_k", 0)) != int(top_k)
+            or entry.get("mode") != mode
+            or bool(entry.get("compare")) != bool(compare_enabled)
+        ):
+            return None
+        return entry
 
     @staticmethod
     def _format_entity_label(mention: Optional[str], canonical: Optional[str]) -> str:
@@ -839,11 +915,8 @@ def search(
                 compare_results = service.compare_modes(query, top_k=min(top_k, 5))
                 results = compare_results.get(mode, [])
                 elapsed_ms = 0
-                answer_payload = service.reader.answer(query, results)
             else:
-                results, elapsed, analysis, answer_payload = service.answer(
-                    query, top_k=top_k, mode=mode
-                )
+                results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
                 elapsed_ms = int(elapsed * 1000)
         seed_entities = service.query_proc.get_query_entity_names(analysis) if service.query_proc and analysis else []
         graph_payload = service._build_graph_payload(
@@ -898,6 +971,10 @@ def health():
             )
             if service.retriever
             else None,
+            "retriever_has_kg": bool(
+                service.retriever and getattr(service.retriever, "_kg", None)
+            ),
+            "search_cache_size": len(service._search_cache),
             "lite_build_enabled": _env_flag("ALLOW_LITE_BUILD", False),
             "query_understanding": service.query_proc is not None,
         }
@@ -933,8 +1010,18 @@ def api_graph(
         return JSONResponse({"error": "not_ready", "state": service.state.__dict__}, status_code=503)
 
     compare_enabled = bool(compare)
-    analysis = service.analyze_query(query)
     results, elapsed, analysis = service.search(query, top_k=top_k, mode=mode)
+    compare_results = service.compare_modes(query, top_k=min(top_k, 5)) if compare_enabled else None
+    search_id = service.cache_search(
+        query=query,
+        top_k=top_k,
+        mode=mode,
+        compare_enabled=compare_enabled,
+        results=results,
+        elapsed=elapsed,
+        analysis=analysis,
+        compare_results=compare_results,
+    )
     seed_entities = service.query_proc.get_query_entity_names(analysis) if service.query_proc else []
     payload = service._build_graph_payload(
         query=query,
@@ -946,8 +1033,9 @@ def api_graph(
     payload.update({
         "elapsed_ms": int(elapsed * 1000),
         "compare": compare_enabled,
-        "compare_results": service.compare_modes(query, top_k=min(top_k, 5)) if compare_enabled else None,
+        "compare_results": compare_results,
         "state": service.state.__dict__,
+        "search_id": search_id,
     })
     return JSONResponse(payload)
 
@@ -958,6 +1046,7 @@ def api_ask(
     top_k: int = Form(10),
     mode: str = Form("full"),
     compare: Optional[str] = Form(None),
+    search_id: Optional[str] = Form(None),
 ):
     query = (query or "").strip()
     top_k = max(1, min(int(top_k or 10), 50))
@@ -968,7 +1057,20 @@ def api_ask(
         return JSONResponse({"error": "not_ready", "state": service.state.__dict__}, status_code=503)
 
     compare_enabled = bool(compare)
-    if compare_enabled:
+    cached = service.get_cached_search(
+        search_id=search_id,
+        query=query,
+        top_k=top_k,
+        mode=mode,
+        compare_enabled=compare_enabled,
+    )
+    if cached:
+        results = cached.get("results", [])
+        elapsed = float(cached.get("elapsed", 0.0) or 0.0)
+        analysis = cached.get("analysis") or service.analyze_query(query)
+        compare_results = cached.get("compare_results")
+        answer_payload = service.reader.answer(query, results)
+    elif compare_enabled:
         compare_results = service.compare_modes(query, top_k=min(top_k, 5))
         results = compare_results.get(mode, [])
         elapsed = 0.0
@@ -996,5 +1098,7 @@ def api_ask(
         "compare_results": compare_results,
         "state": service.state.__dict__,
         "answer": answer_payload,
+        "search_id": search_id,
+        "cache_hit": bool(cached),
     })
     return JSONResponse(payload)

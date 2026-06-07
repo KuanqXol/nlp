@@ -159,11 +159,14 @@ def display_answer(answer_payload: dict, query: str):
     print(answer)
 
     provider = answer_payload.get("provider", "")
+    reader_mode = answer_payload.get("reader_mode", "")
     confidence = answer_payload.get("confidence", "")
     error = answer_payload.get("error")
     meta = []
     if provider:
         meta.append(f"reader={provider}")
+    if reader_mode:
+        meta.append(f"mode={reader_mode}")
     if confidence:
         meta.append(f"confidence={confidence}")
     if error:

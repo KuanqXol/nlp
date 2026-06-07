@@ -103,7 +103,12 @@
               <div class="result-title">Câu trả lời</div>
               <div class="result-meta" id="answer-meta">
                 {% if answer_payload %}
-                  {{ answer_payload.get('provider', '') }} · {{ answer_payload.get('confidence', '') }}
+                  {% set answer_meta = [] %}
+                  {% if answer_payload.get('provider') %}{% set _ = answer_meta.append('reader=' ~ answer_payload.get('provider')) %}{% endif %}
+                  {% if answer_payload.get('reader_mode') %}{% set _ = answer_meta.append('mode=' ~ answer_payload.get('reader_mode')) %}{% endif %}
+                  {% if answer_payload.get('confidence') %}{% set _ = answer_meta.append('confidence=' ~ answer_payload.get('confidence')) %}{% endif %}
+                  {% if answer_payload.get('error') %}{% set _ = answer_meta.append('error=' ~ answer_payload.get('error')) %}{% endif %}
+                  {{ answer_meta | join(' · ') }}
                 {% else %}
                   reader
                 {% endif %}
@@ -116,7 +121,7 @@
               {% if answer_payload and answer_payload.get('citations') %}
                 {% for cite in answer_payload.get('citations', []) %}
                   <a class="answer-source" href="{{ cite.get('url', '#') }}" target="_blank" rel="noreferrer">
-                    {{ cite.get('source_id', 'S?') }} · {{ cite.get('title', '(không có tiêu đề)') }}
+                    {{ cite.get('source_id', 'S?') }} · {{ cite.get('title', '(không có tiêu đề)') }}{% if cite.get('date') %} · {{ cite.get('date') }}{% endif %}
                   </a>
                 {% endfor %}
               {% endif %}
@@ -229,6 +234,8 @@
       const graphTransform = { tx: 0, ty: 0, scale: 1 };
       let isDragging = false;
       let dragStart = null;
+      let activeSearchId = 0;
+      let activeAnswerController = null;
       function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
       function applyGraphTransform() {
         if (!svg) return;
@@ -421,9 +428,15 @@
         }[ch]));
       }
 
-      async function fetchGraph() {
-        const fd = new FormData(form);
-        const res = await fetch('/api/ask', { method: 'POST', body: fd });
+      async function fetchGraph(fd) {
+        const res = await fetch('/api/graph', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'graph_error');
+        return data;
+      }
+
+      async function fetchAnswer(fd, signal) {
+        const res = await fetch('/api/ask', { method: 'POST', body: fd, signal });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'graph_error');
         return data;
@@ -537,6 +550,7 @@
         answerText.textContent = answer.answer || 'Không có câu trả lời.';
         const meta = [];
         if (answer.provider) meta.push(`reader=${answer.provider}`);
+        if (answer.reader_mode) meta.push(`mode=${answer.reader_mode}`);
         if (answer.confidence) meta.push(`confidence=${answer.confidence}`);
         if (answer.error) meta.push(`error=${answer.error}`);
         if (answerMeta) answerMeta.textContent = meta.join(' · ') || 'reader';
@@ -548,6 +562,22 @@
           const date = cite.date ? ` · ${htmlEscape(cite.date)}` : '';
           return `<a class="answer-source" href="${url}" target="_blank" rel="noreferrer">${label} · ${title}${date}</a>`;
         }).join('') : '<span class="muted small">Không có nguồn trích dẫn.</span>';
+      }
+
+      function renderAnswerLoading() {
+        if (!answerCard || !answerText || !answerSources) return;
+        answerCard.style.display = '';
+        answerText.textContent = 'Đang tóm tắt từ các bài đã rerank...';
+        if (answerMeta) answerMeta.textContent = 'reader=vit5-local · status=running';
+        answerSources.innerHTML = '<span class="muted small">Kết quả tìm kiếm đã hiển thị bên dưới.</span>';
+      }
+
+      function renderAnswerError(message) {
+        if (!answerCard || !answerText || !answerSources) return;
+        answerCard.style.display = '';
+        answerText.textContent = 'Không tạo được tóm tắt đáng tin cậy ở lượt này.';
+        if (answerMeta) answerMeta.textContent = `reader=vit5-local · error=${message || 'reader_error'}`;
+        answerSources.innerHTML = '<span class="muted small">Danh sách bài báo rerank vẫn có thể dùng để đọc nguồn.</span>';
       }
 
       function syncSearchState(payload) {
@@ -567,20 +597,49 @@
 
       async function runGraphSearch(ev) {
         ev.preventDefault();
+        const searchId = ++activeSearchId;
+        if (activeAnswerController) {
+          activeAnswerController.abort();
+          activeAnswerController = null;
+        }
+        const graphFormData = new FormData(form);
+        const answerFormData = new FormData(form);
         btn.disabled = true;
         btn.textContent = 'Searching…';
-        setGraphMessage('Đang dựng graph…');
+        setGraphMessage('Đang tìm kiếm và rerank…');
         if (resultEmpty) resultEmpty.textContent = 'Đang tìm và highlight top-k trên graph…';
+        if (answerCard) answerCard.style.display = 'none';
         try {
-          const payload = await fetchGraph();
+          const payload = await fetchGraph(graphFormData);
+          if (searchId !== activeSearchId) return;
           syncSearchState(payload);
+          renderAnswerLoading();
+          if (payload.search_id) {
+            answerFormData.set('search_id', payload.search_id);
+          }
+          activeAnswerController = new AbortController();
+          fetchAnswer(answerFormData, activeAnswerController.signal)
+            .then((answerPayload) => {
+              if (searchId !== activeSearchId) return;
+              activeAnswerController = null;
+              renderAnswer(answerPayload);
+            })
+            .catch((err) => {
+              if (err.name === 'AbortError') return;
+              if (searchId !== activeSearchId) return;
+              activeAnswerController = null;
+              renderAnswerError(err.message);
+            });
         } catch (err) {
+          if (searchId !== activeSearchId) return;
           setGraphMessage(`Error: ${err.message}`);
           empty.style.display = 'grid';
           empty.textContent = 'Không thể dựng graph lúc này.';
         } finally {
-          btn.disabled = false;
-          btn.textContent = 'Search';
+          if (searchId === activeSearchId) {
+            btn.disabled = false;
+            btn.textContent = 'Search';
+          }
         }
       }
 

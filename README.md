@@ -2,7 +2,7 @@
 
 Hệ thống tìm kiếm tin tức tiếng Việt trên tập VnExpress, kết hợp Knowledge Graph, FAISS dense retrieval, query expansion, cross-encoder reranking và Reader QA để trả lời ngắn gọn có dẫn nguồn.
 
-Điểm cập nhật quan trọng: reranker dùng **model train sẵn** `BAAI/bge-reranker-v2-m3`; Reader QA dùng **Gemini** qua `GEMINI_API_KEY`.
+Điểm cập nhật quan trọng: reranker dùng **model train sẵn** `BAAI/bge-reranker-v2-m3`; Reader QA dùng **ViT5 local** để tóm tắt top kết quả, không cần API key bên ngoài.
 
 ## Tổng Quan Pipeline
 
@@ -42,7 +42,7 @@ CSV / JSON
      FAISS top chunk -> doc dedupe -> graph boost -> BGE rerank -> date decay
 
   -> QAReader
-     đọc top chunks/bài báo, sinh câu trả lời tiếng Việt ngắn + citation
+     tự nhận diện intent; factoid thì trích đáp án, câu hỏi tổng hợp thì dùng ViT5 tóm tắt
 
   -> Kết quả
      answer + citations + title, URL, snippet chunk, score
@@ -269,10 +269,16 @@ Env hữu ích:
 | `DEMO_MAX_DOCS` | `2000` | Số bài cho lite build |
 | `RERANKER_BATCH_SIZE` | CUDA: 8, CPU: 16 | Batch size khi rerank |
 | `RERANKER_MAX_LENGTH` | `192` | Max length cho cross-encoder |
-| `GEMINI_API_KEY` | None | API key Gemini để bật LLM reader qua Google AI Studio |
-| `GEMINI_MODEL` | `gemini-3.5-flash` | Model Gemini cho reader |
-| `READER_MAX_TOKENS` | `320` | Giới hạn output reader |
-| `READER_TEMPERATURE` | `0` | Temperature reader |
+| `VIT5_MODEL` | `VietAI/vit5-base-vietnews-summarization` | Model encoder-decoder đã fine-tune cho tóm tắt tin tức |
+| `VIT5_CONTEXT_CHARS` | `1200` | Số ký tự tối đa lấy từ mỗi context |
+| `VIT5_MIN_CONTEXT_CHARS` | `80` | Bỏ context quá ngắn, thiếu bằng chứng |
+| `VIT5_MAX_INPUT_CHARS` | `3500` | Số ký tự tối đa đưa vào prompt ViT5 |
+| `VIT5_MAX_LENGTH` | `1024` | Số token tối đa khi tokenize input |
+| `VIT5_MAX_NEW_TOKENS` | `220` | Giới hạn output reader |
+| `VIT5_NUM_BEAMS` | `4` | Beam search khi sinh tóm tắt |
+| `VIT5_DEVICE` | `auto` | `auto`, `cpu` hoặc `cuda` |
+| `VIT5_MIN_CONTEXT_SCORE` | `0.30` | Ngưỡng điểm context tối thiểu để Reader dùng |
+| `VIT5_MIN_QUERY_OVERLAP` | `0.34` | Ngưỡng overlap query tối thiểu để tránh context yếu |
 
 API web:
 
@@ -323,7 +329,7 @@ Lệnh trong interactive mode:
 | `underthesea` | Fallback NER | Tự dùng khi chưa có PhoBERT NER |
 | `bkai-foundation-models/vietnamese-bi-encoder` | Dense embedding | Dùng cho FAISS, query embedding, entity linking, similarity graph |
 | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker mặc định | Model train sẵn, ưu tiên local `data/reranker_bge_v2_m3/` nếu có |
-| `gemini-3.5-flash` | Reader QA | Dùng qua Gemini nếu có `GEMINI_API_KEY` |
+| `VietAI/vit5-base-vietnews-summarization` | Reader/Summarizer | Chạy local qua Hugging Face Transformers, dùng để tóm tắt top context có citation |
 
 ## Đánh Giá Và Benchmark
 
@@ -422,8 +428,13 @@ Reader QA trả thêm:
 | `answer` | Câu trả lời ngắn bằng tiếng Việt |
 | `citations` | Danh sách nguồn `[S1]`, `[S2]` đã dùng |
 | `used_contexts` | Context thực tế đưa vào reader |
-| `confidence` | Mức tự tin thô: `medium` hoặc `low` |
+| `selected_sentences` | Câu đã chọn sau bước context compressor |
+| `confidence` | Mức tự tin thô: `high`, `medium` hoặc `low` |
 | `is_answerable` | Context có đủ bằng chứng để trả lời hay không |
+| `provider` | Luôn là `vit5-local` |
+| `model` | Model ViT5 đang dùng |
+| `reader_mode` | `factoid_extractive`, `vit5_summarization`, `unreliable` hoặc `none` |
+| `error` | Lý do lỗi hoặc context yếu, nếu có |
 
 ## Lưu Ý Kỹ Thuật
 
@@ -432,9 +443,10 @@ Reader QA trả thêm:
 - Knowledge Graph sẽ có relation semantic nếu document có field `triples`; pipeline hiện tại không chạy relation extraction trong build chính, nên với CSV thường KG chủ yếu dựa trên entity co-occurrence và similarity edge.
 - `SimilarityGraphBuilder` tính similarity toàn cặp entity, có thể tốn thời gian nếu số entity lớn.
 - Web chỉ load reranker khi `USE_RERANKER=1`; nếu không bật env này thì mode `vector-rerank` và `full` sẽ không có rerank.
+- Web gọi `/api/graph` để hiển thị kết quả retrieval/rerank trước, sau đó mới gọi `/api/ask` để cập nhật answer panel. Vì vậy Reader chậm hoặc lỗi không chặn danh sách bài báo.
 - Reader chỉ dùng các bài/chunk đã được Retriever trả về; nó không tự tìm thêm nguồn mới.
 - Reranker chỉ sắp xếp lại candidate đã được FAISS lấy ra. Nếu bài đúng không vào top chunk ban đầu, reranker không tự tìm thêm bài mới.
-- README này phản ánh trạng thái runtime hiện tại: BGE reranker train sẵn và Gemini Reader QA.
+- README này phản ánh trạng thái runtime hiện tại: BGE reranker train sẵn và ViT5 local Reader/Summarizer.
 
 ## Xử Lý Sự Cố
 
@@ -458,12 +470,19 @@ Hệ thống dùng `underthesea`. Nếu muốn chất lượng tốt hơn, train
 
 Tắt rerank trên web bằng cách không set `USE_RERANKER=1`, hoặc giảm `RERANKER_BATCH_SIZE`. CLI mặc định sẽ cố load BGE reranker; có thể truyền BGE local/Hugging Face id qua `--reranker-dir`.
 
-**Không có API key cho Reader**
+**Reader ViT5 load chậm hoặc lỗi model**
 
-Reader cần Gemini API key để sinh câu trả lời QA:
+Reader không cần API key bên ngoài. Lần đầu chạy `--answer`, Hugging Face Transformers có thể cần tải/cache model ViT5. Đảm bảo môi trường có đúng dependency trong `requirements.txt`, đặc biệt là `sentencepiece` và `transformers==4.41.0`:
 
 ```powershell
-$env:GEMINI_API_KEY="..."
+.\.venv\Scripts\python.exe -m pip install sentencepiece==0.2.1 transformers==4.41.0 tokenizers==0.19.1
+```
+
+Nếu máy không có GPU hoặc CUDA lỗi, ép chạy CPU:
+
+```powershell
+$env:VIT5_MODEL="VietAI/vit5-base-vietnews-summarization"
+$env:VIT5_DEVICE="cpu"
 ```
 
 **FAISS không import được**
