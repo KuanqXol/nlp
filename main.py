@@ -42,10 +42,7 @@ from src.retrieval import (
     QueryProcessor,
     QueryExpander,
 )
-from src.retrieval.chunking import (
-    DEFAULT_MAX_CHUNK_CHARS,
-    DEFAULT_OVERLAP_SENTENCES,
-)
+from src.reader import QAReader
 from src.retrieval.chunking import (
     DEFAULT_MAX_CHUNK_CHARS,
     DEFAULT_OVERLAP_SENTENCES,
@@ -128,7 +125,7 @@ def display_results(results: list, query: str, elapsed: float):
         cat = doc.get("category", "")
         score = doc.get("retrieval_score", 0.0)
 
-        # Snippet: ưu tiên chunk_text, fallback content
+        # Snippet: ưu tiên chunk_text, sau đó mới dùng content.
         snippet = doc.get("chunk_text", "") or doc.get("content", "")
         if snippet:
             snippet = snippet[:160].replace("\n", " ").strip()
@@ -149,6 +146,46 @@ def display_results(results: list, query: str, elapsed: float):
             print(f"      {snippet}")
 
     print(f"\n{'─'*60}")
+
+
+def display_answer(answer_payload: dict, query: str):
+    """Hiển thị câu trả lời QA ngắn kèm nguồn."""
+    print(f"\n{'═'*60}")
+    print(f'💬  Trả lời cho: "{query}"')
+    print(f"{'═'*60}")
+
+    answer = answer_payload.get("answer") or "Không có câu trả lời."
+    print(answer)
+
+    provider = answer_payload.get("provider", "")
+    reader_mode = answer_payload.get("reader_mode", "")
+    confidence = answer_payload.get("confidence", "")
+    error = answer_payload.get("error")
+    meta = []
+    if provider:
+        meta.append(f"reader={provider}")
+    if reader_mode:
+        meta.append(f"mode={reader_mode}")
+    if confidence:
+        meta.append(f"confidence={confidence}")
+    if error:
+        meta.append(f"error={error}")
+    if meta:
+        print(f"\n📌 {' · '.join(meta)}")
+
+    citations = answer_payload.get("citations", [])
+    if citations:
+        print("\nNguồn:")
+        for cite in citations:
+            label = cite.get("source_id", "S?")
+            title = cite.get("title", "(không có tiêu đề)")
+            url = cite.get("url", "")
+            date = cite.get("date", "")
+            suffix = f" — {date}" if date else ""
+            print(f"  [{label}] {title}{suffix}")
+            if url:
+                print(f"       {url}")
+    print(f"{'═'*60}")
 
 
 # ── NewsSearchSystem ──────────────────────────────────────────────────────────
@@ -182,6 +219,7 @@ class NewsSearchSystem:
         self.retriever = Retriever(
             use_faiss=use_faiss, reranker_model_dir=reranker_model_dir
         )
+        self.reader = QAReader()
 
         self._expander: QueryExpander = None
         self._documents = []
@@ -289,6 +327,10 @@ class NewsSearchSystem:
 
         self._documents = state["documents"]
         self.em = EmbeddingManager.from_state(state["embedding"])
+        self.linker = EntityLinker(shared_encoder=self.em._enc)
+        self.linker.hydrate_from_knowledge_graph(self.kg)
+        self.linker.hydrate_safe_aliases_from_documents(self._documents)
+        self.query_proc = QueryProcessor(self.ner, self.linker)
 
         self.ranker.compute_pagerank(self.kg)
         importance_scores = self.ranker.compute_importance_scores(self.kg)
@@ -342,6 +384,26 @@ class NewsSearchSystem:
 
         elapsed = time.time() - t0
         return results, elapsed
+
+    def answer_query(
+        self,
+        query: str,
+        top_k: int = 10,
+        max_context_docs: int = 5,
+    ) -> dict:
+        """Tìm kiếm rồi dùng reader sinh câu trả lời QA có nguồn."""
+        results, elapsed = self.search(query, top_k=top_k)
+        answer_payload = self.reader.answer(
+            query,
+            results,
+            max_context_docs=max_context_docs,
+        )
+        return {
+            "query": query,
+            "answer": answer_payload,
+            "results": results,
+            "elapsed": elapsed,
+        }
 
     # ── Interactive loop ──────────────────────────────────────────────────
 
@@ -441,6 +503,17 @@ def parse_args():
         "--data", "-d", type=str, default=None, help="Đường dẫn dataset CSV/JSON"
     )
     p.add_argument("--top-k", "-k", type=int, default=10, help="Số bài báo trả về")
+    p.add_argument(
+        "--answer",
+        action="store_true",
+        help="Sinh câu trả lời QA ngắn từ các kết quả truy hồi",
+    )
+    p.add_argument(
+        "--reader-context-docs",
+        type=int,
+        default=5,
+        help="Số kết quả top dùng làm context cho reader",
+    )
     p.add_argument("--load-index", action="store_true", help="Load index từ disk")
     p.add_argument("--index-dir", type=str, default=None, help="Thư mục index")
     p.add_argument(
@@ -450,7 +523,7 @@ def parse_args():
         "--reranker-dir",
         type=str,
         default=None,
-        help="Thư mục cross-encoder checkpoint",
+        help="Thư mục BGE local hoặc Hugging Face model id của cross-encoder reranker",
     )
     p.add_argument(
         "--viz", action="store_true", help="Xuất KG visualization sau khi build"
@@ -478,8 +551,17 @@ def main():
         system._export_viz()
 
     if args.query:
-        results, elapsed = system.search(args.query, top_k=args.top_k)
-        display_results(results, args.query, elapsed)
+        if args.answer:
+            qa = system.answer_query(
+                args.query,
+                top_k=args.top_k,
+                max_context_docs=args.reader_context_docs,
+            )
+            display_answer(qa["answer"], args.query)
+            display_results(qa["results"], args.query, qa["elapsed"])
+        else:
+            results, elapsed = system.search(args.query, top_k=args.top_k)
+            display_results(results, args.query, elapsed)
     else:
         system.run_interactive(top_k=args.top_k)
 

@@ -13,6 +13,7 @@ Yêu cầu: faiss-cpu, sentence-transformers
 """
 
 import math
+import os
 import pickle
 from collections import defaultdict
 
@@ -47,8 +48,40 @@ DATE_DECAY_ENABLED = True
 DATE_DECAY_WEIGHT = 0.08  # Contribution của date decay vào final score (0→tắt, 1→full)
 MAX_CHUNKS_PER_DOC = 2  # Tối đa giữ N chunk/doc khi dedupe
 
-# Cross-encoder: dùng model fine-tuned nếu có, fallback ms-marco
-DEFAULT_CROSS_ENCODER = "cross-encoder/ms-marco-MiniLM-L6-v2"
+# Cross-encoder: prefer the local BGE v2 M3 reranker, otherwise use the public
+# Hugging Face model id.
+DEFAULT_CROSS_ENCODER = "BAAI/bge-reranker-v2-m3"
+DEFAULT_LOCAL_CROSS_ENCODER_DIR = "reranker_bge_v2_m3"
+
+
+def _has_local_cross_encoder_model(path: Path) -> bool:
+    return (
+        path.exists()
+        and (path / "config.json").exists()
+        and ((path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists())
+    )
+
+
+def _find_local_cross_encoder_model(path: Path) -> Optional[Path]:
+    """Return a loadable local cross-encoder directory, if present."""
+    return path if _has_local_cross_encoder_model(path) else None
+
+
+def _resolve_cross_encoder_model(model_dir: Optional[str]) -> str:
+    if model_dir:
+        path = Path(model_dir).expanduser()
+        if path.exists():
+            local_model = _find_local_cross_encoder_model(path)
+            if local_model is not None:
+                return str(local_model)
+        return model_dir
+
+    data_dir = Path(__file__).resolve().parents[2] / "data"
+    default = data_dir / DEFAULT_LOCAL_CROSS_ENCODER_DIR
+    local_model = _find_local_cross_encoder_model(default)
+    if local_model is not None:
+        return str(local_model)
+    return DEFAULT_CROSS_ENCODER
 
 
 # ── FAISS Backend ─────────────────────────────────────────────────────────────
@@ -118,52 +151,113 @@ class _CrossEncoderReranker:
             except ImportError:
                 device = "cpu"
         self._device = device
-        # Batch size tối ưu: GPU 128, CPU 32
-        self._batch_size = 128 if device.startswith("cuda") else 32
+        default_batch = 8 if device.startswith("cuda") else 16
+        self._batch_size = int(os.getenv("RERANKER_BATCH_SIZE", str(default_batch)))
+        self._max_length = int(os.getenv("RERANKER_MAX_LENGTH", "192"))
+        self._trust_remote_code = os.getenv("RERANKER_TRUST_REMOTE_CODE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         print(f"[Reranker] Đang load: {model_dir} (device={device})")
-        self._model = CrossEncoder(model_dir, device=device)
-        # torch.compile: giam CPU overhead, tang GPU utilization
+        self.model_dir = model_dir
+        model_kwargs = {}
         try:
-            import torch as _tc
+            import torch
 
-            if hasattr(_tc, "compile") and _tc.cuda.is_available():
-                self._model.model = _tc.compile(
-                    self._model.model, mode="reduce-overhead"
-                )
-                print("[Reranker] torch.compile enabled")
+            # Some Vietnamese checkpoints are saved with dtype=float16 in config.
+            # CPU fp16 inference can produce NaN logits, so force fp32 at load time.
+            model_kwargs["torch_dtype"] = torch.float32
         except Exception:
-            pass
+            model_kwargs = {}
+        try:
+            cross_encoder_kwargs = {
+                "device": device,
+                "model_kwargs": model_kwargs or None,
+                "max_length": self._max_length,
+            }
+            if self._trust_remote_code:
+                cross_encoder_kwargs["trust_remote_code"] = True
+            self._model = CrossEncoder(
+                model_dir,
+                **cross_encoder_kwargs,
+            )
+        except TypeError:
+            self._model = CrossEncoder(model_dir, device=device, max_length=self._max_length)
+        self._validate_model()
         print("[Reranker] Sẵn sàng.")
 
     @staticmethod
-    def _to_scalar_score(score) -> float:
-        """Normalize CrossEncoder outputs into a plain float.
+    def _sigmoid(values: np.ndarray) -> np.ndarray:
+        clipped = np.clip(values, -80.0, 80.0)
+        return 1.0 / (1.0 + np.exp(-clipped))
 
-        CrossEncoder.predict() can return:
-        - a Python float / numpy scalar
-        - a 1D numpy array of shape (1,)
-        - a nested array/list for some transformer versions
-        This helper safely extracts the first scalar value and clamps
-        invalid outputs to 0.0 so reranking never crashes the web app.
+    @classmethod
+    def _single_output_to_relevance(cls, values: np.ndarray) -> Optional[np.ndarray]:
+        if values.size == 0 or not np.isfinite(values).any():
+            return None
+        values = np.nan_to_num(values.astype(np.float64), nan=0.0, posinf=80.0, neginf=-80.0)
+        if np.nanmin(values) < 0.0 or np.nanmax(values) > 1.0:
+            values = cls._sigmoid(values)
+        return values.astype(np.float64)
+
+    @classmethod
+    def _scores_to_relevance(cls, scores, expected: int) -> Optional[np.ndarray]:
+        """Convert CrossEncoder outputs to one finite relevance score per pair.
+
+        SentenceTransformers returns shape (N,) for regression/single-label models
+        and shape (N, 2) for binary classifiers. For 2-label classifiers, the
+        correct relevance score is the positive-class softmax.
         """
         try:
-            import numpy as np
-
-            arr = np.asarray(score)
-            if arr.size == 0:
-                return 0.0
-            value = float(arr.reshape(-1)[0])
-            if np.isnan(value) or np.isinf(value):
-                return 0.0
-            return value
+            arr = np.asarray(scores, dtype=np.float64)
         except Exception:
-            try:
-                value = float(score)
-                if value != value or value in (float("inf"), float("-inf")):
-                    return 0.0
-                return value
-            except Exception:
-                return 0.0
+            return None
+
+        if arr.size == 0 or expected <= 0 or not np.isfinite(arr).any():
+            return None
+
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+
+        if arr.ndim == 1:
+            flat = arr.reshape(-1)
+            if flat.size == expected * 2:
+                arr = flat.reshape(expected, 2)
+            elif flat.size == expected:
+                return cls._single_output_to_relevance(flat)
+            else:
+                return None
+
+        if arr.ndim >= 2:
+            arr = arr.reshape(arr.shape[0], -1)
+            if arr.shape[0] != expected:
+                if arr.size % expected != 0:
+                    return None
+                arr = arr.reshape(expected, -1)
+
+            if arr.shape[1] == 1:
+                return cls._single_output_to_relevance(arr[:, 0])
+
+            arr = np.nan_to_num(arr, nan=0.0, posinf=80.0, neginf=-80.0)
+            shifted = arr - np.max(arr, axis=1, keepdims=True)
+            exp = np.exp(np.clip(shifted, -80.0, 80.0))
+            denom = np.sum(exp, axis=1)
+            denom = np.where(denom == 0.0, 1e-12, denom)
+            return (exp[:, -1] / denom).astype(np.float64)
+
+        return None
+
+    def _validate_model(self):
+        scores = self._model.predict(
+            [("kiem tra reranker", "kiem tra reranker")],
+            batch_size=1,
+            show_progress_bar=False,
+        )
+        values = self._scores_to_relevance(scores, expected=1)
+        if values is None or not np.isfinite(values).all():
+            raise RuntimeError("reranker returned non-finite scores during smoke test")
 
     def rerank(
         self,
@@ -176,23 +270,21 @@ class _CrossEncoderReranker:
             return candidates
 
         pairs = [(query, c.get(text_field, c.get("full_text", ""))) for c in candidates]
-        scores = self._model.predict(pairs, batch_size=self._batch_size)
+        try:
+            scores = self._model.predict(
+                pairs,
+                batch_size=self._batch_size,
+                show_progress_bar=False,
+            )
+            score_values = self._scores_to_relevance(scores, expected=len(candidates))
+        except Exception as e:
+            print(f"[Reranker] WARNING: rerank failed ({e}); using vector scores.")
+            score_values = None
 
-        if isinstance(scores, (list, tuple)):
-            score_values = [self._to_scalar_score(s) for s in scores]
-        else:
-            try:
-                import numpy as np
-
-                score_values = [self._to_scalar_score(s) for s in np.asarray(scores).reshape(-1)]
-            except Exception:
-                score_values = [self._to_scalar_score(scores)] * len(candidates)
-
-        if len(score_values) != len(candidates):
-            if len(score_values) < len(candidates):
-                score_values.extend([0.0] * (len(candidates) - len(score_values)))
-            else:
-                score_values = score_values[: len(candidates)]
+        if score_values is None or len(score_values) != len(candidates):
+            print("[Reranker] WARNING: invalid scores; keeping pre-rerank ordering.")
+            candidates.sort(key=lambda x: -x["retrieval_score"])
+            return candidates[:top_k] if top_k else candidates
 
         for cand, score in zip(candidates, score_values):
             cand["cross_encoder_score"] = round(score, 4)
@@ -220,6 +312,7 @@ class Retriever:
         use_faiss: bool = True,
         reranker_model_dir: Optional[str] = None,
         use_cross_encoder: bool = True,
+        load_cross_encoder: bool = True,
         **kwargs,  # backward-compat
     ):
         if not _FAISS_AVAILABLE:
@@ -235,25 +328,10 @@ class Retriever:
 
         self._backend = _FaissBackend()
 
-        # Cross-encoder: ưu tiên fine-tuned model nếu có
-        self._reranker: Optional[_CrossEncoderReranker] = None
-        if use_cross_encoder and _CROSS_ENCODER_AVAILABLE:
-            model_path = reranker_model_dir
-            if model_path is None:
-                default = (
-                    Path(__file__).resolve().parents[2] / "data" / "reranker_model"
-                )
-                model_path = (
-                    str(default)
-                    if (default / "config.json").exists()
-                    else DEFAULT_CROSS_ENCODER
-                )
-            try:
-                self._reranker = _CrossEncoderReranker(model_path, device=self._device)
-            except Exception as e:
-                print(f"[Reranker] Không load được ({e}), tắt rerank.")
-
         # State
+        self._reranker: Optional[_CrossEncoderReranker] = None
+        self._reranker_model_dir = reranker_model_dir
+        self._use_cross_encoder = bool(use_cross_encoder)
         self._em = None
         self._documents: Dict[str, Dict] = {}
         self._chunks: Dict[str, Dict] = {}
@@ -262,6 +340,28 @@ class Retriever:
         self._kg = None
         self._global_scores: Dict[str, float] = {}
         self._chunk_mode = False
+
+        if load_cross_encoder:
+            self.load_reranker()
+
+    def load_reranker(self) -> bool:
+        """Load the cross-encoder after heavier retrieval artifacts when needed."""
+        if self._reranker is not None:
+            return True
+        if not self._use_cross_encoder:
+            return False
+        if not _CROSS_ENCODER_AVAILABLE:
+            print("[Reranker] sentence-transformers chưa được cài, tắt rerank.")
+            return False
+
+        model_path = _resolve_cross_encoder_model(self._reranker_model_dir)
+        try:
+            self._reranker = _CrossEncoderReranker(model_path, device=self._device)
+            return True
+        except Exception as e:
+            print(f"[Reranker] Không load được ({type(e).__name__}: {e}), tắt rerank.")
+            self._reranker = None
+            return False
 
     # ── Build ─────────────────────────────────────────────────────────────
 

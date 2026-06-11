@@ -113,6 +113,8 @@ class _PhoBERTNERBackend:
         self._tokenizer = None
         self._device = None
         self._segmenter = None
+        self._segment_fn = None
+        self._segmenter_name = "whitespace"
 
     def _load(self):
         if self._model is not None:
@@ -145,6 +147,8 @@ class _PhoBERTNERBackend:
         # VnCoreNLP word segmenter -- bat buoc de PhoBERT tokenize dung
         # "Ho Chi Minh" -> "Ho_Chi_Minh" -> PhoBERT nhan ra 1 entity
         self._segmenter = None
+        self._segment_fn = None
+        self._segmenter_name = "whitespace"
         try:
             import py_vncorenlp
             from pathlib import Path as _Path
@@ -163,27 +167,48 @@ class _PhoBERTNERBackend:
             self._segmenter = py_vncorenlp.VnCoreNLP(
                 annotators=["wseg"], save_dir=save_dir
             )
+            self._segmenter_name = "vncorenlp"
             print("[NER/PhoBERT] VnCoreNLP word segmenter ready.")
         except Exception as e:
             print(f"[NER/PhoBERT] WARNING: VnCoreNLP unavailable ({e}).")
-            print(
-                "[NER/PhoBERT] Falling back to whitespace split -- NER quality will be lower."
-            )
-            print(
-                "[NER/PhoBERT] Fix: dam bao data/vncorenlp/VnCoreNLP-1.2.jar ton tai va Java da cai."
-            )
+            try:
+                from underthesea import word_tokenize as _word_tokenize
+
+                def _segment_with_underthesea(text: str) -> str:
+                    segmented = _word_tokenize(text, format="text")
+                    return str(segmented).strip()
+
+                self._segment_fn = _segment_with_underthesea
+                self._segmenter_name = "underthesea"
+                print(
+                    "[NER/PhoBERT] Using underthesea word_tokenize fallback for segmentation."
+                )
+            except Exception as seg_e:
+                print(f"[NER/PhoBERT] underthesea segmentation unavailable ({seg_e}).")
+                print(
+                    "[NER/PhoBERT] Falling back to whitespace split -- NER quality will be lower."
+                )
+                print(
+                    "[NER/PhoBERT] Fix: cai py_vncorenlp hoac dam bao underthesea hoat dong."
+                )
 
         print("[NER/PhoBERT] San sang.")
 
     def _segment(self, text: str) -> str:
         """Word-segment: 'Ha Noi' -> 'Ha_Noi'. Fallback: tra nguyen text."""
-        if self._segmenter is None:
-            return text
-        try:
-            result = self._segmenter.word_segment(text)
-            return " ".join(result) if isinstance(result, list) else str(result)
-        except Exception:
-            return text
+        if self._segmenter is not None:
+            try:
+                result = self._segmenter.word_segment(text)
+                return " ".join(result) if isinstance(result, list) else str(result)
+            except Exception:
+                pass
+        if self._segment_fn is not None:
+            try:
+                result = self._segment_fn(text)
+                return result or text
+            except Exception:
+                pass
+        return text
 
     def _desegment_entity(self, seg_text: str) -> str:
         """Khoi phuc entity text ve dang goc: 'Ha_Noi' -> 'Ha Noi'."""
@@ -336,6 +361,8 @@ class _PhoBERTNERBackend:
     def close(self):
         self._model = None
         self._tokenizer = None
+        self._segmenter = None
+        self._segment_fn = None
         if _TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -525,6 +552,18 @@ class VietnameseNER:
 
     def close(self):
         self._backend.close()
+
+    def segment_text(self, text: str) -> str:
+        text = _normalize_text(text)
+        if not text:
+            return ""
+        segment = getattr(self._backend, "_segment", None)
+        if callable(segment):
+            try:
+                return _normalize_text(segment(text))
+            except Exception:
+                return text
+        return text
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
