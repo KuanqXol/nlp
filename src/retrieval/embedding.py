@@ -63,6 +63,17 @@ class VietnameseBiEncoder:
                 f"[Embedding] Đang tải model: {self.model_name} (device={self.device}) ..."
             )
             self._model = SentenceTransformer(self.model_name, device=self.device)
+            # torch.compile: giam CPU overhead, tang GPU utilization
+            try:
+                import torch as _tc
+
+                if hasattr(_tc, "compile") and _tc.cuda.is_available():
+                    self._model[0].auto_model = _tc.compile(
+                        self._model[0].auto_model, mode="reduce-overhead"
+                    )
+                    print("[Embedding] torch.compile enabled")
+            except Exception:
+                pass
             print(
                 f"[Embedding] Model sẵn sàng. Dim={self._model.get_sentence_embedding_dimension()}"
             )

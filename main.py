@@ -49,7 +49,6 @@ from src.retrieval.chunking import (
     DEFAULT_MIN_CHUNK_CHARS,
 )
 
-
 # ── Banner ────────────────────────────────────────────────────────────────────
 
 BANNER = """
@@ -210,7 +209,7 @@ class NewsSearchSystem:
         print("🔧 Đang khởi tạo hệ thống...\n")
 
         self.ner = VietnameseNER(model_dir=ner_model_dir)
-        self.em = EmbeddingManager()
+        self.em = EmbeddingManager(model_name=str(DATA_DIR / "bi_encoder_model"))
         # EntityLinker dùng chung encoder với EmbeddingManager → cùng vector space,
         # tiết kiệm ~1-2 GB RAM so với load 2 model riêng.
         self.linker = EntityLinker(shared_encoder=self.em._enc)

@@ -366,20 +366,17 @@ def patch_configs():
     else:
         info("main.py: EmbeddingManager local da co.")
 
-    # main.py: max_chars 800 (giam so chunks: 1.9M -> ~950k)
-    import re
+    # main.py: hien thi max_chars hien tai (nguoi dung tu chinh)
+    import re as _re2
 
-    c = MAIN_PY.read_text(encoding="utf-8")
-    m = re.search(r"max_chars=(\d+)", c)
-    if m:
-        current = int(m.group(1))
-        if current < 800:
-            c = re.sub(r"max_chars=\d+", "max_chars=800", c)
-            MAIN_PY.write_text(c, encoding="utf-8")
-            ok(f"main.py: max_chars {current}->800 (giam chunks ~2x)")
-            changed = True
-        else:
-            info(f"main.py: max_chars={current} da OK.")
+    _mc = MAIN_PY.read_text(encoding="utf-8")
+    _mm = _re2.search(r"max_chars=(\d+)", _mc)
+    if _mm:
+        info(
+            f"main.py: max_chars={_mm.group(1)} (400=nhanh/it chunks, 800=trung binh, 1500=day du)"
+        )
+    else:
+        warn("main.py: khong tim thay max_chars")
 
     # embedding.py: batch_size 128 cho 4GB VRAM
     c = SRC_EMBED.read_text(encoding="utf-8")

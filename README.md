@@ -114,6 +114,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 $env:PYTHONIOENCODING="utf-8"
 pip install -r requirements.txt
+python setup.py
 ```
 
 Linux/macOS:
